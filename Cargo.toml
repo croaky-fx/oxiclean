@@ -1,0 +1,17 @@
+[package]
+name = "oxiclean"
+version = "1.0.0"
+edition = "2021"
+description = "Fast cross-distribution Linux system cleaner"
+authors = ["You"]
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
