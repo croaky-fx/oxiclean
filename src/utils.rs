@@ -219,3 +219,108 @@ pub fn info(msg: &str) {
 pub fn skip(msg: &str) {
     println!("    {} {}", "⊘".dimmed(), msg.dimmed());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_format_size_bytes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+    }
+
+    #[test]
+    fn test_format_size_kb() {
+        assert_eq!(format_size(1024), "1.00 KB");
+        assert_eq!(format_size(1536), "1.50 KB");
+    }
+
+    #[test]
+    fn test_format_size_mb() {
+        assert_eq!(format_size(1_048_576), "1.00 MB");
+    }
+
+    #[test]
+    fn test_format_size_gb() {
+        assert_eq!(format_size(1_073_741_824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_which_exists() {
+        assert!(which("ls"));
+        assert!(which("echo"));
+    }
+
+    #[test]
+    fn test_which_not_exists() {
+        assert!(!which("nonexistent_command_xyz_12345"));
+    }
+
+    #[test]
+    fn test_home_dir_exists() {
+        let home = home_dir();
+        assert!(home.is_some());
+        assert!(!home.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_capture_echo() {
+        let result = capture("echo", &["hello"]);
+        assert_eq!(result, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_capture_nonexistent() {
+        let result = capture("nonexistent_cmd_xyz", &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dir_size_nonexistent() {
+        let path = PathBuf::from("/tmp/oxiclean_test_nonexistent");
+        assert_eq!(dir_size(&path), 0);
+    }
+
+    #[test]
+    fn test_dir_size_and_rm() {
+        let test_dir = PathBuf::from("/tmp/oxiclean_test_size");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::write(test_dir.join("a.txt"), "hello").unwrap();
+        fs::write(test_dir.join("b.txt"), "world!!!").unwrap();
+        let sub = test_dir.join("subdir");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("c.txt"), "test data").unwrap();
+
+        let size = dir_size(&test_dir);
+        assert!(size > 0);
+
+        let freed = rm_contents(&test_dir);
+        assert!(freed > 0);
+        assert!(test_dir.exists());
+        assert_eq!(dir_size(&test_dir), 0);
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_rm_contents_empty() {
+        let test_dir = PathBuf::from("/tmp/oxiclean_test_empty");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+        assert_eq!(rm_contents(&test_dir), 0);
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_run_silent_true() {
+        assert!(run_silent("true", &[]));
+    }
+
+    #[test]
+    fn test_run_silent_false() {
+        assert!(!run_silent("false", &[]));
+    }
+}

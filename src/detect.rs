@@ -164,3 +164,46 @@ pub fn has_flatpak() -> bool {
 pub fn has_snap() -> bool {
     crate::utils::which("snap")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_distro_names() {
+        assert_eq!(Distro::Arch.name(), "Arch Linux");
+        assert_eq!(Distro::Debian.name(), "Debian/Ubuntu");
+        assert_eq!(Distro::Fedora.name(), "Fedora/RHEL");
+        assert_eq!(Distro::Unknown.name(), "Unknown");
+    }
+
+    #[test]
+    fn test_pkg_managers() {
+        assert_eq!(Distro::Arch.pkg_manager(), "pacman");
+        assert_eq!(Distro::Debian.pkg_manager(), "apt");
+        assert_eq!(Distro::Unknown.pkg_manager(), "N/A");
+    }
+
+    #[test]
+    fn test_detection_doesnt_panic() {
+        let d = distro();
+        assert!(!d.name().is_empty());
+    }
+
+    #[test]
+    fn test_pretty_name_not_empty() {
+        assert!(!pretty_name().is_empty());
+    }
+
+    #[test]
+    fn test_distro_equality() {
+        assert_eq!(Distro::Arch, Distro::Arch);
+        assert_ne!(Distro::Arch, Distro::Debian);
+    }
+
+    #[test]
+    fn test_distro_clone() {
+        let d = Distro::Arch;
+        assert_eq!(d, d.clone());
+    }
+}
