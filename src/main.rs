@@ -162,11 +162,9 @@ fn main() {
 
         // ── Sudo ──
         let needs_sudo = do_packages || do_orphans || do_journal || do_flatpak || do_snap;
-        if needs_sudo && !cli.dry_run {
-            if !utils::acquire_sudo() {
-                utils::error("Failed to acquire sudo privileges. Exiting.");
-                std::process::exit(1);
-            }
+        if needs_sudo && !cli.dry_run && !utils::acquire_sudo() {
+            utils::error("Failed to acquire sudo privileges. Exiting.");
+            std::process::exit(1);
         }
 
         // ── Execute ──

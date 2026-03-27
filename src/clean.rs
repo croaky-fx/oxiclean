@@ -190,10 +190,10 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 } else {
                     utils::error("eclean distfiles failed");
                 }
-                if should_deep(deep, yes, "Also clean binary packages? [y/N]:") {
-                    if utils::sudo("eclean", &["packages"]) {
+                if should_deep(deep, yes, "Also clean binary packages? [y/N]:")
+                    && utils::sudo("eclean", &["packages"])
+                {
                         utils::success("Binary packages cleaned");
-                    }
                 }
             } else {
                 utils::warning("eclean not found — install app-portage/gentoolkit");

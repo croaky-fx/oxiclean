@@ -147,12 +147,10 @@ pub fn pretty_name() -> String {
 
 /// Detect available AUR helper (Arch-based only)
 pub fn aur_helper() -> Option<&'static str> {
-    for h in &["paru", "yay", "trizen", "pikaur", "aura"] {
-        if crate::utils::which(h) {
-            return Some(h);
-        }
-    }
-    None
+    ["paru", "yay", "trizen", "pikaur", "aura"]
+        .iter()
+        .copied()
+        .find(|h| crate::utils::which(h))
 }
 
 /// Check if Flatpak is installed
