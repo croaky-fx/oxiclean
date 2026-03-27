@@ -201,7 +201,7 @@ fn main() {
 
         if do_flatpak {
             if has_flatpak {
-                // ✅ بنمرر cli.deep هنا
+
                 total_freed += clean::flatpak(cli.deep, cli.dry_run);
             } else if cli.flatpak {
                 utils::section("Flatpak");
