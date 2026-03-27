@@ -22,32 +22,32 @@ pub enum Distro {
 impl Distro {
     pub fn name(&self) -> &str {
         match self {
-            Self::Arch    => "Arch Linux",
-            Self::Debian  => "Debian/Ubuntu",
-            Self::Fedora  => "Fedora/RHEL",
-            Self::Suse    => "openSUSE/SLES",
-            Self::Nix     => "NixOS",
-            Self::Void    => "Void Linux",
-            Self::Alpine  => "Alpine Linux",
-            Self::Gentoo  => "Gentoo",
-            Self::Solus   => "Solus",
-            Self::Clear   => "Clear Linux",
+            Self::Arch => "Arch Linux",
+            Self::Debian => "Debian/Ubuntu",
+            Self::Fedora => "Fedora/RHEL",
+            Self::Suse => "openSUSE/SLES",
+            Self::Nix => "NixOS",
+            Self::Void => "Void Linux",
+            Self::Alpine => "Alpine Linux",
+            Self::Gentoo => "Gentoo",
+            Self::Solus => "Solus",
+            Self::Clear => "Clear Linux",
             Self::Unknown => "Unknown",
         }
     }
 
     pub fn pkg_manager(&self) -> &str {
         match self {
-            Self::Arch    => "pacman",
-            Self::Debian  => "apt",
-            Self::Fedora  => "dnf/yum",
-            Self::Suse    => "zypper",
-            Self::Nix     => "nix",
-            Self::Void    => "xbps",
-            Self::Alpine  => "apk",
-            Self::Gentoo  => "portage",
-            Self::Solus   => "eopkg",
-            Self::Clear   => "swupd",
+            Self::Arch => "pacman",
+            Self::Debian => "apt",
+            Self::Fedora => "dnf/yum",
+            Self::Suse => "zypper",
+            Self::Nix => "nix",
+            Self::Void => "xbps",
+            Self::Alpine => "apk",
+            Self::Gentoo => "portage",
+            Self::Solus => "eopkg",
+            Self::Clear => "swupd",
             Self::Unknown => "N/A",
         }
     }
@@ -78,48 +78,102 @@ pub fn distro() -> Distro {
     // ── Direct ID match ──
 
     const ARCH: &[&str] = &[
-        "arch", "manjaro", "endeavouros", "garuda", "artix", "cachyos",
-        "arcolinux", "archcraft", "parabola", "hyperbola", "crystal",
-        "bluestar", "archbang",
+        "arch",
+        "manjaro",
+        "endeavouros",
+        "garuda",
+        "artix",
+        "cachyos",
+        "arcolinux",
+        "archcraft",
+        "parabola",
+        "hyperbola",
+        "crystal",
+        "bluestar",
+        "archbang",
     ];
     const DEBIAN: &[&str] = &[
-        "debian", "ubuntu", "linuxmint", "pop", "elementary", "zorin",
-        "kali", "parrot", "deepin", "mx", "antix", "lmde", "devuan",
-        "raspbian", "neon", "pureos", "tails", "peppermint", "bodhi",
-        "sparky", "bunsen",
+        "debian",
+        "ubuntu",
+        "linuxmint",
+        "pop",
+        "elementary",
+        "zorin",
+        "kali",
+        "parrot",
+        "deepin",
+        "mx",
+        "antix",
+        "lmde",
+        "devuan",
+        "raspbian",
+        "neon",
+        "pureos",
+        "tails",
+        "peppermint",
+        "bodhi",
+        "sparky",
+        "bunsen",
     ];
     const FEDORA: &[&str] = &[
-        "fedora", "rhel", "centos", "rocky", "alma", "nobara",
-        "ultramarine", "oracle", "scientific", "amazon", "eurolinux",
+        "fedora",
+        "rhel",
+        "centos",
+        "rocky",
+        "alma",
+        "nobara",
+        "ultramarine",
+        "oracle",
+        "scientific",
+        "amazon",
+        "eurolinux",
     ];
     const SUSE: &[&str] = &[
-        "opensuse", "opensuse-leap", "opensuse-tumbleweed",
-        "opensuse-microos", "sles", "suse",
+        "opensuse",
+        "opensuse-leap",
+        "opensuse-tumbleweed",
+        "opensuse-microos",
+        "sles",
+        "suse",
     ];
 
-    if ARCH.contains(&id.as_str())   { return Distro::Arch; }
-    if DEBIAN.contains(&id.as_str()) { return Distro::Debian; }
-    if FEDORA.contains(&id.as_str()) { return Distro::Fedora; }
+    if ARCH.contains(&id.as_str()) {
+        return Distro::Arch;
+    }
+    if DEBIAN.contains(&id.as_str()) {
+        return Distro::Debian;
+    }
+    if FEDORA.contains(&id.as_str()) {
+        return Distro::Fedora;
+    }
     if SUSE.contains(&id.as_str()) || id.starts_with("opensuse") {
         return Distro::Suse;
     }
 
     match id.as_str() {
-        "nixos"                      => return Distro::Nix,
-        "void"                       => return Distro::Void,
-        "alpine" | "postmarketos"    => return Distro::Alpine,
+        "nixos" => return Distro::Nix,
+        "void" => return Distro::Void,
+        "alpine" | "postmarketos" => return Distro::Alpine,
         "gentoo" | "funtoo" | "calculate" => return Distro::Gentoo,
-        "solus"                      => return Distro::Solus,
-        "clear-linux-os"             => return Distro::Clear,
+        "solus" => return Distro::Solus,
+        "clear-linux-os" => return Distro::Clear,
         _ => {}
     }
 
     // ── Fallback: ID_LIKE field ──
 
-    if id_like.contains("arch")                            { return Distro::Arch; }
-    if id_like.contains("debian") || id_like.contains("ubuntu") { return Distro::Debian; }
-    if id_like.contains("fedora") || id_like.contains("rhel")   { return Distro::Fedora; }
-    if id_like.contains("suse")                            { return Distro::Suse; }
+    if id_like.contains("arch") {
+        return Distro::Arch;
+    }
+    if id_like.contains("debian") || id_like.contains("ubuntu") {
+        return Distro::Debian;
+    }
+    if id_like.contains("fedora") || id_like.contains("rhel") {
+        return Distro::Fedora;
+    }
+    if id_like.contains("suse") {
+        return Distro::Suse;
+    }
 
     Distro::Unknown
 }
@@ -127,18 +181,16 @@ pub fn distro() -> Distro {
 /// Get PRETTY_NAME from /etc/os-release
 pub fn pretty_name() -> String {
     fs::read_to_string("/etc/os-release")
-    .ok()
-    .and_then(|c| {
-        c.lines()
-        .find(|l| l.starts_with("PRETTY_NAME="))
-        .map(|l| {
-            l.strip_prefix("PRETTY_NAME=")
-            .unwrap_or("")
-            .trim_matches('"')
-            .to_string()
+        .ok()
+        .and_then(|c| {
+            c.lines().find(|l| l.starts_with("PRETTY_NAME=")).map(|l| {
+                l.strip_prefix("PRETTY_NAME=")
+                    .unwrap_or("")
+                    .trim_matches('"')
+                    .to_string()
+            })
         })
-    })
-    .unwrap_or_else(|| "Unknown Linux".into())
+        .unwrap_or_else(|| "Unknown Linux".into())
 }
 
 // ═══════════════════════════════════════════════════

@@ -12,21 +12,21 @@ use std::process::{Command, Stdio};
 /// Run command with visible output (inherits stdio)
 pub fn run(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
-    .args(args)
-    .status()
-    .map(|s| s.success())
-    .unwrap_or(false)
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Run command silently (suppress all output)
 pub fn run_silent(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
-    .args(args)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .status()
-    .map(|s| s.success())
-    .unwrap_or(false)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Run command with sudo, falls back to direct if already root
@@ -42,11 +42,11 @@ pub fn sudo(cmd: &str, args: &[&str]) -> bool {
 /// Capture stdout of a command (returns output regardless of exit code)
 pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
     Command::new(cmd)
-    .args(args)
-    .stderr(Stdio::null())
-    .output()
-    .ok()
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 /// Check if a command exists in PATH
@@ -56,9 +56,7 @@ pub fn which(cmd: &str) -> bool {
 
 /// Check if running as root (uid 0)
 pub fn is_root() -> bool {
-    capture("id", &["-u"])
-    .map(|id| id == "0")
-    .unwrap_or(false)
+    capture("id", &["-u"]).map(|id| id == "0").unwrap_or(false)
 }
 
 /// Acquire sudo privileges (prompts for password)
@@ -69,10 +67,10 @@ pub fn acquire_sudo() -> bool {
     println!();
     println!("  {}", "🔐 Requesting sudo privileges...".yellow());
     Command::new("sudo")
-    .arg("-v")
-    .status()
-    .map(|s| s.success())
-    .unwrap_or(false)
+        .arg("-v")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ═══════════════════════════════════════════════════
@@ -179,8 +177,8 @@ pub fn banner(version: &str) {
     println!(
         "    {} {}  {}",
         "⚡ Oxi".cyan().bold(),
-             "Clean".white().bold(),
-             format!("v{}", version).dimmed()
+        "Clean".white().bold(),
+        format!("v{}", version).dimmed()
     );
     println!(
         "    {}",
@@ -189,8 +187,8 @@ pub fn banner(version: &str) {
     println!(
         "    {}",
         "──────────────────────────────────────────────"
-        .cyan()
-        .dimmed()
+            .cyan()
+            .dimmed()
     );
     println!();
 }

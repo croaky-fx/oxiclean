@@ -23,7 +23,7 @@ fn test_version_flag() {
 #[test]
 fn test_no_args_fails() {
     let output = oxiclean().output().unwrap();
-    assert!(! output.status.success());
+    assert!(!output.status.success());
 }
 
 #[test]
@@ -46,7 +46,10 @@ fn test_dry_run_all() {
 
 #[test]
 fn test_dry_run_deep() {
-    let output = oxiclean().args(["--all", "--dry-run", "--deep"]).output().unwrap();
+    let output = oxiclean()
+        .args(["--all", "--dry-run", "--deep"])
+        .output()
+        .unwrap();
     assert!(output.status.success());
 }
 
@@ -58,6 +61,9 @@ fn test_short_flags() {
 
 #[test]
 fn test_multiple_flags() {
-    let output = oxiclean().args(["--cache", "--trash", "--journal", "--dry-run"]).output().unwrap();
+    let output = oxiclean()
+        .args(["--cache", "--trash", "--journal", "--dry-run"])
+        .output()
+        .unwrap();
     assert!(output.status.success());
 }
