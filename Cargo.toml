@@ -1,6 +1,6 @@
 [package]
 name = "oxiclean"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Fast cross-distribution Linux system cleaner"
 authors = ["You"]
