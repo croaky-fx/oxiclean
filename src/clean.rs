@@ -4,10 +4,6 @@ use std::path::PathBuf;
 use crate::detect::Distro;
 use crate::utils;
 
-// ═══════════════════════════════════════════════════
-//  Helper: should we do deep clean?
-// ═══════════════════════════════════════════════════
-
 fn should_deep(deep: bool, yes: bool, prompt: &str) -> bool {
     if deep {
         return true;
@@ -18,9 +14,25 @@ fn should_deep(deep: bool, yes: bool, prompt: &str) -> bool {
     utils::confirm(prompt)
 }
 
-// ═══════════════════════════════════════════════════
-//  1. User Cache (~/.cache)
-// ═══════════════════════════════════════════════════
+fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
+    match distro {
+        Distro::Arch => Some(PathBuf::from("/var/cache/pacman/pkg")),
+        Distro::Debian => Some(PathBuf::from("/var/cache/apt/archives")),
+        Distro::Fedora => {
+            if utils::which("dnf") {
+                Some(PathBuf::from("/var/cache/dnf"))
+            } else {
+                Some(PathBuf::from("/var/cache/yum"))
+            }
+        }
+        Distro::Suse => Some(PathBuf::from("/var/cache/zypp/packages")),
+        Distro::Void => Some(PathBuf::from("/var/cache/xbps")),
+        Distro::Alpine => Some(PathBuf::from("/var/cache/apk")),
+        Distro::Gentoo => Some(PathBuf::from("/var/cache/distfiles")),
+        Distro::Solus => Some(PathBuf::from("/var/cache/eopkg/packages")),
+        _ => None,
+    }
+}
 
 pub fn user_cache(dry_run: bool) -> u64 {
     utils::section("User Cache (~/.cache)");
@@ -48,10 +60,7 @@ pub fn user_cache(dry_run: bool) -> u64 {
     }
 
     if dry_run {
-        utils::info(&format!(
-            "[DRY RUN] Would free {}",
-            utils::format_size(size)
-        ));
+        utils::info(&format!("[DRY RUN] Would free {}", utils::format_size(size)));
         return 0;
     }
 
@@ -59,10 +68,6 @@ pub fn user_cache(dry_run: bool) -> u64 {
     utils::success(&format!("Freed {}", utils::format_size(freed).green()));
     freed
 }
-
-// ═══════════════════════════════════════════════════
-//  2. Package Manager Cache
-// ═══════════════════════════════════════════════════
 
 pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
     utils::section(&format!("Package Cache ({})", distro.pkg_manager()));
@@ -76,10 +81,13 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         utils::info(&format!(
             "[DRY RUN] Would clean {} cache{}",
             distro.pkg_manager(),
-                             if deep { " (deep)" } else { "" }
+            if deep { " (deep)" } else { "" }
         ));
         return 0;
     }
+
+    let cache_dir = pkg_cache_dir(distro);
+    let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
 
     match distro {
         Distro::Arch => {
@@ -139,11 +147,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
             utils::sudo("nix-collect-garbage", &[]);
             utils::success("Garbage collected");
 
-            if should_deep(
-                deep,
-                yes,
-                "Delete ALL old generations? (nix-collect-garbage -d) [y/N]:",
-            ) {
+            if should_deep(deep, yes, "Delete ALL old generations? (nix-collect-garbage -d) [y/N]:") {
                 utils::run("nix-collect-garbage", &["-d"]);
                 utils::sudo("nix-collect-garbage", &["-d"]);
                 utils::success("Old generations deleted");
@@ -225,12 +229,13 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         Distro::Unknown => {}
     }
 
-    0
+    let size_after = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
+    let freed = size_before.saturating_sub(size_after);
+    if freed > 0 {
+        utils::info(&format!("Package cache freed: {}", utils::format_size(freed).green()));
+    }
+    freed
 }
-
-// ═══════════════════════════════════════════════════
-//  3. Orphaned Packages
-// ═══════════════════════════════════════════════════
 
 pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
     utils::section("Orphaned Packages");
@@ -250,7 +255,7 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
             let pkgs: Vec<&str> = out.lines().collect();
             utils::info(&format!("Found {} orphan(s):", pkgs.len()));
             for p in &pkgs {
-                println!("      {} {}", "•".dimmed(), p);
+                println!("      {} {}", "\u{2022}".dimmed(), p);
             }
             if dry_run {
                 utils::info("[DRY RUN] Would remove above packages");
@@ -295,25 +300,19 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Suse => {
-            let out = utils::capture("zypper", &["packages", "--orphaned"])
-            .unwrap_or_default();
+            let out = utils::capture("zypper", &["packages", "--orphaned"]).unwrap_or_default();
             if out.is_empty() || !out.contains('|') {
                 utils::success("No orphans found");
                 return 0;
             }
-            let pkgs: Vec<String> = out
-            .lines()
-            .filter(|l| l.contains('|') && !l.contains("---") && !l.contains("Name"))
-            .filter_map(|l| {
-                let cols: Vec<&str> = l.split('|').map(|s| s.trim()).collect();
-                if cols.len() >= 3 {
-                    Some(cols[2].to_string())
-                } else {
-                    None
-                }
-            })
-            .filter(|n| !n.is_empty())
-            .collect();
+            let pkgs: Vec<String> = out.lines()
+                .filter(|l| l.contains('|') && !l.contains("---") && !l.contains("Name"))
+                .filter_map(|l| {
+                    let cols: Vec<&str> = l.split('|').map(|s| s.trim()).collect();
+                    if cols.len() >= 3 { Some(cols[2].to_string()) } else { None }
+                })
+                .filter(|n| !n.is_empty())
+                .collect();
 
             if pkgs.is_empty() {
                 utils::success("No orphans found");
@@ -359,7 +358,6 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
                 return 0;
             }
             utils::info("Alpine manages deps via world file");
-            utils::info("Consider: apk del $(apk info -e | grep -v world)");
             utils::warning("Automatic orphan removal not supported on Alpine");
         }
 
@@ -391,7 +389,6 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
 
         Distro::Clear => {
             utils::info("Clear Linux auto-manages dependencies via swupd bundles");
-            utils::info("Run 'swupd bundle-list' to review installed bundles");
         }
 
         Distro::Unknown => {}
@@ -399,10 +396,6 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
 
     0
 }
-
-// ═══════════════════════════════════════════════════
-//  4. AUR Helper Cache (Arch only)
-// ═══════════════════════════════════════════════════
 
 pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
     utils::section(&format!("AUR Cache ({})", helper));
@@ -416,6 +409,9 @@ pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
         return 0;
     }
 
+    let cache_dir = utils::home_dir().map(|h| PathBuf::from(&h).join(".cache").join(helper));
+    let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
+
     utils::info(&format!("Cleaning {} cache...", helper));
     if utils::run(helper, &["-Sc", "--noconfirm"]) {
         utils::success(&format!("{} cache cleaned", helper));
@@ -423,14 +419,7 @@ pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
         utils::error(&format!("{} -Sc failed", helper));
     }
 
-    if should_deep(
-        deep,
-        yes,
-        &format!(
-            "Run {} -Scc? (removes ALL cached AUR packages) [y/N]:",
-                 helper
-        ),
-    ) {
+    if should_deep(deep, yes, &format!("Run {} -Scc? (removes ALL cached AUR packages) [y/N]:", helper)) {
         if utils::run(helper, &["-Scc", "--noconfirm"]) {
             utils::success(&format!("{} deep clean done", helper));
         } else {
@@ -438,12 +427,13 @@ pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
     }
 
-    0
+    let size_after = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
+    let freed = size_before.saturating_sub(size_after);
+    if freed > 0 {
+        utils::info(&format!("AUR cache freed: {}", utils::format_size(freed).green()));
+    }
+    freed
 }
-
-// ═══════════════════════════════════════════════════
-//  5. Flatpak
-// ═══════════════════════════════════════════════════
 
 pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
     utils::section("Flatpak Cleanup");
@@ -456,22 +446,18 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
         return 0;
     }
 
-    // Remove unused runtimes — user level
     utils::info("Removing unused Flatpak runtimes (user)...");
     utils::run("flatpak", &["uninstall", "--unused", "-y"]);
 
-    // Remove unused runtimes — system level
     utils::info("Removing unused Flatpak runtimes (system)...");
     utils::sudo("flatpak", &["uninstall", "--unused", "-y"]);
 
-    // Repair only in deep mode
     if deep {
         utils::info("Repairing Flatpak installation (deep mode)...");
         utils::sudo("flatpak", &["repair"]);
         utils::success("Flatpak repair done");
     }
 
-    // Clean user-level Flatpak temp cache
     let mut freed = 0u64;
     if let Some(home) = utils::home_dir() {
         let fp_cache = PathBuf::from(&home).join(".local/share/flatpak/repo/tmp");
@@ -483,33 +469,11 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
         }
     }
 
-    // Clean system-level Flatpak temp files
-    utils::sudo(
-        "find",
-        &[
-            "/var/tmp",
-            "-name",
-            "flatpak-cache-*",
-            "-exec",
-            "rm",
-            "-rf",
-            "{}",
-            "+",
-        ],
-    );
+    utils::sudo("find", &["/var/tmp", "-name", "flatpak-cache-*", "-exec", "rm", "-rf", "{}", "+"]);
 
-    // Clean system repo tmp
     let sys_fp_tmp = PathBuf::from("/var/lib/flatpak/repo/tmp");
     if sys_fp_tmp.exists() {
-        utils::sudo(
-            "find",
-            &[
-                "/var/lib/flatpak/repo/tmp",
-                "-mindepth",
-                "1",
-                "-delete",
-            ],
-        );
+        utils::sudo("find", &["/var/lib/flatpak/repo/tmp", "-mindepth", "1", "-delete"]);
     }
 
     if freed > 0 {
@@ -521,10 +485,6 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
     freed
 }
 
-// ═══════════════════════════════════════════════════
-//  6. Snap
-// ═══════════════════════════════════════════════════
-
 pub fn snap(dry_run: bool) -> u64 {
     utils::section("Snap Cleanup");
 
@@ -534,18 +494,13 @@ pub fn snap(dry_run: bool) -> u64 {
     }
 
     let out = utils::capture("snap", &["list", "--all"]).unwrap_or_default();
-    let disabled: Vec<(&str, &str)> = out
-    .lines()
-    .filter(|l| l.contains("disabled"))
-    .filter_map(|l| {
-        let parts: Vec<&str> = l.split_whitespace().collect();
-        if parts.len() >= 3 {
-            Some((parts[0], parts[2]))
-        } else {
-            None
-        }
-    })
-    .collect();
+    let disabled: Vec<(&str, &str)> = out.lines()
+        .filter(|l| l.contains("disabled"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            if parts.len() >= 3 { Some((parts[0], parts[2])) } else { None }
+        })
+        .collect();
 
     if disabled.is_empty() {
         utils::info("No disabled snap revisions found");
@@ -567,10 +522,7 @@ pub fn snap(dry_run: bool) -> u64 {
         let size = utils::dir_size(&snap_cache);
         if size > 0 {
             utils::info("Cleaning snap cache...");
-            utils::sudo(
-                "find",
-                &["/var/lib/snapd/cache", "-type", "f", "-delete"],
-            );
+            utils::sudo("find", &["/var/lib/snapd/cache", "-type", "f", "-delete"]);
             freed += size;
             utils::success(&format!("Freed {}", utils::format_size(size).green()));
         }
@@ -578,10 +530,6 @@ pub fn snap(dry_run: bool) -> u64 {
 
     freed
 }
-
-// ═══════════════════════════════════════════════════
-//  7. Systemd Journal
-// ═══════════════════════════════════════════════════
 
 pub fn journal(dry_run: bool) -> u64 {
     utils::section("Systemd Journal");
@@ -600,6 +548,9 @@ pub fn journal(dry_run: bool) -> u64 {
         return 0;
     }
 
+    let journal_dir = PathBuf::from("/var/log/journal");
+    let size_before = utils::dir_size(&journal_dir);
+
     utils::info("Vacuuming journal (keeping 50M)...");
     if utils::sudo("journalctl", &["--vacuum-size=50M"]) {
         utils::success("Journal vacuumed");
@@ -607,12 +558,13 @@ pub fn journal(dry_run: bool) -> u64 {
         utils::error("Journal vacuum failed");
     }
 
-    0
+    let size_after = utils::dir_size(&journal_dir);
+    let freed = size_before.saturating_sub(size_after);
+    if freed > 0 {
+        utils::info(&format!("Journal freed: {}", utils::format_size(freed).green()));
+    }
+    freed
 }
-
-// ═══════════════════════════════════════════════════
-//  8. Trash
-// ═══════════════════════════════════════════════════
 
 pub fn trash(dry_run: bool) -> u64 {
     utils::section("Trash");
@@ -643,16 +595,10 @@ pub fn trash(dry_run: bool) -> u64 {
         return 0;
     }
 
-    utils::info(&format!(
-        "Trash size: {}",
-        utils::format_size(total_size).yellow()
-    ));
+    utils::info(&format!("Trash size: {}", utils::format_size(total_size).yellow()));
 
     if dry_run {
-        utils::info(&format!(
-            "[DRY RUN] Would free {}",
-            utils::format_size(total_size)
-        ));
+        utils::info(&format!("[DRY RUN] Would free {}", utils::format_size(total_size)));
         return 0;
     }
 
