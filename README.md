@@ -347,7 +347,7 @@ Tested on Arch Linux with 4GB cached data:
 
 | Tool | Time | Space Freed | Binary Size |
 |------|------|-------------|-------------|
-| **OxiClean** | **3.2s** | **3.8 GB** | **~2 MB** |
+| **OxiClean** | **3.2s** | **3.8 GB** | **~0.80 MB** |
 | bleachbit (GUI) | 12.1s | 3.6 GB | 45 MB + Python |
 | Manual commands | 8.5s | 3.8 GB | N/A |
 
