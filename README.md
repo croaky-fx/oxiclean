@@ -8,6 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Linux](https://img.shields.io/badge/Platform-Linux-yellow?logo=linux&logoColor=white)](https://kernel.org)
 [![AUR](https://img.shields.io/aur/version/oxiclean?logo=archlinux&label=AUR&color=1793D1)](https://aur.archlinux.org/packages/oxiclean)
+[![CI](https://github.com/croaky-fx/oxiclean/actions/workflows/ci.yml/badge.svg)](https://github.com/croaky-fx/oxiclean/actions/workflows/ci.yml)
 [![Stars](https://img.shields.io/github/stars/croaky-fx/oxiclean?style=social)](https://github.com/croaky-fx/oxiclean)
 
 *One tool to clean them all.*
@@ -30,21 +31,25 @@ Every Linux distribution has its own package manager, its own cache locations, i
 ```
 $ oxiclean --all
 
-    ⚡ Oxi Clean  v1.0.0
+    ⚡ Oxi Clean  v1.0.3
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
-  System: Arch Linux
+  System: CachyOS Linux
   Distro: Arch Linux (pacman)
   AUR:    paru
   Flatpak: detected ✔
+
+  🔐 Requesting sudo privileges...
 
   ━━▶ User Cache (~/.cache)
     ℹ Cache size: 2.14 GB
     ✔ Freed 2.14 GB
 
   ━━▶ Package Cache (pacman)
+    ℹ Cleaning pacman cache (keeping latest version)...
     ✔ pacman cache cleaned
+    ℹ Package cache freed: 847.32 MB
 
   ━━▶ Orphaned Packages
     ℹ Found 3 orphan(s):
@@ -54,7 +59,9 @@ $ oxiclean --all
     ✔ Orphans removed
 
   ━━▶ AUR Cache (paru)
+    ℹ Cleaning paru cache...
     ✔ paru cache cleaned
+    ℹ AUR cache freed: 124.50 MB
 
   ━━▶ Flatpak Cleanup
     ✔ Flatpak cleanup done
@@ -62,12 +69,13 @@ $ oxiclean --all
   ━━▶ Systemd Journal
     ℹ Current usage: Archived and active journals take up 312.0M
     ✔ Journal vacuumed
+    ℹ Journal freed: 262.00 MB
 
   ━━▶ Trash
     ✔ Trash is empty
 
   ══════════════════════════════════════════════
-  ⚡ Total freed: 2.87 GB
+  ⚡ Total freed: 3.36 GB
   ⏱  Completed in: 3.41s
   ══════════════════════════════════════════════
 ```
@@ -114,9 +122,10 @@ $ oxiclean --all
 
 ### ⚡ Performance
 - Written in pure Rust
-- Single static binary (~2MB)
+- Single static binary (~800 KB)
 - Zero runtime dependencies
 - Minimal memory footprint
+- Accurate freed space reporting
 
 </td>
 </tr>
@@ -185,6 +194,16 @@ sudo cp target/release/oxiclean /usr/local/bin/
 
 ```bash
 cargo install --git https://github.com/croaky-fx/oxiclean.git
+```
+
+### Pre-built Binary
+
+Download from [Releases](https://github.com/croaky-fx/oxiclean/releases):
+
+```bash
+curl -LO https://github.com/croaky-fx/oxiclean/releases/latest/download/oxiclean-x86_64-linux-gnu
+chmod +x oxiclean-x86_64-linux-gnu
+sudo mv oxiclean-x86_64-linux-gnu /usr/local/bin/oxiclean
 ```
 
 ### Build Requirements
@@ -286,6 +305,8 @@ Options:
 oxiclean/
 ├── Cargo.toml       # Dependencies: clap + colored (minimal)
 ├── PKGBUILD         # AUR package build script
+├── tests/
+│   └── cli_test.rs  # Integration tests
 └── src/
     ├── main.rs      # CLI parsing, orchestration, summary
     ├── detect.rs    # Distro detection, tool discovery
@@ -318,6 +339,19 @@ oxiclean/
      └─ (unknown)        → Universal cleaning only
 ```
 
+### How Freed Space Is Measured
+
+| Operation | Method |
+|-----------|--------|
+| User cache | Direct file size before/after deletion |
+| Package cache | `/var/cache/pacman/pkg` (or equivalent) before/after |
+| AUR cache | `~/.cache/paru` (or equivalent) before/after |
+| Journal | `/var/log/journal` before/after vacuum |
+| Flatpak | Temp directory size measurement |
+| Snap | Cache directory size measurement |
+| Trash | Direct file size before/after deletion |
+| Orphans | Not measurable (files spread across system) |
+
 ## 🛡️ Safety
 
 OxiClean is designed with safety as a core principle:
@@ -347,11 +381,34 @@ Tested on Arch Linux with 4GB cached data:
 
 | Tool | Time | Space Freed | Binary Size |
 |------|------|-------------|-------------|
-| **OxiClean** | **3.2s** | **3.8 GB** | **~0.80 MB** |
+| **OxiClean** | **3.2s** | **3.8 GB** | **~800 KB** |
 | bleachbit (GUI) | 12.1s | 3.6 GB | 45 MB + Python |
 | Manual commands | 8.5s | 3.8 GB | N/A |
 
 > *Single binary, no runtime dependencies, no Python, no GUI toolkit.*
+
+## 🧪 Testing
+
+OxiClean includes comprehensive tests:
+
+```bash
+# Run all tests
+cargo test
+
+# Run with output
+cargo test -- --nocapture
+
+# Run clippy (linting)
+cargo clippy -- -D warnings
+
+# Format check
+cargo fmt -- --check
+```
+
+**Test coverage:**
+- **20 unit tests** — format_size, dir_size, rm_contents, which, capture, distro detection
+- **9 integration tests** — CLI flags, dry-run mode, help/version output
+- **CI pipeline** — Automated testing on every push via GitHub Actions
 
 ## 🤝 Contributing
 
@@ -361,6 +418,7 @@ Contributions are welcome! Here's how to get started:
 git clone https://github.com/croaky-fx/oxiclean.git
 cd oxiclean
 cargo build
+cargo test
 cargo clippy -- -D warnings
 cargo fmt
 ```
@@ -405,7 +463,7 @@ If your distro is based on Arch, Debian, Fedora, SUSE, or any supported family �
 
 - **Speed**: Native compiled binary, no interpreter overhead
 - **Safety**: Memory-safe, no segfaults, no undefined behavior
-- **Size**: Single ~2MB binary with zero runtime dependencies
+- **Size**: Single ~800KB binary with zero runtime dependencies
 - **Reliability**: Strong type system catches errors at compile time
 </details>
 
