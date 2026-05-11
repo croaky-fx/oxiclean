@@ -367,6 +367,54 @@ OxiClean is designed with safety as a core principle:
 - User documents, downloads, or personal files
 - Running application data
 - Boot files or kernel images
+## 📊 Real Example Output
+
+Here's an actual run on CachyOS (Arch-based) with real system state:
+
+```
+$ oxiclean -A -y
+
+    ⚡ Oxi Clean  v1.0.3
+    Fast Cross-Distribution Linux System Cleaner
+    ──────────────────────────────────────────────
+
+  System: CachyOS
+  Distro: Arch Linux (pacman)
+  AUR: paru
+  Flatpak: detected ✔
+
+  ━━▶ User Cache (~/.cache)
+    ✔ Freed 59.21 MB
+
+  ━━▶ Package Cache (pacman)
+    ✔ pacman cache cleaned
+
+  ━━▶ AUR Cache (paru)
+    ✔ paru cache cleaned
+
+  ━━▶ Flatpak Cleanup
+    ✔ Flatpak cleanup done
+
+  ━━▶ Systemd Journal
+    ✔ Journal vacuumed
+
+  ━━▶ Trash
+    ✔ Trash is empty
+
+  ══════════════════════════════════════════════
+  ⚡ Total freed: 59.21 MB
+  ⏱  Completed in: 1.98s
+  ══════════════════════════════════════════════
+```
+
+### Why Results Vary
+
+- **System state matters** — Different cache sizes depending on usage
+- **Hardware affects speed** — HDD vs NVMe, CPU speed, etc.
+- **Distro-specific** — Package manager implementations differ
+- **User behavior** — How much you've cached affects totals
+
+**The real value: Works consistently across all distros, not in raw numbers.**
 ## 🧪 Testing
 
 OxiClean includes comprehensive tests:
