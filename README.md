@@ -367,19 +367,6 @@ OxiClean is designed with safety as a core principle:
 - User documents, downloads, or personal files
 - Running application data
 - Boot files or kernel images
-
-## 📊 Benchmarks
-
-Tested on Arch Linux with 4GB cached data:
-
-| Tool | Time | Space Freed | Binary Size |
-|------|------|-------------|-------------|
-| **OxiClean** | **3.2s** | **3.8 GB** | **~800 KB** |
-| bleachbit (GUI) | 12.1s | 3.6 GB | 45 MB + Python |
-| Manual commands | 8.5s | 3.8 GB | N/A |
-
-> *Single binary, no runtime dependencies, no Python, no GUI toolkit.*
-
 ## 🧪 Testing
 
 OxiClean includes comprehensive tests:
