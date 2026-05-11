@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.4] - 2026-05-11
+
+### Fixed
+- Improved Unicode handling and text display
+
 ## [1.0.3] - 2026-03-28
 
 ### Fixed
