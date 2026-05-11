@@ -31,7 +31,7 @@ Every Linux distribution has its own package manager, its own cache locations, i
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.0.3
+    ⚡ Oxi Clean  v1.0.4
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -374,7 +374,7 @@ Here's an actual run on CachyOS (Arch-based) with real system state:
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.0.3
+    ⚡ Oxi Clean  v1.0.4
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
