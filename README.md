@@ -29,55 +29,48 @@ Every Linux distribution has its own package manager, its own cache locations, i
 **OxiClean solves this.** It detects your distribution automatically and runs the right cleanup commands — from Arch to Void, from Debian to NixOS. One tool, every distro.
 
 ```
-$ oxiclean --all
+$ oxiclean -A -y
 
     ⚡ Oxi Clean  v1.0.3
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
-  System: CachyOS Linux
+  System: CachyOS
   Distro: Arch Linux (pacman)
-  AUR:    paru
+  AUR: paru
   Flatpak: detected ✔
 
   🔐 Requesting sudo privileges...
 
   ━━▶ User Cache (~/.cache)
-    ℹ Cache size: 2.14 GB
-    ✔ Freed 2.14 GB
+    ℹ Cache size: 216.31 MB
+    ✔ Freed 215.63 MB
 
   ━━▶ Package Cache (pacman)
-    ℹ Cleaning pacman cache (keeping latest version)...
     ✔ pacman cache cleaned
-    ℹ Package cache freed: 847.32 MB
 
   ━━▶ Orphaned Packages
-    ℹ Found 3 orphan(s):
-      • lib32-libx11
-      • python-deprecated
-      • ruby-irb
-    ✔ Orphans removed
+    ✔ No orphans found
 
   ━━▶ AUR Cache (paru)
-    ℹ Cleaning paru cache...
     ✔ paru cache cleaned
-    ℹ AUR cache freed: 124.50 MB
 
   ━━▶ Flatpak Cleanup
     ✔ Flatpak cleanup done
 
   ━━▶ Systemd Journal
-    ℹ Current usage: Archived and active journals take up 312.0M
+    ℹ Current usage: 45.9M
     ✔ Journal vacuumed
-    ℹ Journal freed: 262.00 MB
 
   ━━▶ Trash
     ✔ Trash is empty
 
   ══════════════════════════════════════════════
-  ⚡ Total freed: 3.36 GB
-  ⏱  Completed in: 3.41s
+  ⚡ Total freed: 215.63 MB
+  ⏱  Completed in: 9.62s
   ══════════════════════════════════════════════
+"Real output on CachyOS, HDD 5400rpm, after recent cleanup.
+Results vary based on cache size and disk type"
 ```
 
 ## ✨ Features
