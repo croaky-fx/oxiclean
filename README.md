@@ -9,24 +9,14 @@
 [![Linux](https://img.shields.io/badge/Platform-Linux-yellow?logo=linux&logoColor=white)](https://kernel.org)
 [![AUR](https://img.shields.io/aur/version/oxiclean?logo=archlinux&label=AUR&color=1793D1)](https://aur.archlinux.org/packages/oxiclean)
 [![CI](https://github.com/croaky-fx/oxiclean/actions/workflows/ci.yml/badge.svg)](https://github.com/croaky-fx/oxiclean/actions/workflows/ci.yml)
-[![Stars](https://img.shields.io/github/stars/croaky-fx/oxiclean?style=social)](https://github.com/croaky-fx/oxiclean)
-
-*One tool to clean them all.*
-
-Reclaim disk space across **any** Linux distribution with a single command.
-No configuration. No dependencies. Just one fast binary.
-
-[Features](#-features) · [Install](#-installation) · [Usage](#-usage) · [Supported Distros](#-supported-distributions) · [Contributing](#-contributing)
-
----
 
 </div>
 
-## 🤔 Why OxiClean?
+---
 
-Every Linux distribution has its own package manager, its own cache locations, its own cleanup commands. Switching distros means memorizing new commands. Cleaning scripts break across systems.
+I hop between Linux distros a lot. Arch one month, Fedora the next, maybe Void when I'm feeling adventurous. And every single time I'd forget: *what's the command to clean orphaned packages here again? where does this distro put its package cache?*
 
-**OxiClean solves this.** It detects your distribution automatically and runs the right cleanup commands — from Arch to Void, from Debian to NixOS. One tool, every distro.
+So I wrote OxiClean. It figures out what distro you're on and does the right thing. That's basically it.
 
 ```
 $ oxiclean -A -y
@@ -69,113 +59,34 @@ $ oxiclean -A -y
   ⚡ Total freed: 215.63 MB
   ⏱  Completed in: 9.62s
   ══════════════════════════════════════════════
-"Real output on CachyOS, HDD 5400rpm, after recent cleanup.
-Results vary based on cache size and disk type"
 ```
 
-## ✨ Features
+*(Real output on CachyOS, spinning HDD at 5400rpm, right after a cleanup — so don't expect huge numbers every time)*
 
-<table>
-<tr>
-<td width="50%">
+---
 
-### 🔍 Smart Detection
-- Auto-detects your Linux distribution
-- Identifies available package managers
-- Finds AUR helpers (paru, yay, trizen...)
-- Checks for Flatpak and Snap installations
+## What it cleans
 
-</td>
-<td width="50%">
-
-### 🧹 Comprehensive Cleaning
-- User cache (~/.cache)
-- Package manager cache
-- Orphaned packages
-- AUR helper cache
+- `~/.cache` — the obvious stuff
+- Package manager cache (pacman, apt, dnf, zypper, xbps, apk, portage...)
+- Orphaned packages — things nothing depends on anymore
+- AUR helper cache (paru, yay, trizen, etc.)
 - Flatpak unused runtimes
 - Snap disabled revisions
 - Systemd journal logs
-- Trash files
+- Trash
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+It handles **50+ distributions** across 10 package manager families. If you're on something obscure it doesn't know, it'll still clean the universal stuff (cache, trash, journal, Flatpak, Snap) without complaining.
 
-### 🛡️ Safety First
-- Dry-run mode — preview before cleaning
-- Preserves directory structure
-- Graceful error handling
-- Interactive confirmations
-- Never deletes system-critical files
+## Installation
 
-</td>
-<td width="50%">
-
-### ⚡ Performance
-- Written in pure Rust
-- Single static binary (~800 KB)
-- Zero runtime dependencies
-- Minimal memory footprint
-- Accurate freed space reporting
-
-</td>
-</tr>
-</table>
-
-### Cleaning Modes
-
-| Mode | Flag | Behavior |
-|------|------|----------|
-| **Standard** | *(default)* | Safe cleanup with confirmations |
-| **Auto** | `--yes` | Standard cleanup, skip prompts |
-| **Deep** | `--deep` | Aggressive cleanup (e.g. pacman -Scc, flatpak repair) |
-| **Preview** | `--dry-run` | Show what would be cleaned, change nothing |
-| **Full Auto** | `--all --yes --deep` | Maximum cleanup, no prompts |
-
-## 📦 Supported Distributions
-
-OxiClean supports **50+** Linux distributions across **10** package manager families:
-
-| Family | Distributions | Package Manager | Cache Clean | Orphan Removal |
-|--------|--------------|-----------------|:-----------:|:--------------:|
-| **Arch** | Arch, Manjaro, EndeavourOS, Garuda, Artix, CachyOS, ArcoLinux, Archcraft, Parabola... | `pacman` | ✅ `-Sc` / `-Scc` | ✅ `-Qdtq` + `-Rns` |
-| **Debian** | Debian, Ubuntu, Mint, Pop!_OS, Elementary, Zorin, Kali, MX, Deepin, Devuan... | `apt` | ✅ `clean` / `autoclean` | ✅ `autoremove` |
-| **Fedora** | Fedora, RHEL, CentOS, Rocky, Alma, Nobara, Oracle... | `dnf` / `yum` | ✅ `clean all` | ✅ `autoremove` |
-| **SUSE** | openSUSE Leap, Tumbleweed, MicroOS, SLES... | `zypper` | ✅ `clean --all` | ✅ orphaned detection |
-| **NixOS** | NixOS | `nix` | ✅ `nix-collect-garbage` | ✅ generation cleanup |
-| **Void** | Void Linux | `xbps` | ✅ `-O` | ✅ `-o` |
-| **Alpine** | Alpine, postmarketOS | `apk` | ✅ `cache clean` | ⚠️ manual |
-| **Gentoo** | Gentoo, Funtoo, Calculate | `portage` | ✅ `eclean` | ✅ `--depclean` |
-| **Solus** | Solus | `eopkg` | ✅ `delete-cache` | ✅ `remove-orphans` |
-| **Clear** | Clear Linux | `swupd` | ✅ staged cleanup | ℹ️ bundle-based |
-
-### Universal Support (all distros)
-
-| Target | Method |
-|--------|--------|
-| **User Cache** | `~/.cache/*` safe removal |
-| **Flatpak** | Remove unused runtimes + temp cache |
-| **Snap** | Remove disabled revisions + cache |
-| **Journal** | `journalctl --vacuum-size=50M` |
-| **Trash** | XDG trash directories cleanup |
-| **AUR Helpers** | paru, yay, trizen, pikaur, aura |
-
-## 🚀 Installation
-
-### AUR (Arch Linux)
-
+**Arch (AUR):**
 ```bash
-# With paru
 paru -S oxiclean
-
-# With yay
-yay -S oxiclean
+# or yay -S oxiclean
 ```
 
-### From Source
-
+**From source:**
 ```bash
 git clone https://github.com/croaky-fx/oxiclean.git
 cd oxiclean
@@ -183,84 +94,52 @@ cargo build --release
 sudo cp target/release/oxiclean /usr/local/bin/
 ```
 
-### Cargo Install
-
+**Cargo:**
 ```bash
 cargo install --git https://github.com/croaky-fx/oxiclean.git
 ```
 
-### Pre-built Binary
-
-Download from [Releases](https://github.com/croaky-fx/oxiclean/releases):
-
+**Pre-built binary:**
 ```bash
 curl -LO https://github.com/croaky-fx/oxiclean/releases/latest/download/oxiclean-x86_64-linux-gnu
 chmod +x oxiclean-x86_64-linux-gnu
 sudo mv oxiclean-x86_64-linux-gnu /usr/local/bin/oxiclean
 ```
 
-### Build Requirements
+Requires: Rust 1.70+, Linux, sudo.
 
-- Rust 1.70+ (`rustup default stable`)
-- Linux (any distribution)
-- `sudo` for privileged operations
+---
 
-## 📖 Usage
+## Usage
 
-### Quick Start
+I'd recommend running with `--dry-run` first, at least the first time:
 
 ```bash
-# Preview first (always recommended)
+# See what would happen, touch nothing
 oxiclean --all --dry-run
 
-# Clean everything with confirmations
+# Run it
 oxiclean --all
 
-# Clean everything without prompts
-oxiclean --all --yes
-```
-
-### Common Patterns
-
-```bash
-# Full cleanup — safe mode (asks before aggressive operations)
-oxiclean --all
-
-# Full cleanup — no prompts
+# Run it without asking questions
 oxiclean --all --yes
 
-# Full deep cleanup — maximum space recovery
-oxiclean --all --yes --deep
-
-# Preview mode — see what would be cleaned
-oxiclean --all --dry-run
-
-# Selective cleanup
-oxiclean --cache --trash          # Just cache and trash
-oxiclean --packages --orphans     # Package manager only
-oxiclean --flatpak --snap         # Container packages only
-oxiclean --journal                # Just journal logs
-oxiclean --aur                    # AUR helper cache only
-```
-
-### Recommended Workflow
-
-```bash
-# Step 1: Always preview first
-oxiclean --all --dry-run
-
-# Step 2: Run standard cleanup
-oxiclean --all --yes
-
-# Step 3: If you need more space, go deep
+# Go deeper (more aggressive — pacman -Scc, flatpak repair, etc.)
 oxiclean --all --yes --deep
 ```
 
-## 🎯 CLI Reference
+You can also target specific things if you don't want to clean everything:
+
+```bash
+oxiclean --cache --trash
+oxiclean --packages --orphans
+oxiclean --journal
+oxiclean --flatpak --snap
+```
+
+### All flags
 
 ```
-Usage: oxiclean [OPTIONS]
-
 Options:
   -c, --cache       Clean user cache (~/.cache)
   -p, --packages    Clean package manager cache
@@ -278,255 +157,157 @@ Options:
   -V, --version     Print version
 ```
 
-### Flag Combinations
+---
 
-| Command | What It Does |
-|---------|-------------|
-| `--all` | All operations, asks for deep clean |
-| `--all --yes` | All operations, standard mode, no prompts |
-| `--all --deep` | All operations, deep mode, asks confirmation |
-| `--all --yes --deep` | Everything, aggressive, no prompts |
-| `--all --dry-run` | Preview all operations |
-| `--cache` | Only `~/.cache` cleanup |
-| `--packages --deep` | Pkg cache with aggressive mode |
-| `--orphans` | Only orphan removal |
-| `--aur --deep` | AUR cache with `-Scc` |
+## Supported distros
 
-## 🏗️ Architecture
+| Family | Package Manager | Cache | Orphans |
+|--------|----------------|:-----:|:-------:|
+| Arch, Manjaro, EndeavourOS, Garuda, CachyOS, Artix... | `pacman` | ✅ | ✅ |
+| Debian, Ubuntu, Mint, Pop!_OS, Kali, MX... | `apt` | ✅ | ✅ |
+| Fedora, RHEL, CentOS, Rocky, Alma, Nobara... | `dnf` / `yum` | ✅ | ✅ |
+| openSUSE Leap, Tumbleweed, MicroOS... | `zypper` | ✅ | ✅ |
+| NixOS | `nix` | ✅ | ✅ |
+| Void Linux | `xbps` | ✅ | ✅ |
+| Alpine, postmarketOS | `apk` | ✅ | ⚠️ |
+| Gentoo, Funtoo, Calculate | `portage` | ✅ | ✅ |
+| Solus | `eopkg` | ✅ | ✅ |
+| Clear Linux | `swupd` | ✅ | ℹ️ |
 
+---
+
+## A few things worth knowing
+
+**It won't touch your personal files.** No documents, no downloads, no running app data, no boot files. Only caches, package leftovers, and logs. If you're still nervous, `--dry-run` exists for a reason.
+
+**Results vary a lot.** Whether you free 5MB or 2GB depends on how long since you last cleaned, your distro, and your disk. The tool's value isn't in big numbers — it's in not having to remember 10 different commands for 10 different distros.
+
+**`--deep` is a bit more aggressive.** Things like `pacman -Scc` (removes *all* cached packages, not just old ones) or `flatpak repair`. Useful for squeezing out more space, but worth knowing what you're getting into. Run `--dry-run --deep` first if unsure.
+
+**It needs sudo for some things** — package cache, orphan removal, journal. For user-level stuff (your `~/.cache`, trash) it won't ask.
+
+**Cron-friendly:**
 ```
-oxiclean/
-├── Cargo.toml       # Dependencies: clap + colored (minimal)
-├── PKGBUILD         # AUR package build script
-├── tests/
-│   └── cli_test.rs  # Integration tests
-└── src/
-    ├── main.rs      # CLI parsing, orchestration, summary
-    ├── detect.rs    # Distro detection, tool discovery
-    ├── clean.rs     # All cleaning operations
-    └── utils.rs     # Command execution, file ops, UI helpers
+0 3 * * 0 /usr/local/bin/oxiclean --all --yes
 ```
+Avoid `--deep` in automated runs.
 
-### Design Principles
+---
 
-1. **Detect, Don't Assume** — Read `/etc/os-release`, check `$PATH`
-2. **Measure Before Delete** — Calculate sizes for accurate reporting
-3. **Preserve Structure** — Remove contents, keep directories
-4. **Fail Gracefully** — Skip unavailable operations, never crash
-5. **Minimal Dependencies** — Only `clap` (CLI) + `colored` (output)
+## How it works under the hood
 
-### How Detection Works
+It reads `/etc/os-release` to figure out your distro, then checks `$PATH` for which tools are available. Detection chain looks roughly like:
 
 ```
 /etc/os-release
-     │
-     ├─ ID=arch          → Distro::Arch    → pacman
-     ├─ ID=ubuntu        → Distro::Debian  → apt
-     ├─ ID=fedora        → Distro::Fedora  → dnf
-     ├─ ID=opensuse-...  → Distro::Suse    → zypper
-     ├─ ID=nixos         → Distro::Nix     → nix
-     ├─ ID=void          → Distro::Void    → xbps
-     ├─ ID=alpine        → Distro::Alpine  → apk
-     ├─ ID=gentoo        → Distro::Gentoo  → portage
-     ├─ ID_LIKE=arch     → Distro::Arch    → pacman    (fallback)
-     └─ (unknown)        → Universal cleaning only
+  ID=arch          → pacman
+  ID=ubuntu        → apt
+  ID=fedora        → dnf
+  ID=opensuse-...  → zypper
+  ID_LIKE=arch     → pacman  (for derivatives)
+  (unknown)        → universal cleaning only
 ```
 
-### How Freed Space Is Measured
+Freed space is measured by checking directory sizes before and after — not estimated. The one exception is orphan removal, since those files are scattered across the system.
 
-| Operation | Method |
-|-----------|--------|
-| User cache | Direct file size before/after deletion |
-| Package cache | `/var/cache/pacman/pkg` (or equivalent) before/after |
-| AUR cache | `~/.cache/paru` (or equivalent) before/after |
-| Journal | `/var/log/journal` before/after vacuum |
-| Flatpak | Temp directory size measurement |
-| Snap | Cache directory size measurement |
-| Trash | Direct file size before/after deletion |
-| Orphans | Not measurable (files spread across system) |
+The binary itself is ~800KB with no runtime dependencies. Just `clap` for CLI parsing and `colored` for the output colors.
 
-## 🛡️ Safety
+---
 
-OxiClean is designed with safety as a core principle:
-
-| Concern | How OxiClean Handles It |
-|---------|------------------------|
-| **Accidental deletion** | `--dry-run` to preview, confirmations for destructive ops |
-| **System files** | Never touches system directories; only user cache + pkg manager |
-| **Permission errors** | Catches and skips files it can't delete |
-| **Unknown distros** | Falls back to universal cleaning (cache, trash, journal) |
-| **Orphan removal** | Lists packages before removal, asks for confirmation |
-| **Deep clean** | Requires explicit `--deep` flag; warned in output |
-| **Symlinks** | Skipped during cache cleanup to prevent escaping directories |
-
-### What OxiClean Does NOT Touch
-
-- `/tmp`, `/var/tmp` (managed by system)
-- `/var/log` (managed by logrotate)
-- System configuration files
-- User documents, downloads, or personal files
-- Running application data
-- Boot files or kernel images
-## 📊 Real Example Output
-
-Here's an actual run on CachyOS (Arch-based) with real system state:
+## Project structure
 
 ```
-$ oxiclean -A -y
-
-    ⚡ Oxi Clean  v1.0.4
-    Fast Cross-Distribution Linux System Cleaner
-    ──────────────────────────────────────────────
-
-  System: CachyOS
-  Distro: Arch Linux (pacman)
-  AUR: paru
-  Flatpak: detected ✔
-
-  ━━▶ User Cache (~/.cache)
-    ✔ Freed 59.21 MB
-
-  ━━▶ Package Cache (pacman)
-    ✔ pacman cache cleaned
-
-  ━━▶ AUR Cache (paru)
-    ✔ paru cache cleaned
-
-  ━━▶ Flatpak Cleanup
-    ✔ Flatpak cleanup done
-
-  ━━▶ Systemd Journal
-    ✔ Journal vacuumed
-
-  ━━▶ Trash
-    ✔ Trash is empty
-
-  ══════════════════════════════════════════════
-  ⚡ Total freed: 59.21 MB
-  ⏱  Completed in: 1.98s
-  ══════════════════════════════════════════════
+oxiclean/
+├── Cargo.toml
+├── PKGBUILD
+├── tests/
+│   └── cli_test.rs
+└── src/
+    ├── main.rs     # CLI parsing, orchestration, summary
+    ├── detect.rs   # Distro detection, tool discovery
+    ├── clean.rs    # All cleaning operations
+    └── utils.rs    # Command execution, file ops, helpers
 ```
 
-### Why Results Vary
+---
 
-- **System state matters** — Different cache sizes depending on usage
-- **Hardware affects speed** — HDD vs NVMe, CPU speed, etc.
-- **Distro-specific** — Package manager implementations differ
-- **User behavior** — How much you've cached affects totals
-
-**The real value: Works consistently across all distros, not in raw numbers.**
-## 🧪 Testing
-
-OxiClean includes comprehensive tests:
+## Testing
 
 ```bash
-# Run all tests
 cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run clippy (linting)
+cargo test -- --nocapture  # with output
 cargo clippy -- -D warnings
-
-# Format check
 cargo fmt -- --check
 ```
 
-**Test coverage:**
-- **20 unit tests** — format_size, dir_size, rm_contents, which, capture, distro detection
-- **9 integration tests** — CLI flags, dry-run mode, help/version output
-- **CI pipeline** — Automated testing on every push via GitHub Actions
+There are 20 unit tests covering formatting, directory sizing, file removal, distro detection, etc., and 9 integration tests for CLI flags and dry-run behavior.
 
-## 🤝 Contributing
+---
 
-Contributions are welcome! Here's how to get started:
+## Contributing
 
 ```bash
 git clone https://github.com/croaky-fx/oxiclean.git
 cd oxiclean
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt
+cargo build && cargo test
 ```
 
-### Adding a New Distribution
-
-1. Add the variant to `Distro` enum in `detect.rs`
-2. Add the ID to the detection arrays in `detect.rs`
-3. Add cache cleaning logic in `clean.rs` → `pkg_cache()`
-4. Add orphan removal logic in `clean.rs` → `orphans()`
+**Adding a new distro** — the process is pretty mechanical:
+1. Add a variant to the `Distro` enum in `detect.rs`
+2. Add its ID to the detection arrays
+3. Add cache cleaning in `clean.rs → pkg_cache()`
+4. Add orphan removal in `clean.rs → orphans()`
 5. Update the README table
-6. Test on the target distribution (or VM/container)
+6. Test it (a VM or container works fine)
 
-### Areas for Contribution
+**Things I'd love help with:**
+- More distros (Guix, Slackware...)
+- Shell completions (bash, zsh, fish)
+- `doas` support as a sudo alternative
+- `--quiet` mode
+- Integration tests with Docker containers
+- Logging to file (`--log`)
 
-- [ ] Add more distributions (Guix, Slackware, etc.)
-- [ ] Locale/i18n support
-- [ ] Optional config file for custom paths
-- [ ] Shell completions (bash, zsh, fish)
-- [ ] Logging to file (`--log`)
-- [ ] Quiet mode (`--quiet`)
-- [ ] Integration tests with Docker containers
-- [ ] `doas` support as sudo alternative
-- [ ] Disk usage before/after comparison
+---
 
-## 📝 FAQ
+## FAQ
 
 <details>
-<summary><b>Is it safe to run with <code>--all --yes --deep</code>?</b></summary>
+<summary>Is <code>--all --yes --deep</code> safe to run?</summary>
 
-It removes all cached packages (not installed packages), all orphaned packages, all old Nix generations, and vacuums journal logs. Your installed software and personal files are never touched. If unsure, run with `--dry-run` first.
+It removes cached packages (not installed ones), orphaned packages, old Nix generations, and vacuums journal logs. Your actual software and personal files are never touched. If you're unsure, run `--dry-run` first — that's what it's there for.
 </details>
 
 <details>
-<summary><b>Does it work on my distro?</b></summary>
+<summary>Does it work on my distro?</summary>
 
-If your distro is based on Arch, Debian, Fedora, SUSE, or any supported family — yes. Even on unknown distros, universal cleaning (cache, trash, journal, Flatpak, Snap) still works.
+If your distro is based on any of the supported families (Arch, Debian, Fedora, etc.) — yes. Unknown distros get universal cleaning (cache, trash, journal, Flatpak, Snap) which is still useful.
 </details>
 
 <details>
-<summary><b>Why Rust?</b></summary>
+<summary>How is this different from BleachBit?</summary>
 
-- **Speed**: Native compiled binary, no interpreter overhead
-- **Safety**: Memory-safe, no segfaults, no undefined behavior
-- **Size**: Single ~800KB binary with zero runtime dependencies
-- **Reliability**: Strong type system catches errors at compile time
+BleachBit is GUI-based, Python-dependent, and focuses on cleaning inside specific applications. OxiClean is a single CLI binary focused on system-level cleanup that works the same way regardless of what distro you're on. Different tools for different needs — they don't really overlap much.
 </details>
 
 <details>
-<summary><b>How is this different from BleachBit?</b></summary>
+<summary>Why Rust?</summary>
 
-BleachBit is a GUI tool with Python dependencies that focuses on application-specific cleaning. OxiClean is a lightweight CLI tool focused on system-level package manager and cache cleanup across all distros. They complement each other.
+Honestly, I wanted to learn it. Also: single static binary, no interpreter to install, fast, and the type system catches a lot of bugs before they ship.
 </details>
 
-<details>
-<summary><b>Can I run it in a cron job?</b></summary>
+---
 
-Yes! Use `--yes` to skip prompts. For safety, avoid `--deep` in automated runs:
+## License
 
-`0 3 * * 0 /usr/local/bin/oxiclean --all --yes`
-</details>
-
-<details>
-<summary><b>Does it need root?</b></summary>
-
-It requests `sudo` only for operations that need it (package cache, orphan removal, journal). User-level operations (cache, trash) run without elevation. In `--dry-run` mode, sudo is never requested.
-</details>
-
-## 📄 License
-
-This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
 
 ---
 
 <div align="center">
 
-**Made with 🦀 and ❤️ for the Linux community**
+*OxiClean = Oxide (Rust) + Clean — no connection to any commercial cleaning product.*
 
-*OxiClean = Oxide (Rust) + Clean — no affiliation with any commercial product.*
-
-[⬆ Back to Top](#-oxiclean)
+[⬆ Back to top](#-oxiclean)
 
 </div>
