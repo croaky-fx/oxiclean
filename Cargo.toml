@@ -3,7 +3,7 @@ name = "oxiclean"
 version = "1.0.4"
 edition = "2021"
 description = "Fast cross-distribution Linux system cleaner"
-authors = ["You"]
+authors = ["croaky-fx <217624563+croaky-fx@users.noreply.github.com>"]
 license = "MIT"
 
 [dependencies]
