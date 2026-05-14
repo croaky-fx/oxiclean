@@ -18,17 +18,6 @@ pub fn run(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Run command silently (suppress all output)
-pub fn run_silent(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Run command with sudo, falls back to direct if already root
 pub fn sudo(cmd: &str, args: &[&str]) -> bool {
     if is_root() {
@@ -49,9 +38,15 @@ pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// Check if a command exists in PATH
+/// Check if a command exists in PATH.
+/// Walks $PATH directly instead of spawning a `which` subprocess —
+/// faster, more reliable, and works on systems where `which` itself
+/// is not installed (e.g. minimal Alpine containers).
 pub fn which(cmd: &str) -> bool {
-    run_silent("which", &[cmd])
+    match env::var_os("PATH") {
+        Some(paths) => env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()),
+        None => false,
+    }
 }
 
 /// Check if running as root (uid 0)
@@ -247,6 +242,20 @@ mod tests {
     }
 
     #[test]
+    fn test_format_size_boundary_kb_mb() {
+        // 1024 * 1024 - 1 must stay in KB, not flip to MB
+        assert_eq!(format_size(1_048_575), "1024.00 KB");
+        assert_eq!(format_size(1_048_576), "1.00 MB");
+    }
+
+    #[test]
+    fn test_format_size_boundary_mb_gb() {
+        // 1024 * 1024 * 1024 - 1 must stay in MB, not flip to GB
+        assert_eq!(format_size(1_073_741_823), "1024.00 MB");
+        assert_eq!(format_size(1_073_741_824), "1.00 GB");
+    }
+
+    #[test]
     fn test_which_exists() {
         assert!(which("ls"));
         assert!(which("echo"));
@@ -312,13 +321,4 @@ mod tests {
         let _ = fs::remove_dir_all(&test_dir);
     }
 
-    #[test]
-    fn test_run_silent_true() {
-        assert!(run_silent("true", &[]));
-    }
-
-    #[test]
-    fn test_run_silent_false() {
-        assert!(!run_silent("false", &[]));
-    }
 }

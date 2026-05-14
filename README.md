@@ -21,7 +21,7 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.0.4
+    ⚡ Oxi Clean  v1.0.5
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -240,7 +240,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 20 unit tests covering formatting, directory sizing, file removal, distro detection, etc., and 9 integration tests for CLI flags and dry-run behavior.
+There are 22 unit tests covering formatting, directory sizing, file removal, distro detection, etc., and 11 integration tests for CLI flags and dry-run behavior.
 
 ---
 

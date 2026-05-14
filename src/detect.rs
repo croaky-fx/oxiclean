@@ -57,13 +57,9 @@ impl Distro {
 //  Detection Logic
 // ═══════════════════════════════════════════════════
 
-/// Detect Linux distribution by reading /etc/os-release
-pub fn distro() -> Distro {
-    let content = match fs::read_to_string("/etc/os-release") {
-        Ok(c) => c,
-        Err(_) => return Distro::Unknown,
-    };
-
+/// Parse /etc/os-release content and return matching Distro.
+/// Pure function — no file I/O — testable in isolation.
+pub fn distro_from_str(content: &str) -> Distro {
     let mut id = String::new();
     let mut id_like = String::new();
 
@@ -178,6 +174,14 @@ pub fn distro() -> Distro {
     Distro::Unknown
 }
 
+/// Detect Linux distribution by reading /etc/os-release
+pub fn distro() -> Distro {
+    match fs::read_to_string("/etc/os-release") {
+        Ok(c) => distro_from_str(&c),
+        Err(_) => Distro::Unknown,
+    }
+}
+
 /// Get PRETTY_NAME from /etc/os-release
 pub fn pretty_name() -> String {
     fs::read_to_string("/etc/os-release")
@@ -219,20 +223,48 @@ pub fn has_snap() -> bool {
 mod tests {
     use super::*;
 
+    // ── detection logic tests (pure, no I/O) ──
+
     #[test]
-    fn test_distro_names() {
-        assert_eq!(Distro::Arch.name(), "Arch Linux");
-        assert_eq!(Distro::Debian.name(), "Debian/Ubuntu");
-        assert_eq!(Distro::Fedora.name(), "Fedora/RHEL");
-        assert_eq!(Distro::Unknown.name(), "Unknown");
+    fn test_detect_arch_direct() {
+        let content = "ID=arch\nPRETTY_NAME=\"Arch Linux\"\n";
+        assert_eq!(distro_from_str(content), Distro::Arch);
     }
 
     #[test]
-    fn test_pkg_managers() {
-        assert_eq!(Distro::Arch.pkg_manager(), "pacman");
-        assert_eq!(Distro::Debian.pkg_manager(), "apt");
-        assert_eq!(Distro::Unknown.pkg_manager(), "N/A");
+    fn test_detect_cachyos_via_id() {
+        // CachyOS sets ID=cachyos directly (not just ID_LIKE)
+        let content = "ID=cachyos\nID_LIKE=arch\n";
+        assert_eq!(distro_from_str(content), Distro::Arch);
     }
+
+    #[test]
+    fn test_detect_derivative_via_id_like() {
+        // Distros not in the direct list should fall back to ID_LIKE
+        let content = "ID=someubuntubased\nID_LIKE=ubuntu\n";
+        assert_eq!(distro_from_str(content), Distro::Debian);
+    }
+
+    #[test]
+    fn test_detect_opensuse_variants() {
+        // IDs starting with "opensuse" (not exact match) should still map to Suse
+        let content = "ID=opensuse-tumbleweed\n";
+        assert_eq!(distro_from_str(content), Distro::Suse);
+    }
+
+    #[test]
+    fn test_detect_unknown_no_panic() {
+        let content = "ID=somethingweird\nID_LIKE=alsounknown\n";
+        assert_eq!(distro_from_str(content), Distro::Unknown);
+    }
+
+    #[test]
+    fn test_detect_empty_os_release() {
+        let content = "";
+        assert_eq!(distro_from_str(content), Distro::Unknown);
+    }
+
+    // ── smoke tests for live detection (no panic) ──
 
     #[test]
     fn test_detection_doesnt_panic() {
@@ -243,17 +275,5 @@ mod tests {
     #[test]
     fn test_pretty_name_not_empty() {
         assert!(!pretty_name().is_empty());
-    }
-
-    #[test]
-    fn test_distro_equality() {
-        assert_eq!(Distro::Arch, Distro::Arch);
-        assert_ne!(Distro::Arch, Distro::Debian);
-    }
-
-    #[test]
-    fn test_distro_clone() {
-        let d = Distro::Arch;
-        assert_eq!(d, d.clone());
     }
 }

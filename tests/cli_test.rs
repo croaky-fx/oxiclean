@@ -67,3 +67,32 @@ fn test_multiple_flags() {
         .unwrap();
     assert!(output.status.success());
 }
+
+// ── v1.0.5: assert on actual output, not just exit code ──
+
+#[test]
+fn test_dry_run_output_contains_marker() {
+    // --dry-run must emit the [DRY RUN] marker so users know nothing changed.
+    // Cache is user-level (no sudo), so this works in CI without root.
+    let output = oxiclean().args(["--cache", "--dry-run"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[DRY RUN]") || stdout.contains("DRY RUN"),
+        "dry-run output missing marker. stdout was:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_no_args_shows_hint() {
+    // When invoked with no flags, oxiclean must hint at --all
+    // so the user knows how to proceed.
+    let output = oxiclean().output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--all"),
+        "no-args output should hint at --all. stdout was:\n{}",
+        stdout
+    );
+}

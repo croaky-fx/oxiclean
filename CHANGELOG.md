@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.0.5] - 2026-05-13
+
+### Fixed
+- `which()` no longer spawns a `which` subprocess on every check — walks `$PATH`
+  directly via `env::split_paths`. Faster, more reliable, and works on systems
+  where the `which` binary itself is not installed (e.g. minimal Alpine).
+- Corrected `authors` field in `Cargo.toml` (was placeholder `"You"`).
+
+### Changed
+- Refactored `detect::distro()` to delegate parsing to a pure
+  `distro_from_str(content: &str)` function. Detection logic is now testable
+  in isolation without requiring a real `/etc/os-release`.
+
+### Tests
+- Removed 4 trivial tests that only exercised `derive(PartialEq/Clone)` or
+  hard-coded string literals (`test_distro_equality`, `test_distro_clone`,
+  `test_distro_names`, `test_pkg_managers`).
+- Added 6 real detection tests: direct Arch ID, CachyOS via ID, derivative
+  resolution via `ID_LIKE`, openSUSE variants matched by `starts_with`,
+  unknown distros, and empty `/etc/os-release`.
+- Added `format_size` boundary tests at the KB/MB and MB/GB cutoffs
+  (1 048 575 stays KB, 1 048 576 flips to MB; same for MB/GB).
+- Added integration tests that assert on actual stdout (`[DRY RUN]` marker,
+  `--all` hint when no flags) instead of only the exit code.
+
 ## [1.0.4] - 2026-05-11
 
 ### Fixed
