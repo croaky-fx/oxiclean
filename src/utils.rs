@@ -320,5 +320,4 @@ mod tests {
         assert_eq!(rm_contents(&test_dir), 0);
         let _ = fs::remove_dir_all(&test_dir);
     }
-
 }
