@@ -691,12 +691,7 @@ pub fn trash(dry_run: bool) -> u64 {
 
 /// Run Nix garbage collection. Detects multi-user vs single-user installs
 /// and skips `nix store --optimise` on HDDs because it is extremely slow.
-pub fn nix_gc(
-    deep: bool,
-    dry_run: bool,
-    yes: bool,
-    disk_type: crate::detect::DiskType,
-) -> u64 {
+pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::DiskType) -> u64 {
     utils::section("Nix Garbage Collection");
 
     if !crate::detect::has_nix() {
