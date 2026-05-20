@@ -6,6 +6,43 @@ use clap::Parser;
 use colored::Colorize;
 use std::time::Instant;
 
+use crate::detect::{DiskType, Distro, Privilege};
+
+/// Everything we detect once at startup. Keeping it in one struct avoids
+/// threading six separate parameters through `main()` and the cleanup calls.
+struct SystemInfo {
+    pretty_name: String,
+    distro: Distro,
+    aur_helper: Option<&'static str>,
+    has_flatpak: bool,
+    has_snap: bool,
+    has_nix: bool,
+    privilege: Privilege,
+    disk_type: DiskType,
+}
+
+impl SystemInfo {
+    fn detect() -> Self {
+        let distro = detect::distro();
+        let aur_helper = if distro == Distro::Arch {
+            detect::aur_helper()
+        } else {
+            None
+        };
+
+        Self {
+            pretty_name: detect::pretty_name(),
+            distro,
+            aur_helper,
+            has_flatpak: detect::has_flatpak(),
+            has_snap: detect::has_snap(),
+            has_nix: detect::has_nix(),
+            privilege: detect::find_privilege(),
+            disk_type: detect::detect_root_disk_type(),
+        }
+    }
+}
+
 /// ⚡ OxiClean — Fast Cross-Distribution Linux System Cleaner
 ///
 /// A comprehensive system cleanup tool that works across all major
@@ -108,33 +145,44 @@ fn main() {
     // ── Banner ──
     utils::banner(env!("CARGO_PKG_VERSION"));
 
-    // ── Detect ──
-    let distro = detect::distro();
-    let pretty = detect::pretty_name();
-    let aur = if distro == detect::Distro::Arch {
-        detect::aur_helper()
-    } else {
-        None
-    };
-    let has_flatpak = detect::has_flatpak();
-    let has_snap = detect::has_snap();
+    // ── Detect everything once ──
+    let sys = SystemInfo::detect();
+
+    // Register the chosen privilege helper globally so that `utils::sudo`
+    // (called from every cleanup operation) uses `doas` on systems where
+    // that's the available escalator.
+    utils::set_privilege(sys.privilege);
 
     // ── System info ──
-    println!("  {} {}", "System:".white().bold(), pretty.cyan());
+    println!("  {} {}", "System:".white().bold(), sys.pretty_name.cyan());
     println!(
         "  {} {} ({})",
         "Distro:".white().bold(),
-        distro.name().cyan(),
-        distro.pkg_manager().dimmed()
+        sys.distro.name().cyan(),
+        sys.distro.pkg_manager().dimmed()
     );
-    if let Some(h) = aur {
+    if let Some(h) = sys.aur_helper {
         println!("  {} {}", "AUR:".white().bold(), h.cyan());
     }
-    if has_flatpak {
+    if sys.has_flatpak {
         println!("  {} {}", "Flatpak:".white().bold(), "detected ✔".green());
     }
-    if has_snap {
+    if sys.has_snap {
         println!("  {} {}", "Snap:".white().bold(), "detected ✔".green());
+    }
+    if sys.has_nix && sys.distro != Distro::Nix {
+        // Only mention Nix here on non-NixOS systems — on NixOS it's obvious.
+        println!("  {} {}", "Nix:".white().bold(), "detected ✔".green());
+    }
+
+    // HDD warning: cleanup on a spinning disk can take noticeably longer,
+    // and `nix store --optimise` in particular can take hours.
+    if sys.disk_type == DiskType::HDD {
+        println!(
+            "  {} {}",
+            "⚠".yellow().bold(),
+            "HDD detected — cleanup may take longer".yellow()
+        );
     }
 
     if cli.dry_run {
@@ -154,10 +202,10 @@ fn main() {
         );
     }
 
-    // ── Sudo ──
+    // ── Privilege acquisition ──
     let needs_sudo = do_packages || do_orphans || do_journal || do_flatpak || do_snap;
     if needs_sudo && !cli.dry_run && !utils::acquire_sudo() {
-        utils::error("Failed to acquire sudo privileges. Exiting.");
+        utils::error("Failed to acquire privileges. Exiting.");
         std::process::exit(1);
     }
 
@@ -170,16 +218,24 @@ fn main() {
     }
 
     if do_packages {
-        total_freed += clean::pkg_cache(&distro, cli.deep, cli.dry_run, cli.yes);
+        total_freed += clean::pkg_cache(&sys.distro, cli.deep, cli.dry_run, cli.yes);
+
+        // Nix can be installed on *any* distro (not just NixOS). Run its GC
+        // alongside the native package-cache step when /nix/store is present.
+        // On NixOS the existing pkg_cache path already handles Nix, so we
+        // avoid running it twice.
+        if sys.has_nix && sys.distro != Distro::Nix {
+            total_freed += clean::nix_gc(cli.deep, cli.dry_run, cli.yes, sys.disk_type);
+        }
     }
 
     if do_orphans {
-        total_freed += clean::orphans(&distro, cli.dry_run, cli.yes);
+        total_freed += clean::orphans(&sys.distro, cli.dry_run, cli.yes);
     }
 
     if do_aur {
-        if distro == detect::Distro::Arch {
-            if let Some(helper) = aur {
+        if sys.distro == Distro::Arch {
+            if let Some(helper) = sys.aur_helper {
                 total_freed += clean::aur_cache(helper, cli.deep, cli.dry_run, cli.yes);
             } else {
                 utils::section("AUR Cache");
@@ -192,7 +248,7 @@ fn main() {
     }
 
     if do_flatpak {
-        if has_flatpak {
+        if sys.has_flatpak {
             total_freed += clean::flatpak(cli.deep, cli.dry_run);
         } else if cli.flatpak {
             utils::section("Flatpak");
@@ -201,7 +257,7 @@ fn main() {
     }
 
     if do_snap {
-        if has_snap {
+        if sys.has_snap {
             total_freed += clean::snap(cli.dry_run);
         } else if cli.snap {
             utils::section("Snap");

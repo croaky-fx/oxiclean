@@ -219,6 +219,156 @@ pub fn has_snap() -> bool {
     crate::utils::which("snap")
 }
 
+/// Check if Nix is installed (the /nix/store directory is the unambiguous marker)
+pub fn has_nix() -> bool {
+    std::path::Path::new("/nix/store").exists()
+}
+
+/// Detect if the Nix install is multi-user (has a daemon socket)
+pub fn nix_is_multiuser() -> bool {
+    std::path::Path::new("/nix/var/nix/daemon-socket/socket").exists()
+        || std::path::Path::new("/run/nix-daemon.socket").exists()
+}
+
+// ══════════════════════════════════════════════════
+//  Privilege Escalation
+// ══════════════════════════════════════════════════
+
+/// Available privilege-escalation helpers. `Root` means we are already uid 0
+/// and no escalation is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privilege {
+    Doas,
+    Sudo,
+    Root,
+}
+
+impl Privilege {
+    /// Binary name used to invoke this helper. `Root` returns an empty string
+    /// because the command runs directly with no wrapper.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Doas => "doas",
+            Self::Sudo => "sudo",
+            Self::Root => "",
+        }
+    }
+}
+
+/// Pick the best available privilege-escalation method.
+/// Order: already-root → doas → sudo.
+/// `doas` is preferred over `sudo` because on minimal systems (Alpine, Void)
+/// it is often the only one installed.
+pub fn find_privilege() -> Privilege {
+    if crate::utils::is_root() {
+        return Privilege::Root;
+    }
+    if crate::utils::which("doas") {
+        return Privilege::Doas;
+    }
+    if crate::utils::which("sudo") {
+        return Privilege::Sudo;
+    }
+    // Fall back to sudo — callers will see the failure when they try to use it.
+    // We deliberately do NOT std::process::exit here so that --dry-run and
+    // user-only operations (cache, trash) still work without privileges.
+    Privilege::Sudo
+}
+
+// ══════════════════════════════════════════════════
+//  Disk Detection
+// ══════════════════════════════════════════════════
+
+// SSD/HDD/NVMe are universally recognised industry acronyms; the
+// idiomatic Rust spellings (Ssd, Hdd, Nv_me) are harder to read.
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskType {
+    NVMe,
+    SSD,
+    HDD,
+    Unknown,
+}
+
+/// Pure helper: given the contents of
+/// `/sys/block/<name>/queue/rotational` and the block-device name,
+/// classify the disk.
+///
+/// NVMe is detected by name prefix because some NVMe drives report
+/// `rotational=1` due to kernel quirks. Anything else falls back to the
+/// rotational flag.
+pub fn disk_type_from_rotational(rotational: &str, block_name: &str) -> DiskType {
+    if block_name.starts_with("nvme") {
+        return DiskType::NVMe;
+    }
+    match rotational.trim() {
+        "0" => DiskType::SSD,
+        "1" => DiskType::HDD,
+        _ => DiskType::Unknown,
+    }
+}
+
+/// Pure helper: extract the parent block-device name from a device path.
+///
+/// Examples:
+/// * `/dev/sda3`       → `sda`
+/// * `/dev/sdb`        → `sdb`
+/// * `/dev/nvme0n1p2`  → `nvme0n1`
+/// * `/dev/nvme0n1`    → `nvme0n1`
+/// * `/dev/mmcblk0p1`  → `mmcblk0`
+pub fn extract_block_name(device: &str) -> String {
+    let name = device.trim_start_matches("/dev/");
+
+    if name.starts_with("nvme") || name.starts_with("mmcblk") {
+        // Strip a trailing `p<digits>` partition suffix if present.
+        if let Some(pos) = name.rfind('p') {
+            if !name[pos + 1..].is_empty() && name[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+                return name[..pos].to_string();
+            }
+        }
+        return name.to_string();
+    }
+
+    // sd*, vd*, hd*: strip trailing digits.
+    name.trim_end_matches(|c: char| c.is_ascii_digit())
+        .to_string()
+}
+
+/// Pure helper: parse `/proc/mounts` content and return the device backing
+/// the requested mount point, if any.
+pub fn find_mount_device_in(mounts: &str, mount_point: &str) -> Option<String> {
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 && parts[1] == mount_point {
+            return Some(parts[0].to_string());
+        }
+    }
+    None
+}
+
+/// Detect the type of the disk that hosts `/home` (falling back to `/`).
+/// Returns `DiskType::Unknown` if anything can't be read — never panics.
+pub fn detect_root_disk_type() -> DiskType {
+    let mounts = match fs::read_to_string("/proc/mounts") {
+        Ok(c) => c,
+        Err(_) => return DiskType::Unknown,
+    };
+
+    let device = find_mount_device_in(&mounts, "/home")
+        .or_else(|| find_mount_device_in(&mounts, "/"))
+        .unwrap_or_default();
+
+    let block_name = extract_block_name(&device);
+    if block_name.is_empty() {
+        return DiskType::Unknown;
+    }
+
+    let rotational = fs::read_to_string(format!("/sys/block/{}/queue/rotational", block_name))
+        .unwrap_or_default();
+
+    disk_type_from_rotational(&rotational, &block_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,7 +391,7 @@ mod tests {
     #[test]
     fn test_detect_derivative_via_id_like() {
         // Distros not in the direct list should fall back to ID_LIKE
-        let content = "ID=someubuntubased\nID_LIKE=ubuntu\n";
+        let content = "ID=linuxmint\nID_LIKE=ubuntu debian\n";
         assert_eq!(distro_from_str(content), Distro::Debian);
     }
 
@@ -275,5 +425,122 @@ mod tests {
     #[test]
     fn test_pretty_name_not_empty() {
         assert!(!pretty_name().is_empty());
+    }
+
+    // ── Privilege enum ──
+
+    #[test]
+    fn test_privilege_name() {
+        assert_eq!(Privilege::Sudo.name(), "sudo");
+        assert_eq!(Privilege::Doas.name(), "doas");
+        // Root means "no escalation wrapper" — name() must return an empty string
+        // so that callers never accidentally exec a binary called "".
+        assert_eq!(Privilege::Root.name(), "");
+    }
+
+    #[test]
+    fn test_privilege_equality() {
+        // Privilege is Copy + PartialEq so call sites can compare cheaply.
+        let p = Privilege::Doas;
+        assert_eq!(p, Privilege::Doas);
+        assert_ne!(p, Privilege::Sudo);
+        assert_ne!(p, Privilege::Root);
+    }
+
+    #[test]
+    fn test_find_privilege_doesnt_panic() {
+        // Live detection must always return *some* variant — never panic.
+        let _ = find_privilege();
+    }
+
+    // ── DiskType: rotational parsing (pure) ──
+
+    #[test]
+    fn test_disk_type_from_rotational_0() {
+        assert_eq!(disk_type_from_rotational("0", "sda"), DiskType::SSD);
+    }
+
+    #[test]
+    fn test_disk_type_from_rotational_1() {
+        assert_eq!(disk_type_from_rotational("1", "sda"), DiskType::HDD);
+    }
+
+    #[test]
+    fn test_disk_type_rotational_with_trailing_newline() {
+        // /sys/block/*/queue/rotational always ends with '\n' — must be trimmed.
+        assert_eq!(disk_type_from_rotational("0\n", "sda"), DiskType::SSD);
+        assert_eq!(disk_type_from_rotational("1\n", "sda"), DiskType::HDD);
+    }
+
+    #[test]
+    fn test_disk_type_nvme_by_name() {
+        // NVMe is identified by the block-name prefix, regardless of the
+        // rotational flag (some buggy NVMe report rotational=1).
+        assert_eq!(disk_type_from_rotational("0", "nvme0n1"), DiskType::NVMe);
+        assert_eq!(disk_type_from_rotational("1", "nvme0n1"), DiskType::NVMe);
+    }
+
+    #[test]
+    fn test_disk_type_unknown_on_garbage() {
+        assert_eq!(
+            disk_type_from_rotational("garbage", "sda"),
+            DiskType::Unknown
+        );
+        assert_eq!(disk_type_from_rotational("", "sda"), DiskType::Unknown);
+    }
+
+    // ── block_name extraction (pure) ──
+
+    #[test]
+    fn test_extract_block_name_sata() {
+        assert_eq!(extract_block_name("/dev/sda3"), "sda");
+        assert_eq!(extract_block_name("/dev/sdb"), "sdb");
+        assert_eq!(extract_block_name("/dev/sda12"), "sda");
+    }
+
+    #[test]
+    fn test_extract_block_name_nvme() {
+        assert_eq!(extract_block_name("/dev/nvme0n1p2"), "nvme0n1");
+        assert_eq!(extract_block_name("/dev/nvme0n1"), "nvme0n1");
+        assert_eq!(extract_block_name("/dev/nvme1n1p15"), "nvme1n1");
+    }
+
+    #[test]
+    fn test_extract_block_name_mmcblk() {
+        // SD cards, eMMC.
+        assert_eq!(extract_block_name("/dev/mmcblk0p1"), "mmcblk0");
+        assert_eq!(extract_block_name("/dev/mmcblk0"), "mmcblk0");
+    }
+
+    #[test]
+    fn test_extract_block_name_empty() {
+        // Empty / unparseable input must not panic and must round-trip cleanly.
+        assert_eq!(extract_block_name(""), "");
+    }
+
+    // ── find_mount_device_in: pure parsing of /proc/mounts ──
+
+    #[test]
+    fn test_find_mount_device_root() {
+        let mounts = "\
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+/dev/sda2 / ext4 rw,relatime 0 0
+/dev/sda3 /home ext4 rw,relatime 0 0
+";
+        assert_eq!(
+            find_mount_device_in(mounts, "/"),
+            Some("/dev/sda2".to_string())
+        );
+        assert_eq!(
+            find_mount_device_in(mounts, "/home"),
+            Some("/dev/sda3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_mount_device_missing() {
+        let mounts = "/dev/sda1 / ext4 rw 0 0\n";
+        assert_eq!(find_mount_device_in(mounts, "/home"), None);
+        assert_eq!(find_mount_device_in("", "/"), None);
     }
 }

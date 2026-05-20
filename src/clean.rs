@@ -4,7 +4,14 @@ use std::path::PathBuf;
 use crate::detect::Distro;
 use crate::utils;
 
-fn should_deep(deep: bool, yes: bool, prompt: &str) -> bool {
+/// Decide whether a destructive "deep" operation should run.
+///
+/// * `deep == true`  → always run (user explicitly opted in)
+/// * `deep == false && yes == true` → skip silently (non-interactive run)
+/// * otherwise → ask the user
+///
+/// Pub-crate visibility so it can be unit-tested.
+pub(crate) fn should_deep(deep: bool, yes: bool, prompt: &str) -> bool {
     if deep {
         return true;
     }
@@ -676,4 +683,101 @@ pub fn trash(dry_run: bool) -> u64 {
 
     utils::success(&format!("Freed {}", utils::format_size(freed).green()));
     freed
+}
+
+// ══════════════════════════════════════════════════
+//  Nix garbage collection — works on *any* distro that has /nix/store
+// ══════════════════════════════════════════════════
+
+/// Run Nix garbage collection. Detects multi-user vs single-user installs
+/// and skips `nix store --optimise` on HDDs because it is extremely slow.
+pub fn nix_gc(
+    deep: bool,
+    dry_run: bool,
+    yes: bool,
+    disk_type: crate::detect::DiskType,
+) -> u64 {
+    utils::section("Nix Garbage Collection");
+
+    if !crate::detect::has_nix() {
+        utils::skip("Nix not installed — skipped");
+        return 0;
+    }
+
+    if dry_run {
+        utils::info("[DRY RUN] Would run: nix-collect-garbage");
+        if deep {
+            utils::info("[DRY RUN] Would also delete old generations (-d)");
+        }
+        return 0;
+    }
+
+    let store = PathBuf::from("/nix/store");
+    let store_before = utils::dir_size(&store);
+
+    utils::info("Collecting garbage (user)...");
+    utils::run("nix-collect-garbage", &[]);
+
+    if crate::detect::nix_is_multiuser() {
+        utils::info("Collecting garbage (system)...");
+        utils::sudo("nix-collect-garbage", &[]);
+    }
+
+    if should_deep(
+        deep,
+        yes,
+        "Delete old Nix generations? (removes all but current) [y/N]:",
+    ) {
+        utils::info("Removing old generations...");
+        utils::run("nix-collect-garbage", &["-d"]);
+        if crate::detect::nix_is_multiuser() {
+            utils::sudo("nix-collect-garbage", &["-d"]);
+        }
+        utils::success("Old generations removed");
+
+        // `nix store --optimise` walks the entire store and hard-links
+        // identical files. On a spinning disk that can take *hours*.
+        if disk_type == crate::detect::DiskType::HDD {
+            utils::info(
+                "Skipping store optimise on HDD (too slow). Run manually: nix store --optimise",
+            );
+        } else {
+            utils::info("Optimising Nix store (hard-linking identical files)...");
+            utils::sudo("nix", &["store", "--optimise"]);
+            utils::success("Store optimised");
+        }
+    }
+
+    let store_after = utils::dir_size(&store);
+    let freed = store_before.saturating_sub(store_after);
+    if freed > 0 {
+        utils::info(&format!(
+            "Nix store freed: {}",
+            utils::format_size(freed).green()
+        ));
+    }
+    freed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── should_deep: destructive behaviour — must not surprise the user ──
+
+    #[test]
+    fn test_should_deep_flag_true_always_wins() {
+        // deep=true means the user explicitly asked for deep clean.
+        // It must override `yes` and never prompt.
+        assert!(should_deep(true, false, "irrelevant"));
+        assert!(should_deep(true, true, "irrelevant"));
+    }
+
+    #[test]
+    fn test_should_deep_yes_without_deep_returns_false() {
+        // yes=true + deep=false: non-interactive run.
+        // Must return false WITHOUT prompting — otherwise the test would
+        // hang waiting on stdin, which is itself the proof it works.
+        assert!(!should_deep(false, true, "irrelevant"));
+    }
 }

@@ -1,5 +1,57 @@
 # Changelog
 
+## [1.1.0] - 2026-05-19
+
+### Added
+- **`doas` support**: a new `Privilege` enum (`Doas` / `Sudo` / `Root`)
+  picked automatically at startup. On systems where `doas` is the default
+  (Alpine 3.15+, many Void setups) we no longer fail because `sudo` is
+  missing. The header now shows which helper is in use:
+  `🔐 Requesting privileges (doas)…`
+- **Disk type detection** (`DiskType` enum: `NVMe` / `SSD` / `HDD` /
+  `Unknown`). We resolve the device that backs `/home` (falling back to
+  `/`) via `/proc/mounts`, walk to the parent block device, and read
+  `/sys/block/<name>/queue/rotational`. NVMe is detected from the device
+  name to dodge the well-known “rotational=1” kernel quirk on some NVMe
+  controllers.
+- **HDD warning** printed in the startup header when a spinning disk is
+  detected. SSD/NVMe stay quiet — the goal is information, not noise.
+- **Nix garbage collection on any distro**: `nix_gc()` runs as a separate
+  cleanup step whenever `/nix/store` exists, even on Arch / Fedora /
+  Debian. Multi-user installs (`/nix/var/nix/daemon-socket/socket`) get
+  both a user-level and a `sudo nix-collect-garbage`. On NixOS the
+  existing `pkg_cache` path keeps handling Nix so we don’t double-run.
+- **`SystemInfo` struct** consolidates all detection into a single
+  `SystemInfo::detect()` call. `main()` no longer juggles six separate
+  detection variables.
+
+### Changed
+- New public API in `utils`: `elevate(privilege, cmd, args)` and
+  `acquire_privilege(privilege)`. `utils::sudo()` is now a thin backwards
+  -compatible wrapper that delegates to `elevate()` using the privilege
+  helper recorded once at startup via `utils::set_privilege()`. No call
+  sites in `clean.rs` needed to change — they automatically benefit
+  from doas support.
+- On HDDs, `nix store --optimise` is **skipped** during deep clean (it can
+  take hours on spinning storage). A hint tells the user how to run it
+  manually.
+- `should_deep()` is now `pub(crate)` so its destructive decision logic
+  can be unit-tested. Behaviour unchanged.
+
+### Tests (15+ new)
+- `Privilege::name()` and equality; `find_privilege()` smoke test.
+- `disk_type_from_rotational()`: SSD (`"0"`), HDD (`"1"`), newline
+  trimming, NVMe-by-name overriding rotational, garbage/empty input.
+- `extract_block_name()`: SATA partitions, NVMe partitions (`nvme0n1p2`),
+  eMMC/SD (`mmcblk0p1`), empty input.
+- `find_mount_device_in()`: parses `/proc/mounts`-format text purely;
+  resolves `/` and `/home`; returns `None` for missing mount points.
+- `elevate(Privilege::Root, …)` runs the command directly and propagates
+  both success and failure exit codes.
+- `should_deep()`: `deep=true` always wins (with and without `yes`);
+  `yes=true && deep=false` returns `false` without prompting (a hang
+  here would itself be the failure signal).
+
 ## [1.0.5] - 2026-05-13
 
 ### Fixed

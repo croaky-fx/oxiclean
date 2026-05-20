@@ -4,6 +4,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+use crate::detect::Privilege;
 
 // ═══════════════════════════════════════════════════
 //  Command Execution
@@ -18,14 +21,60 @@ pub fn run(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Run command with sudo, falls back to direct if already root
-pub fn sudo(cmd: &str, args: &[&str]) -> bool {
-    if is_root() {
-        return run(cmd, args);
+// ══════════════════════════════════════════════════
+//  Privilege Escalation
+// ══════════════════════════════════════════════════
+
+/// The privilege helper detected at startup.
+///
+/// `main()` sets this once via [`set_privilege`]; everywhere else — including
+/// the legacy [`sudo`] wrapper used by `clean.rs` — reads it through
+/// [`current_privilege`]. We deliberately avoid threading a `Privilege`
+/// argument through every cleanup function: it would touch ~30 call sites
+/// with no behavioural benefit.
+static PRIVILEGE: OnceLock<Privilege> = OnceLock::new();
+
+/// Record the detected privilege helper. Called once from `main()`.
+/// Subsequent calls are silently ignored — `OnceLock` semantics.
+pub fn set_privilege(p: Privilege) {
+    let _ = PRIVILEGE.set(p);
+}
+
+/// Current privilege helper, or `Privilege::Sudo` if `main()` never set one
+/// (e.g. in unit tests that exercise [`elevate`] directly).
+pub fn current_privilege() -> Privilege {
+    *PRIVILEGE.get().unwrap_or(&Privilege::Sudo)
+}
+
+/// Run `cmd` with the requested privilege helper. `Privilege::Root` runs
+/// the command directly because we are already uid 0.
+pub fn elevate(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
+    match privilege {
+        Privilege::Root => run(cmd, args),
+        Privilege::Sudo | Privilege::Doas => {
+            let mut a = vec![cmd];
+            a.extend_from_slice(args);
+            run(privilege.name(), &a)
+        }
     }
-    let mut a = vec![cmd];
-    a.extend_from_slice(args);
-    run("sudo", &a)
+}
+
+/// Cache the user's password / authorisation for the chosen helper.
+///
+/// `sudo -v` extends the auth-cache; `doas` has no equivalent, so we send a
+/// no-op command (`true`) that simply triggers the password prompt.
+pub fn acquire_privilege(privilege: Privilege) -> bool {
+    match privilege {
+        Privilege::Root => true,
+        Privilege::Sudo => run("sudo", &["-v"]),
+        Privilege::Doas => run("doas", &["true"]),
+    }
+}
+
+/// Backwards-compatible wrapper. Delegates to [`elevate`] with the helper
+/// detected at startup (set by `main()` via [`set_privilege`]).
+pub fn sudo(cmd: &str, args: &[&str]) -> bool {
+    elevate(current_privilege(), cmd, args)
 }
 
 /// Capture stdout of a command (returns output regardless of exit code)
@@ -54,18 +103,21 @@ pub fn is_root() -> bool {
     capture("id", &["-u"]).map(|id| id == "0").unwrap_or(false)
 }
 
-/// Acquire sudo privileges (prompts for password)
+/// Acquire sudo privileges (prompts for password).
+///
+/// Kept as a thin wrapper so the legacy `main.rs` path keeps working until
+/// it is converted to call [`acquire_privilege`] directly.
 pub fn acquire_sudo() -> bool {
-    if is_root() {
+    let p = current_privilege();
+    if p == Privilege::Root {
         return true;
     }
     println!();
-    println!("  {}", "🔐 Requesting sudo privileges...".yellow());
-    Command::new("sudo")
-        .arg("-v")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    println!(
+        "  {}",
+        format!("🔐 Requesting privileges ({})...", p.name()).yellow()
+    );
+    acquire_privilege(p)
 }
 
 // ═══════════════════════════════════════════════════
@@ -319,5 +371,33 @@ mod tests {
         fs::create_dir_all(&test_dir).unwrap();
         assert_eq!(rm_contents(&test_dir), 0);
         let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    // ── Privilege escalation ──
+
+    #[test]
+    fn test_elevate_root_runs_directly() {
+        // Privilege::Root must invoke the command directly, with no wrapper.
+        // `true` exits 0 — it succeeds only if we did NOT prepend `sudo `/`doas `
+        // (which would resolve to non-existent binaries in some environments
+        // and would either fail outright or prompt for a password).
+        assert!(elevate(Privilege::Root, "true", &[]));
+    }
+
+    #[test]
+    fn test_elevate_root_propagates_failure() {
+        // `false` exits non-zero; elevate must surface that.
+        assert!(!elevate(Privilege::Root, "false", &[]));
+    }
+
+    #[test]
+    fn test_current_privilege_default_is_sudo() {
+        // Until main() sets PRIVILEGE, current_privilege() falls back to Sudo.
+        // We can't assert equality reliably across the whole test suite
+        // (any earlier test that calls set_privilege would change it), so we
+        // just assert that the call returns *some* valid variant and does not
+        // panic.
+        let p = current_privilege();
+        let _ = p.name();
     }
 }

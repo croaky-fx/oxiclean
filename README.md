@@ -21,7 +21,7 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.0.5
+    ⚡ Oxi Clean  v1.1.0
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -30,7 +30,7 @@ $ oxiclean -A -y
   AUR: paru
   Flatpak: detected ✔
 
-  🔐 Requesting sudo privileges...
+  🔐 Requesting privileges (sudo)...
 
   ━━▶ User Cache (~/.cache)
     ℹ Cache size: 216.31 MB
@@ -106,7 +106,7 @@ chmod +x oxiclean-x86_64-linux-gnu
 sudo mv oxiclean-x86_64-linux-gnu /usr/local/bin/oxiclean
 ```
 
-Requires: Rust 1.70+, Linux, sudo.
+Requires: Rust 1.70+, Linux, sudo or doas.
 
 ---
 
@@ -184,7 +184,7 @@ Options:
 
 **`--deep` is a bit more aggressive.** Things like `pacman -Scc` (removes *all* cached packages, not just old ones) or `flatpak repair`. Useful for squeezing out more space, but worth knowing what you're getting into. Run `--dry-run --deep` first if unsure.
 
-**It needs sudo for some things** — package cache, orphan removal, journal. For user-level stuff (your `~/.cache`, trash) it won't ask.
+**It needs sudo or doas for some things** — package cache, orphan removal, journal. Detected automatically at startup; on Alpine and Void where `doas` is the default, no configuration needed. For user-level stuff (your `~/.cache`, trash) it won't ask.
 
 **Cron-friendly:**
 ```
@@ -240,7 +240,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 22 unit tests covering formatting, directory sizing, file removal, distro detection, etc., and 11 integration tests for CLI flags and dry-run behavior.
+There are 41 unit tests covering formatting, directory sizing, file removal, distro detection, etc., and 11 integration tests for CLI flags and dry-run behavior.
 
 ---
 
@@ -263,7 +263,6 @@ cargo build && cargo test
 **Things I'd love help with:**
 - More distros (Guix, Slackware...)
 - Shell completions (bash, zsh, fish)
-- `doas` support as a sudo alternative
 - `--quiet` mode
 - Integration tests with Docker containers
 - Logging to file (`--log`)
