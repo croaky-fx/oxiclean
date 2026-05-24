@@ -21,7 +21,7 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.1.0
+    ⚡ Oxi Clean  v1.2.0
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -29,18 +29,26 @@ $ oxiclean -A -y
   Distro: Arch Linux (pacman)
   AUR: paru
   Flatpak: detected ✔
+  ⚠ HDD detected — cleanup may take longer
 
   🔐 Requesting privileges (sudo)...
 
   ━━▶ User Cache (~/.cache)
-    ℹ Cache size: 216.31 MB
-    ✔ Freed 215.63 MB
+    ℹ Cache size: 1.06 GB
+    ✔ Freed 1.06 GB
 
   ━━▶ Package Cache (pacman)
     ✔ pacman cache cleaned
+    ℹ Package cache freed: 95.84 MB
 
   ━━▶ Orphaned Packages
-    ✔ No orphans found
+    ℹ Found 5 orphan(s):
+      • accounts-qml-module
+      • clang21
+      • lib32-gettext
+      • lib32-libpcap
+      • libliftoff
+    ✔ Orphans removed
 
   ━━▶ AUR Cache (paru)
     ✔ paru cache cleaned
@@ -49,24 +57,25 @@ $ oxiclean -A -y
     ✔ Flatpak cleanup done
 
   ━━▶ Systemd Journal
-    ℹ Current usage: 45.9M
+    ℹ Current usage: 47.5M
     ✔ Journal vacuumed
 
   ━━▶ Trash
-    ✔ Trash is empty
+    ✔ Freed 3.33 MB
 
   ══════════════════════════════════════════════
-  ⚡ Total freed: 215.63 MB
-  ⏱  Completed in: 9.62s
+  ⚡ Total freed: 1.15 GB
+  ⏱  Completed in: 135.05s
   ══════════════════════════════════════════════
 ```
 
-*(Real output on CachyOS, spinning HDD at 5400rpm, right after a cleanup — so don't expect huge numbers every time)*
+*(Real run on CachyOS with a 5400rpm HDD. The 135s is mostly snapper taking pre/post snapshots around the orphan removal — on an SSD without snapper it's way faster.)*
 
 ---
 
 ## What it cleans
 
+**System stuff** (the default with `--all`):
 - `~/.cache` — the obvious stuff
 - Package manager cache (pacman, apt, dnf, zypper, xbps, apk, portage...)
 - Orphaned packages — things nothing depends on anymore
@@ -75,6 +84,14 @@ $ oxiclean -A -y
 - Snap disabled revisions
 - Systemd journal logs
 - Trash
+- Nix garbage collection — works on any distro that has `/nix/store`, not just NixOS
+
+**Dev tool caches** (opt-in with `--dev`, not part of `--all`):
+- Node ecosystem: npm, yarn (classic + berry), pnpm, bun, deno
+- Python: pip, uv, pipenv, poetry (cache only — your virtualenvs stay)
+- Rust: cargo registry + git checkouts (your installed binaries in `~/.cargo/bin` are never touched)
+- Go modules (needs `--deep` since it re-downloads)
+- Ruby gems (old versions), PHP composer, Gradle caches, Maven
 
 It handles **50+ distributions** across 10 package manager families. If you're on something obscure it doesn't know, it'll still clean the universal stuff (cache, trash, journal, Flatpak, Snap) without complaining.
 
@@ -137,6 +154,46 @@ oxiclean --journal
 oxiclean --flatpak --snap
 ```
 
+### Cleaning dev tool caches
+
+If you're a developer your `~/.cargo`, `~/.npm`, `~/.cache/pip` and friends can
+add up to several GB. The `--dev` flag scans them all and shows you what's
+there before touching anything:
+
+```bash
+oxiclean --dev --dry-run    # scan and show the table, no changes
+oxiclean --dev              # clean the safe stuff
+oxiclean --dev --deep       # also clean caches that'll re-download
+```
+
+It looks like this:
+
+```
+  ━━▶ Dev Cache
+    ℹ Scanning...
+      • npm                    340 MB   ✓ safe
+      • pnpm                   456 MB   ✓ store prune
+      • pip                     89 MB   ✓ safe
+      • uv                    234 MB   ✓ safe
+      • cargo registry/src   1.20 GB   ✓ re-extract only
+      • cargo registry/cache  890 MB   ⚠ re-download on next build
+      • go modules            670 MB   ⚠ re-download on next build
+      ─ Total: 3.86 GB   |   Will clean now: 2.31 GB
+      ℹ Pass --deep to also clean caches that trigger re-downloads
+    ✔ Freed 2.31 GB
+```
+
+A few things it explicitly *won't* do (these are the ones that bite people):
+- `~/.cargo/bin` is never touched (it has your installed binaries like `cargo-watch`, `rustfmt`)
+- pnpm uses hardlinks to its store — wiping the directory breaks every `node_modules` on the system, so it runs `pnpm store prune` instead
+- Poetry's `virtualenvs/` directory is preserved — only the package download `cache/` is cleaned
+- Gradle's `wrapper/` (which holds the actual Gradle distributions) stays — only `caches/` goes
+- npm globals (`~/.npm/lib/node_modules`) stay — only `_cacache/` goes
+
+`--all` does *not* include `--dev` on purpose. Dev caches have very different
+tradeoffs (some trigger gigabyte-scale re-downloads) and they should be an
+explicit choice.
+
 ### All flags
 
 ```
@@ -149,7 +206,8 @@ Options:
   -s, --snap        Clean Snap disabled revisions & cache
   -j, --journal     Vacuum systemd journal logs
   -t, --trash       Empty trash
-  -A, --all         Run all cleanup operations
+  -D, --dev         Clean dev-tool caches (npm, cargo, pip, etc.)
+  -A, --all         Run all system cleanup operations (not --dev)
   -d, --deep        Enable aggressive/deep cleaning mode
   -y, --yes         Skip all confirmation prompts
   -n, --dry-run     Preview actions without making changes
@@ -182,15 +240,17 @@ Options:
 
 **Results vary a lot.** Whether you free 5MB or 2GB depends on how long since you last cleaned, your distro, and your disk. The tool's value isn't in big numbers — it's in not having to remember 10 different commands for 10 different distros.
 
-**`--deep` is a bit more aggressive.** Things like `pacman -Scc` (removes *all* cached packages, not just old ones) or `flatpak repair`. Useful for squeezing out more space, but worth knowing what you're getting into. Run `--dry-run --deep` first if unsure.
+**`--deep` is a bit more aggressive.** Things like `pacman -Scc` (removes *all* cached packages, not just old ones), `flatpak repair`, or the cargo/go caches that'll re-download. Useful for squeezing out more space, but worth knowing what you're getting into. Run `--dry-run --deep` first if unsure.
 
-**It needs sudo or doas for some things** — package cache, orphan removal, journal. Detected automatically at startup; on Alpine and Void where `doas` is the default, no configuration needed. For user-level stuff (your `~/.cache`, trash) it won't ask.
+**It needs sudo or doas for some things** — package cache, orphan removal, journal. Detected automatically at startup; on Alpine and Void where `doas` is the default, no configuration needed. For user-level stuff (your `~/.cache`, trash, dev caches) it won't ask.
+
+**HDD warning.** If your root filesystem lives on a spinning disk, you'll see a heads-up at startup that cleanup may take a while. Reading directory sizes on an HDD with millions of small files (looking at you, `~/.cargo/registry`) is genuinely slow. Not a bug, just physics.
 
 **Cron-friendly:**
 ```
 0 3 * * 0 /usr/local/bin/oxiclean --all --yes
 ```
-Avoid `--deep` in automated runs.
+Avoid `--deep` in automated runs. And if you want dev caches included, add `--dev`.
 
 ---
 
@@ -224,8 +284,9 @@ oxiclean/
 │   └── cli_test.rs
 └── src/
     ├── main.rs     # CLI parsing, orchestration, summary
-    ├── detect.rs   # Distro detection, tool discovery
-    ├── clean.rs    # All cleaning operations
+    ├── detect.rs   # Distro detection, privilege/disk detection
+    ├── clean.rs    # System cleaning operations
+    ├── dev.rs      # Dev-tool cache cleanup (npm, cargo, pip, ...)
     └── utils.rs    # Command execution, file ops, helpers
 ```
 
@@ -240,7 +301,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 41 unit tests covering formatting, directory sizing, file removal, distro detection, etc., and 11 integration tests for CLI flags and dry-run behavior.
+There are 51 unit tests and 11 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards that make sure the dev cleaner never accidentally targets `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`. Those are the ones that would actually ruin someone's day.
 
 ---
 
@@ -265,7 +326,7 @@ cargo build && cargo test
 - Shell completions (bash, zsh, fish)
 - `--quiet` mode
 - Integration tests with Docker containers
-- Logging to file (`--log`)
+- More dev tools in `--dev` (conda, mix, rebar, sbt...)
 
 ---
 
@@ -281,6 +342,14 @@ It removes cached packages (not installed ones), orphaned packages, old Nix gene
 <summary>Does it work on my distro?</summary>
 
 If your distro is based on any of the supported families (Arch, Debian, Fedora, etc.) — yes. Unknown distros get universal cleaning (cache, trash, journal, Flatpak, Snap) which is still useful.
+</details>
+
+<details>
+<summary>Will <code>--dev</code> break my Rust/Node/Python projects?</summary>
+
+No. Without `--deep` it only removes things that get rebuilt locally with no network (cargo's extracted sources, pip wheel cache, npm download cache, etc.). With `--deep` it also clears caches that *will* re-download next time you build, so don't run that on a metered connection.
+
+The one thing it explicitly *cannot* break is your installed binaries — `~/.cargo/bin`, npm globals, poetry virtualenvs, and gradle's wrapper are all preserved by design, with unit tests that fail loudly if anyone tries to change that.
 </details>
 
 <details>

@@ -1,5 +1,6 @@
 mod clean;
 mod detect;
+mod dev;
 mod utils;
 
 use clap::Parser;
@@ -23,17 +24,17 @@ struct SystemInfo {
 
 impl SystemInfo {
     fn detect() -> Self {
-        let distro = detect::distro();
-        let aur_helper = if distro == Distro::Arch {
-            detect::aur_helper()
-        } else {
-            None
-        };
-
         Self {
             pretty_name: detect::pretty_name(),
-            distro,
-            aur_helper,
+            distro: detect::distro(),
+            aur_helper: {
+                // AUR helpers are only meaningful on Arch-family distros.
+                if detect::distro() == Distro::Arch {
+                    detect::aur_helper()
+                } else {
+                    None
+                }
+            },
             has_flatpak: detect::has_flatpak(),
             has_snap: detect::has_snap(),
             has_nix: detect::has_nix(),
@@ -56,6 +57,8 @@ impl SystemInfo {
 ///   oxiclean --cache --trash        Only clean cache & trash
 ///   oxiclean --all --dry-run        Preview what would be cleaned
 ///   oxiclean --packages --orphans   Clean pkg cache & orphans only
+///   oxiclean --dev                  Clean dev-tool caches (npm, cargo, ...)
+///   oxiclean --all --dev --dry-run  Preview everything including dev caches
 #[derive(Parser)]
 #[command(name = "oxiclean", version, about, long_about = None)]
 struct Cli {
@@ -91,6 +94,12 @@ struct Cli {
     #[arg(short = 't', long)]
     trash: bool,
 
+    /// Clean dev-tool caches (npm, pnpm, yarn, bun, deno, pip, uv, poetry,
+    /// cargo, go, gradle, maven, composer, gem). Safe by default — caches
+    /// that trigger re-downloads need --deep.
+    #[arg(short = 'D', long)]
+    dev: bool,
+
     /// Run all cleanup operations
     #[arg(short = 'A', long)]
     all: bool,
@@ -119,6 +128,10 @@ fn main() {
     let do_snap = cli.all || cli.snap;
     let do_journal = cli.all || cli.journal;
     let do_trash = cli.all || cli.trash;
+    // --dev is opt-in: --all does NOT enable it. Dev caches behave very
+    // differently from system caches (rebuild times, re-download warnings)
+    // and the user should ask for them explicitly.
+    let do_dev = cli.dev;
 
     if !do_cache
         && !do_packages
@@ -128,6 +141,7 @@ fn main() {
         && !do_snap
         && !do_journal
         && !do_trash
+        && !do_dev
     {
         utils::banner(env!("CARGO_PKG_VERSION"));
         println!(
@@ -271,6 +285,10 @@ fn main() {
 
     if do_trash {
         total_freed += clean::trash(cli.dry_run);
+    }
+
+    if do_dev {
+        total_freed += dev::run(cli.deep, cli.dry_run, cli.yes);
     }
 
     // ── Summary ──

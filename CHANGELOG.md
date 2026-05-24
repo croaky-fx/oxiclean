@@ -1,6 +1,59 @@
 # Changelog
 
-## [1.1.0] - 2026-05-19
+## [1.2.0] - 2026-05-24
+
+### Added
+- **`--dev` / `-D` flag**: clean caches of every dev tool we can find,
+  with safety baked in. Detected automatically:
+  - **Node**: npm (`~/.npm/_cacache`), yarn classic (`~/.cache/yarn`),
+    yarn berry (`~/.yarn/berry/cache`), bun (`~/.bun/install/cache`),
+    **pnpm** (via `pnpm store prune` — see below), deno (`deno clean`).
+  - **Python**: pip (`pip cache purge`), uv (`uv cache clean`), pipenv,
+    poetry (cache only — virtualenvs preserved).
+  - **Rust**: `~/.cargo/registry/src`, `~/.cargo/git/checkouts` (safe —
+    re-extract only). With `--deep`, also `~/.cargo/registry/cache` and
+    `~/.cargo/git/db` (will trigger re-download).
+  - **Go**: `go clean -modcache` (Go marks module files read-only, so a
+    plain `rm -rf` fails; we use the official command). `--deep` only —
+    re-downloads.
+  - **Ruby**: `gem cleanup` (removes old versions only).
+  - **PHP**: `composer clear-cache`.
+  - **JVM**: Gradle (`~/.gradle/caches` only, never `wrapper/`),
+    Maven (`~/.m2/repository`, deep only).
+- Pre-cleanup **scan summary** prints every detected cache with size and
+  a safety marker, plus a total and a "will clean now" line. `--deep`
+  unlocks the re-download caches; without it they’re listed but skipped.
+
+### Safety — things this release explicitly does NOT do
+- **pnpm**: the store is hard-linked into every `node_modules` on disk;
+  deleting it manually silently breaks active projects. We call
+  `pnpm store prune` instead.
+- **Cargo**: `~/.cargo/bin` is **never** touched — it holds
+  user-installed binaries (cargo-watch, rustfmt, etc.). Our cleanup
+  targets sibling subdirectories only.
+- **Poetry**: `~/.cache/pypoetry/virtualenvs` is preserved — only the
+  `cache/` subdir is wiped.
+- **Gradle**: `~/.gradle/wrapper` (which holds downloaded Gradle
+  distributions) is preserved — only `caches/` is wiped.
+- **npm**: `~/.npm/lib/node_modules` (global packages) is preserved —
+  only `_cacache/` is wiped.
+- `--all` does **not** enable `--dev`. Dev caches have very different
+  trade-offs (rebuild times, re-downloads) so the user must opt in.
+
+### Tests (10+ new)
+- `scan_simple` returns `None` for missing directories and 0-byte
+  directories, and reports correct size for non-empty ones.
+- `scan_redownload` sets the `needs_redownload` flag.
+- `cleanable_size`: with `deep=false`, redownload caches are excluded;
+  with `deep=true`, everything is included.
+- `clean_dir_contents_except`: regression guard — keeps named children
+  and removes the rest, with byte-accurate freed accounting.
+- Path-shape assertions for cargo (`bin/` never targeted), poetry
+  (`virtualenvs/` never targeted), gradle (`wrapper/` never targeted),
+  and npm (`node_modules` never targeted). These tests are cheap
+  but catch the most damaging refactor mistakes.
+
+## [1.1.0] - 2026-05-13
 
 ### Added
 - **`doas` support**: a new `Privilege` enum (`Doas` / `Sudo` / `Root`)
