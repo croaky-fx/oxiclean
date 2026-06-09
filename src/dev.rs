@@ -210,8 +210,11 @@ pub fn scan_all() -> Vec<DevCache> {
     }
 
     // ── Go ──
-    if let Some(c) = scan_redownload("go modules", go_modcache_path(), "re-download on next build")
-    {
+    if let Some(c) = scan_redownload(
+        "go modules",
+        go_modcache_path(),
+        "re-download on next build",
+    ) {
         out.push(c);
     }
 
@@ -285,7 +288,12 @@ pub fn print_summary(caches: &[DevCache], deep: bool) {
     }
 
     // Longest name for padding.
-    let name_width = caches.iter().map(|c| c.name.len()).max().unwrap_or(8).max(8);
+    let name_width = caches
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
 
     for c in caches {
         let will_clean = deep || !c.needs_redownload;
@@ -407,13 +415,9 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
 
         // pnpm: hard-linked store \u2014 NEVER touch directly.
         "pnpm" => {
-            let before = pnpm_store_path()
-                .map(|p| utils::dir_size(&p))
-                .unwrap_or(0);
+            let before = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             utils::run("pnpm", &["store", "prune"]);
-            let after = pnpm_store_path()
-                .map(|p| utils::dir_size(&p))
-                .unwrap_or(0);
+            let after = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
 
@@ -499,13 +503,9 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // Use the official command here because the module cache often
         // contains read-only files; direct deletion is less reliable.
         "go modules" if utils::which("go") => {
-            let before = go_modcache_path()
-                .map(|p| utils::dir_size(&p))
-                .unwrap_or(0);
+            let before = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             utils::run("go", &["clean", "-modcache"]);
-            let after = go_modcache_path()
-                .map(|p| utils::dir_size(&p))
-                .unwrap_or(0);
+            let after = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
         "go modules" => 0,
@@ -580,9 +580,13 @@ pub fn run(deep: bool, dry_run: bool, yes: bool) -> u64 {
     // Deep mode may clear caches that will need to be downloaded again.
     // Ask once before doing that unless the user already passed --yes.
     let has_redownload = caches.iter().any(|c| c.needs_redownload);
-    if deep && has_redownload && !yes && !utils::confirm(
-        "Proceed with --deep? This will trigger re-downloads on next build. [y/N]:",
-    ) {
+    if deep
+        && has_redownload
+        && !yes
+        && !utils::confirm(
+            "Proceed with --deep? This will trigger re-downloads on next build. [y/N]:",
+        )
+    {
         utils::skip("Deep clean cancelled by user");
         return 0;
     }
