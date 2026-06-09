@@ -4,6 +4,37 @@ use std::path::PathBuf;
 use crate::detect::Distro;
 use crate::utils;
 
+/// Remove partial-download files left over from interrupted `pacman -Syu`
+/// runs. These live in `/var/cache/pacman/pkg/` and follow the pattern
+/// `download-XXXXXX` (random suffix). Doing this before `pacman -Sc` avoids
+/// the noisy `error: could not open file ... Error reading fd 7` warnings
+/// pacman would otherwise spit out.
+///
+/// Quiet by design — we shell out to `find -delete` and don't report counts
+/// because there's no clean way to count the deletions across sudo.
+fn cleanup_pacman_partial_downloads() {
+    use std::path::Path;
+    let cache = Path::new("/var/cache/pacman/pkg");
+    if !cache.exists() {
+        return;
+    }
+    // We use sudo + find rather than std::fs because /var/cache/pacman/pkg
+    // is owned by root.
+    utils::sudo(
+        "find",
+        &[
+            "/var/cache/pacman/pkg",
+            "-maxdepth",
+            "1",
+            "-name",
+            "download-*",
+            "-type",
+            "f",
+            "-delete",
+        ],
+    );
+}
+
 /// Decide whether a destructive "deep" operation should run.
 ///
 /// * `deep == true`  → always run (user explicitly opted in)
@@ -42,7 +73,7 @@ fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
 }
 
 pub fn user_cache(dry_run: bool) -> u64 {
-    utils::section("User Cache (~/.cache)");
+    utils::section("User Cache");
 
     let home = match utils::home_dir() {
         Some(h) => h,
@@ -59,11 +90,6 @@ pub fn user_cache(dry_run: bool) -> u64 {
     }
 
     let size = utils::dir_size(&cache);
-    utils::info(&format!(
-        "Cache size: {}",
-        utils::format_size(size).yellow()
-    ));
-
     if size == 0 {
         utils::success("Already clean");
         return 0;
@@ -83,7 +109,7 @@ pub fn user_cache(dry_run: bool) -> u64 {
 }
 
 pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
-    utils::section(&format!("Package Cache ({})", distro.pkg_manager()));
+    utils::section("Package Cache");
 
     if *distro == Distro::Unknown {
         utils::skip("Unknown distribution — skipped");
@@ -104,7 +130,15 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
 
     match distro {
         Distro::Arch => {
-            utils::info("Cleaning pacman cache (keeping latest version)...");
+            // Sweep partial-download leftovers BEFORE `pacman -Sc`.
+            // When a `pacman -Syu` is interrupted (Ctrl-C, lost network,
+            // power loss) it leaves files like `/var/cache/pacman/pkg/
+            // download-AbCdEf` behind. `pacman -Sc` later tries to open
+            // them and prints `error: could not open file ... Error
+            // reading fd 7` for each. We delete them quietly first —
+            // see https://forum.endeavouros.com/t/error-cleaning-package-cache/73965
+            cleanup_pacman_partial_downloads();
+
             if utils::sudo("pacman", &["-Sc", "--noconfirm"]) {
                 utils::success("pacman cache cleaned");
             } else {
@@ -124,7 +158,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Debian => {
-            utils::info("Cleaning apt cache...");
             if utils::sudo("apt-get", &["clean"]) {
                 utils::success("apt cache cleaned");
             } else {
@@ -145,7 +178,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
 
         Distro::Fedora => {
             let pm = if utils::which("dnf") { "dnf" } else { "yum" };
-            utils::info(&format!("Cleaning {} cache...", pm));
             if utils::sudo(pm, &["clean", "all"]) {
                 utils::success(&format!("{} cache cleaned", pm));
             } else {
@@ -154,7 +186,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Suse => {
-            utils::info("Cleaning zypper cache...");
             if utils::sudo("zypper", &["clean", "--all"]) {
                 utils::success("zypper cache cleaned");
             } else {
@@ -184,7 +215,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Void => {
-            utils::info("Cleaning xbps cache...");
             if utils::sudo("xbps-remove", &["-O", "-y"]) {
                 utils::success("xbps cache cleaned");
             } else {
@@ -193,14 +223,12 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Alpine => {
-            utils::info("Cleaning apk cache...");
             if utils::sudo("apk", &["cache", "clean"]) {
                 utils::success("apk cache cleaned");
             } else {
                 utils::warning("apk cache clean failed");
                 let apk_cache = PathBuf::from("/var/cache/apk");
                 if apk_cache.exists() {
-                    utils::info("Cleaning /var/cache/apk manually...");
                     utils::sudo("find", &["/var/cache/apk", "-type", "f", "-delete"]);
                     utils::success("apk cache directory cleaned");
                 }
@@ -209,7 +237,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
 
         Distro::Gentoo => {
             if utils::which("eclean") {
-                utils::info("Cleaning distfiles...");
                 if utils::sudo("eclean", &["distfiles"]) {
                     utils::success("Distfiles cleaned");
                 } else {
@@ -224,7 +251,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 utils::warning("eclean not found — install app-portage/gentoolkit");
                 let distfiles = PathBuf::from("/var/cache/distfiles");
                 if distfiles.exists() {
-                    utils::info("Cleaning /var/cache/distfiles manually...");
                     utils::sudo("find", &["/var/cache/distfiles", "-type", "f", "-delete"]);
                     utils::success("Distfiles cleaned");
                 }
@@ -232,7 +258,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Solus => {
-            utils::info("Cleaning eopkg cache...");
             if utils::sudo("eopkg", &["delete-cache"]) {
                 utils::success("eopkg cache cleaned");
             } else {
@@ -241,7 +266,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Clear => {
-            utils::info("Cleaning swupd state...");
             let staged = PathBuf::from("/var/lib/swupd/staged");
             if staged.exists() {
                 utils::sudo("rm", &["-rf", "/var/lib/swupd/staged"]);
@@ -431,7 +455,7 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
 }
 
 pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
-    utils::section(&format!("AUR Cache ({})", helper));
+    utils::section("AUR Cache");
 
     if dry_run {
         utils::info(&format!(
@@ -445,7 +469,6 @@ pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
     let cache_dir = utils::home_dir().map(|h| PathBuf::from(&h).join(".cache").join(helper));
     let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
 
-    utils::info(&format!("Cleaning {} cache...", helper));
     if utils::run(helper, &["-Sc", "--noconfirm"]) {
         utils::success(&format!("{} cache cleaned", helper));
     } else {
@@ -479,7 +502,7 @@ pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
 }
 
 pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
-    utils::section("Flatpak Cleanup");
+    utils::section("Flatpak");
 
     if dry_run {
         utils::info("[DRY RUN] Would clean Flatpak unused runtimes & cache");
@@ -544,7 +567,7 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
 }
 
 pub fn snap(dry_run: bool) -> u64 {
-    utils::section("Snap Cleanup");
+    utils::section("Snap");
 
     if dry_run {
         utils::info("[DRY RUN] Would remove disabled snap revisions & cache");
@@ -584,7 +607,6 @@ pub fn snap(dry_run: bool) -> u64 {
     if snap_cache.exists() {
         let size = utils::dir_size(&snap_cache);
         if size > 0 {
-            utils::info("Cleaning snap cache...");
             utils::sudo("find", &["/var/lib/snapd/cache", "-type", "f", "-delete"]);
             freed += size;
             utils::success(&format!("Freed {}", utils::format_size(size).green()));
@@ -595,7 +617,7 @@ pub fn snap(dry_run: bool) -> u64 {
 }
 
 pub fn journal(dry_run: bool) -> u64 {
-    utils::section("Systemd Journal");
+    utils::section("Journal");
 
     if !utils::which("journalctl") {
         utils::skip("journalctl not found — skipped");
@@ -691,8 +713,13 @@ pub fn trash(dry_run: bool) -> u64 {
 
 /// Run Nix garbage collection. Detects multi-user vs single-user installs
 /// and skips `nix store --optimise` on HDDs because it is extremely slow.
-pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::DiskType) -> u64 {
-    utils::section("Nix Garbage Collection");
+pub fn nix_gc(
+    deep: bool,
+    dry_run: bool,
+    yes: bool,
+    disk_type: crate::detect::DiskType,
+) -> u64 {
+    utils::section("Nix GC");
 
     if !crate::detect::has_nix() {
         utils::skip("Nix not installed — skipped");

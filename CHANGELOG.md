@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.0] - 2026-06-09
+
+### Added
+- `--quiet` / `-q` to suppress banner text, info lines, and skip lines while keeping the important action results visible.
+- `--generate-completion <SHELL>` to print shell completion scripts for bash, zsh, fish, elvish, and powershell.
+- CLI regression tests for quiet mode and shell-completion output.
+
+### Changed
+- Shorter section titles in the output (`User Cache`, `Package Cache`, `AUR Cache`, `Flatpak`, `Journal`).
+- Less noisy cleanup output: removed a bunch of "Cleaning ..." info lines so normal runs read more naturally.
+- Pinned `clap_complete` to `4.5.20` for compatibility with the Rust/Cargo toolchain used in CI and minimal environments.
+
+### Fixed
+- Arch cleanup now quietly removes leftover `/var/cache/pacman/pkg/download-*` partial downloads before `pacman -Sc`, avoiding the noisy `Error reading fd 7` pacman messages seen after interrupted downloads.
+
 ## [1.2.0] - 2026-05-24
 
 ### Added

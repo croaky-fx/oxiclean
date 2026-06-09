@@ -12,6 +12,8 @@ fn test_help_flag() {
     assert!(stdout.contains("oxiclean"));
     assert!(stdout.contains("--cache"));
     assert!(stdout.contains("--all"));
+    assert!(stdout.contains("--quiet"));
+    assert!(stdout.contains("--generate-completion"));
 }
 
 #[test]
@@ -93,6 +95,42 @@ fn test_no_args_shows_hint() {
     assert!(
         stdout.contains("--all"),
         "no-args output should hint at --all. stdout was:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_generate_completion_bash() {
+    let output = oxiclean()
+        .args(["--generate-completion", "bash"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("oxiclean"));
+    assert!(
+        stdout.contains("complete -F") || stdout.contains("_oxiclean"),
+        "bash completion output looks wrong. stdout was:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_quiet_hides_banner_and_info_lines() {
+    let output = oxiclean()
+        .args(["--quiet", "--cache", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Fast Cross-Distribution Linux System Cleaner"),
+        "quiet mode should hide banner subtitle. stdout was:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains('ℹ'),
+        "quiet mode should hide info lines. stdout was:\n{}",
         stdout
     );
 }

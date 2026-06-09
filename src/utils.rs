@@ -34,10 +34,26 @@ pub fn run(cmd: &str, args: &[&str]) -> bool {
 /// with no behavioural benefit.
 static PRIVILEGE: OnceLock<Privilege> = OnceLock::new();
 
+/// Quiet-mode flag set by `--quiet` / `-q`. When true, [`info`] and [`skip`]
+/// produce no output and the banner sub-lines are hidden. Action lines
+/// (section, success, warning, error) always print — those are the bits the
+/// user actually needs to see.
+static QUIET: OnceLock<bool> = OnceLock::new();
+
 /// Record the detected privilege helper. Called once from `main()`.
 /// Subsequent calls are silently ignored — `OnceLock` semantics.
 pub fn set_privilege(p: Privilege) {
     let _ = PRIVILEGE.set(p);
+}
+
+/// Enable quiet mode. Called once from `main()` when `--quiet` is passed.
+pub fn set_quiet(q: bool) {
+    let _ = QUIET.set(q);
+}
+
+/// Returns true if `--quiet` was passed at startup.
+pub fn is_quiet() -> bool {
+    *QUIET.get().unwrap_or(&false)
 }
 
 /// Current privilege helper, or `Privilege::Sudo` if `main()` never set one
@@ -220,6 +236,11 @@ pub fn confirm(msg: &str) -> bool {
 // ═══════════════════════════════════════════════════
 
 pub fn banner(version: &str) {
+    if is_quiet() {
+        // Quiet mode: skip the banner entirely. Most automated/scripted
+        // users want plain output they can pipe somewhere.
+        return;
+    }
     println!();
     println!(
         "    {} {}  {}",
@@ -257,11 +278,20 @@ pub fn error(msg: &str) {
     println!("    {} {}", "✘".red().bold(), msg);
 }
 
+/// Informational line. Suppressed by `--quiet` because these are the
+/// noisiest lines and the user can survive without them.
 pub fn info(msg: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("    {} {}", "ℹ".blue(), msg);
 }
 
+/// "Skipped" line. Also suppressed by `--quiet`; nothing to act on.
 pub fn skip(msg: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("    {} {}", "⊘".dimmed(), msg.dimmed());
 }
 

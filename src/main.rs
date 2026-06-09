@@ -3,7 +3,8 @@ mod detect;
 mod dev;
 mod utils;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::aot::{generate, Shell};
 use colored::Colorize;
 use std::time::Instant;
 
@@ -59,6 +60,7 @@ impl SystemInfo {
 ///   oxiclean --packages --orphans   Clean pkg cache & orphans only
 ///   oxiclean --dev                  Clean dev-tool caches (npm, cargo, ...)
 ///   oxiclean --all --dev --dry-run  Preview everything including dev caches
+///   oxiclean --generate-completion bash > ~/.local/share/bash-completion/completions/oxiclean
 #[derive(Parser)]
 #[command(name = "oxiclean", version, about, long_about = None)]
 struct Cli {
@@ -115,10 +117,32 @@ struct Cli {
     /// Preview actions without making changes
     #[arg(short = 'n', long)]
     dry_run: bool,
+
+    /// Reduce output: only section headers and action results,
+    /// no banner sub-lines, no "info" hints, no "skipped" lines.
+    /// Useful for cron and CI runs.
+    #[arg(short = 'q', long)]
+    quiet: bool,
+
+    /// Print shell completion script to stdout and exit.
+    /// Supported values come from clap_complete (bash, zsh, fish, elvish, powershell).
+    #[arg(long = "generate-completion", value_name = "SHELL")]
+    generate_completion: Option<Shell>,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(shell) = cli.generate_completion {
+        let mut cmd = Cli::command();
+        let mut out = std::io::stdout();
+        generate(shell, &mut cmd, "oxiclean", &mut out);
+        return;
+    }
+
+    // Register --quiet BEFORE anything that might print (including the
+    // banner and detection output).
+    utils::set_quiet(cli.quiet);
 
     let do_cache = cli.all || cli.cache;
     let do_packages = cli.all || cli.packages;

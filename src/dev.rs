@@ -1,26 +1,26 @@
-// --------------------------------------------------
-// Dev-tool cache cleanup
-// --------------------------------------------------
+// ═══════════════════════════════════════════════════
+//  Dev-tool cache cleanup
+// ═══════════════════════════════════════════════════
 //
-// Each tool exposes two functions:
-//   - `scan_*`: report the cache size without changing anything.
-//   - `clean_*`: actually remove the cache.
+// Each tool exposes a `scan_*` function that reports the size of its cache
+// without touching anything, and a `clean_*` function that performs the
+// cleanup. Splitting the two phases lets us print a nice summary first,
+// then act — and lets the user see exactly what would be touched
+// in `--dry-run`.
 //
-// We separate scanning from cleaning so we can show a clear summary,
-// let the user review results, and support `--dry-run`.
+// Safety rules:
 //
-// Important rules:
-//
-// - Never remove user-installed binaries (e.g. `~/.cargo/bin`,
-//   `~/.npm/lib/node_modules`) — those are not caches and belong to the user.
-// - Do not delete Poetry virtualenvs — only clear `~/.cache/pypoetry/cache`.
-// - `pnpm` uses a central, hard-linked store. Deleting that store directory
-//   by hand will silently break existing `node_modules`. Use `pnpm store prune`.
-// - Go's module cache may be permission-protected; `rm -rf` can fail.
-//   Use `go clean -modcache`, which handles permissions correctly.
-// - Any removal that would force packages to be re-downloaded on the next build
-//   is skipped by default and only performed with `--deep`. Re-extracting
-//   from a local `.crate` file is fine and does not count as a re-download.
+// * **Never** delete user-installed binaries (`~/.cargo/bin`,
+//   `~/.npm/lib/node_modules`, etc.). Those are not caches.
+// * **Never** delete poetry virtualenvs — only `~/.cache/pypoetry/cache`.
+// * **pnpm** uses hard-linked stores; deleting the store directory by hand
+//   silently breaks every existing `node_modules`. We must call
+//   `pnpm store prune`.
+// * **go**'s module cache is read-only; `rm -rf` fails. Use `go clean
+//   -modcache`.
+// * Anything that triggers a re-download on next build is gated behind
+//   `--deep`. Re-extracting from a local `.crate` file doesn't count as
+//   re-download.
 
 use colored::Colorize;
 use std::path::{Path, PathBuf};
@@ -210,11 +210,8 @@ pub fn scan_all() -> Vec<DevCache> {
     }
 
     // ── Go ──
-    if let Some(c) = scan_redownload(
-        "go modules",
-        go_modcache_path(),
-        "re-download on next build",
-    ) {
+    if let Some(c) = scan_redownload("go modules", go_modcache_path(), "re-download on next build")
+    {
         out.push(c);
     }
 
@@ -288,12 +285,7 @@ pub fn print_summary(caches: &[DevCache], deep: bool) {
     }
 
     // Longest name for padding.
-    let name_width = caches
-        .iter()
-        .map(|c| c.name.len())
-        .max()
-        .unwrap_or(8)
-        .max(8);
+    let name_width = caches.iter().map(|c| c.name.len()).max().unwrap_or(8).max(8);
 
     for c in caches {
         let will_clean = deep || !c.needs_redownload;
@@ -415,9 +407,13 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
 
         // pnpm: hard-linked store \u2014 NEVER touch directly.
         "pnpm" => {
-            let before = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let before = pnpm_store_path()
+                .map(|p| utils::dir_size(&p))
+                .unwrap_or(0);
             utils::run("pnpm", &["store", "prune"]);
-            let after = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let after = pnpm_store_path()
+                .map(|p| utils::dir_size(&p))
+                .unwrap_or(0);
             before.saturating_sub(after)
         }
 
@@ -499,13 +495,21 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             .map(clean_dir_contents)
             .unwrap_or(0),
 
-        // ── Go ── (read-only files \u2014 use go clean)
+        // ── Go ──
+        // Use the official command here because the module cache often
+        // contains read-only files; direct deletion is less reliable.
         "go modules" if utils::which("go") => {
-            let before = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let before = go_modcache_path()
+                .map(|p| utils::dir_size(&p))
+                .unwrap_or(0);
             utils::run("go", &["clean", "-modcache"]);
-            let after = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let after = go_modcache_path()
+                .map(|p| utils::dir_size(&p))
+                .unwrap_or(0);
             before.saturating_sub(after)
         }
+        "go modules" => 0,
+
         // ── Ruby ──
         "ruby gems (old versions)" => {
             // `gem cleanup` removes old versions only \u2014 it never touches
@@ -515,6 +519,8 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         }
 
         // ── PHP ──
+        // Prefer Composer's own cache command when it exists instead of
+        // blindly deleting the directory.
         "composer" if utils::which("composer") => {
             let before = home_join(".cache/composer")
                 .map(|p| utils::dir_size(&p))
@@ -525,6 +531,8 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
                 .unwrap_or(0);
             before.saturating_sub(after)
         }
+        "composer" => 0,
+
         // ── JVM ──
         "gradle" => {
             // ONLY the `caches/` subtree of `~/.gradle`. NEVER `wrapper/`.
@@ -569,15 +577,12 @@ pub fn run(deep: bool, dry_run: bool, yes: bool) -> u64 {
         return 0;
     }
 
-    // Destructive caches: ask once unless --yes / --deep.
+    // Deep mode may clear caches that will need to be downloaded again.
+    // Ask once before doing that unless the user already passed --yes.
     let has_redownload = caches.iter().any(|c| c.needs_redownload);
-    if deep
-        && has_redownload
-        && !yes
-        && !utils::confirm(
-            "Proceed with --deep? This will trigger re-downloads on next build. [y/N]:",
-        )
-    {
+    if deep && has_redownload && !yes && !utils::confirm(
+        "Proceed with --deep? This will trigger re-downloads on next build. [y/N]:",
+    ) {
         utils::skip("Deep clean cancelled by user");
         return 0;
     }

@@ -141,6 +141,9 @@ oxiclean --all
 # Run it without asking questions
 oxiclean --all --yes
 
+# Quieter output (nice for cron / CI)
+oxiclean --all --yes --quiet
+
 # Go deeper (more aggressive — pacman -Scc, flatpak repair, etc.)
 oxiclean --all --yes --deep
 ```
@@ -208,12 +211,33 @@ Options:
   -t, --trash       Empty trash
   -D, --dev         Clean dev-tool caches (npm, cargo, pip, etc.)
   -A, --all         Run all system cleanup operations (not --dev)
-  -d, --deep        Enable aggressive/deep cleaning mode
-  -y, --yes         Skip all confirmation prompts
-  -n, --dry-run     Preview actions without making changes
-  -h, --help        Print help
-  -V, --version     Print version
+  -d, --deep                        Enable aggressive/deep cleaning mode
+  -y, --yes                         Skip all confirmation prompts
+  -n, --dry-run                     Preview actions without making changes
+  -q, --quiet                       Reduce output noise (good for cron / CI)
+      --generate-completion <SHELL> Print shell completion script and exit
+  -h, --help                        Print help
+  -V, --version                     Print version
 ```
+
+### Shell completions
+
+If you want tab completion, OxiClean can print the script for your shell and you
+just redirect it where your distro expects it:
+
+```bash
+# bash
+oxiclean --generate-completion bash > ~/.local/share/bash-completion/completions/oxiclean
+
+# zsh
+mkdir -p ~/.local/share/zsh/site-functions
+oxiclean --generate-completion zsh > ~/.local/share/zsh/site-functions/_oxiclean
+
+# fish
+oxiclean --generate-completion fish > ~/.config/fish/completions/oxiclean.fish
+```
+
+Not glamorous, but it works fine and keeps the binary simple.
 
 ---
 
@@ -248,7 +272,7 @@ Options:
 
 **Cron-friendly:**
 ```
-0 3 * * 0 /usr/local/bin/oxiclean --all --yes
+0 3 * * 0 /usr/local/bin/oxiclean --all --yes --quiet
 ```
 Avoid `--deep` in automated runs. And if you want dev caches included, add `--dev`.
 
@@ -270,7 +294,7 @@ It reads `/etc/os-release` to figure out your distro, then checks `$PATH` for wh
 
 Freed space is measured by checking directory sizes before and after — not estimated. The one exception is orphan removal, since those files are scattered across the system.
 
-The binary itself is ~800KB with no runtime dependencies. Just `clap` for CLI parsing and `colored` for the output colors.
+The binary itself stays small and has no runtime dependencies. It uses `clap` for CLI parsing, `colored` for terminal colors, and `clap_complete` only to print shell completion scripts when you ask for them.
 
 ---
 
@@ -323,10 +347,10 @@ cargo build && cargo test
 
 **Things I'd love help with:**
 - More distros (Guix, Slackware...)
-- Shell completions (bash, zsh, fish)
-- `--quiet` mode
 - Integration tests with Docker containers
 - More dev tools in `--dev` (conda, mix, rebar, sbt...)
+- Better distro-specific docs for Alpine / Void / Nix edge cases
+- A couple more real-world smoke tests on HDD systems
 
 ---
 
