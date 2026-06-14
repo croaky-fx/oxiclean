@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.1] - 2026-06-14
+
+### Fixed
+- **Pacman partial-download leftovers were never actually removed.** The
+  v1.3.0 sweep filtered on `find -type f`, but modern pacman (6.1+, which
+  downloads in a sandbox as the `alpm` user — the default on Arch/CachyOS)
+  leaves leftovers as **directories** (`download-XXXXXX`, mode `0700`, owned
+  by `alpm`), not files. The filter skipped them, so `pacman -Sc` / `paru -Sc`
+  kept printing `error: could not open file ... Error reading fd 7`. The sweep
+  now matches both files and directories and removes them with `sudo rm -rf`,
+  guarded by a `.pkg.tar` check so a real cached package is never touched.
+- The sweep now also runs before the AUR helper's `-Sc` (paru/yay clean the
+  same shared pacman cache), so the AUR Cache section no longer prints the
+  leftover error either.
+
 ## [1.3.0] - 2026-06-09
 
 ### Added

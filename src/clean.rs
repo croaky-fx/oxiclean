@@ -1,38 +1,60 @@
 use colored::Colorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::detect::Distro;
 use crate::utils;
 
-/// Remove partial-download files left over from interrupted `pacman -Syu`
-/// runs. These live in `/var/cache/pacman/pkg/` and follow the pattern
-/// `download-XXXXXX` (random suffix). Doing this before `pacman -Sc` avoids
-/// the noisy `error: could not open file ... Error reading fd 7` warnings
-/// pacman would otherwise spit out.
+/// Remove partial-download leftovers from interrupted `pacman -Syu` runs.
 ///
-/// Quiet by design — we shell out to `find -delete` and don't report counts
-/// because there's no clean way to count the deletions across sudo.
+/// Modern pacman (6.1+) downloads packages in a sandbox under the dedicated
+/// `alpm` user, so an interrupted run (Ctrl-C, lost network, power loss)
+/// leaves behind a *directory* like `/var/cache/pacman/pkg/download-XXXXXX`,
+/// owned by `alpm` and mode `0700`. Older pacman left `.part`-style files
+/// instead. Either way, `pacman -Sc` / `<helper> -Sc` later trip over the
+/// leftover and print `error: could not open file ... Error reading fd 7`
+/// for each one. We remove them quietly first.
+///
+/// The parent dir is world-readable, so we enumerate names as the invoking
+/// user; the leftovers themselves are root/`alpm`-owned, so the delete goes
+/// through `sudo rm -rf` (which handles both files and non-empty dirs).
+/// See https://forum.endeavouros.com/t/error-cleaning-package-cache/73965
 fn cleanup_pacman_partial_downloads() {
-    use std::path::Path;
-    let cache = Path::new("/var/cache/pacman/pkg");
-    if !cache.exists() {
+    let leftovers = find_partial_downloads(Path::new("/var/cache/pacman/pkg"));
+    if leftovers.is_empty() {
         return;
     }
-    // We use sudo + find rather than std::fs because /var/cache/pacman/pkg
-    // is owned by root.
-    utils::sudo(
-        "find",
-        &[
-            "/var/cache/pacman/pkg",
-            "-maxdepth",
-            "1",
-            "-name",
-            "download-*",
-            "-type",
-            "f",
-            "-delete",
-        ],
-    );
+    let paths: Vec<String> = leftovers
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let mut args: Vec<&str> = vec!["-rf"];
+    args.extend(paths.iter().map(|s| s.as_str()));
+    utils::sudo("rm", &args);
+}
+
+/// True if `name` is a pacman partial-download leftover that is always safe to
+/// delete. Real cached packages always end in `.pkg.tar.*`; the sandboxed
+/// downloader's leftovers never do — they are `download-` followed by a random
+/// suffix (a directory on pacman 6.1+, a file on older versions).
+fn is_partial_download(name: &str) -> bool {
+    name.starts_with("download-") && !name.contains(".pkg.tar")
+}
+
+/// Enumerate partial-download leftovers (files *or* directories) directly under
+/// `cache_dir`. Reads entry names only — never descends — so it works even when
+/// the leftovers are mode `0700` and owned by another user.
+fn find_partial_downloads(cache_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if is_partial_download(name) {
+                    out.push(entry.path());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Decide whether a destructive "deep" operation should run.
@@ -469,6 +491,11 @@ pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
     let cache_dir = utils::home_dir().map(|h| PathBuf::from(&h).join(".cache").join(helper));
     let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
 
+    // AUR helpers (paru, yay, …) clean the shared pacman cache too, so the same
+    // partial-download leftovers would make them print the `Error reading fd 7`
+    // noise. Sweep them first — see `cleanup_pacman_partial_downloads`.
+    cleanup_pacman_partial_downloads();
+
     if utils::run(helper, &["-Sc", "--noconfirm"]) {
         utils::success(&format!("{} cache cleaned", helper));
     } else {
@@ -796,5 +823,57 @@ mod tests {
         // Must return false WITHOUT prompting — otherwise the test would
         // hang waiting on stdin, which is itself the proof it works.
         assert!(!should_deep(false, true, "irrelevant"));
+    }
+
+    // ── partial-download sweep: catch alpm leftovers, never real packages ──
+
+    #[test]
+    fn test_is_partial_download_matches_leftovers() {
+        // pacman 6.1+ leaves directories; older pacman left files. Both share
+        // the `download-<random>` shape and must be matched.
+        assert!(is_partial_download("download-3kcUOv"));
+        assert!(is_partial_download("download-AbCdEf"));
+    }
+
+    #[test]
+    fn test_is_partial_download_spares_real_packages() {
+        // A real cached package that merely starts with "download" must
+        // survive — the guard keys on the `.pkg.tar` extension.
+        assert!(!is_partial_download(
+            "download-manager-1.2-1-x86_64.pkg.tar.zst"
+        ));
+        assert!(!is_partial_download("firefox-120.0-1-x86_64.pkg.tar.zst"));
+        assert!(!is_partial_download("downloads"));
+    }
+
+    #[test]
+    fn test_find_partial_downloads_selects_files_and_dirs() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("oxiclean_sweep_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // The directory shape (which the old `-type f` filter silently missed),
+        // the older file shape, and a real package that must be left alone.
+        fs::create_dir(tmp.join("download-3kcUOv")).unwrap();
+        fs::write(tmp.join("download-OldPart"), b"x").unwrap();
+        fs::write(tmp.join("vim-9.1-1-x86_64.pkg.tar.zst"), b"x").unwrap();
+
+        let mut found: Vec<String> = find_partial_downloads(&tmp)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+
+        assert_eq!(found, vec!["download-3kcUOv", "download-OldPart"]);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_find_partial_downloads_missing_dir_is_empty() {
+        // A non-existent cache dir must not panic — just yield nothing.
+        let found = find_partial_downloads(Path::new("/nonexistent/oxiclean/cache"));
+        assert!(found.is_empty());
     }
 }
