@@ -21,7 +21,7 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.2.0
+    ⚡ Oxi Clean  v1.3.1
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -33,43 +33,35 @@ $ oxiclean -A -y
 
   🔐 Requesting privileges (sudo)...
 
-  ━━▶ User Cache (~/.cache)
-    ℹ Cache size: 1.06 GB
-    ✔ Freed 1.06 GB
+  ━━▶ User Cache
+    ✔ Freed 846.36 MB
 
-  ━━▶ Package Cache (pacman)
+  ━━▶ Package Cache
     ✔ pacman cache cleaned
-    ℹ Package cache freed: 95.84 MB
 
   ━━▶ Orphaned Packages
-    ℹ Found 5 orphan(s):
-      • accounts-qml-module
-      • clang21
-      • lib32-gettext
-      • lib32-libpcap
-      • libliftoff
-    ✔ Orphans removed
+    ✔ No orphans found
 
-  ━━▶ AUR Cache (paru)
+  ━━▶ AUR Cache
     ✔ paru cache cleaned
 
-  ━━▶ Flatpak Cleanup
+  ━━▶ Flatpak
     ✔ Flatpak cleanup done
 
-  ━━▶ Systemd Journal
-    ℹ Current usage: 47.5M
+  ━━▶ Journal
+    ℹ Current usage: 47.8M
     ✔ Journal vacuumed
 
   ━━▶ Trash
-    ✔ Freed 3.33 MB
+    ✔ Trash is empty
 
   ══════════════════════════════════════════════
-  ⚡ Total freed: 1.15 GB
-  ⏱  Completed in: 135.05s
+  ⚡ Total freed: 846.36 MB
+  ⏱  Completed in: 21.30s
   ══════════════════════════════════════════════
 ```
 
-*(Real run on CachyOS with a 5400rpm HDD. The 135s is mostly snapper taking pre/post snapshots around the orphan removal — on an SSD without snapper it's way faster.)*
+*(Real run on CachyOS with a 5400rpm HDD. pacman/paru also print their own `[Y/n]` prompts during the run — those are pacman's, not oxiclean's, and they auto-answer with `--noconfirm`; they're trimmed here for clarity. A run that removes orphaned packages takes longer, mostly because snapper takes pre/post snapshots around the removal.)*
 
 ---
 
@@ -325,7 +317,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 51 unit tests and 11 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards that make sure the dev cleaner never accidentally targets `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`. Those are the ones that would actually ruin someone's day.
+There are 55 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards that make sure the dev cleaner never accidentally targets `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`. Those are the ones that would actually ruin someone's day.
 
 ---
 
