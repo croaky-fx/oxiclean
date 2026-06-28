@@ -21,7 +21,7 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.3.1
+    ⚡ Oxi Clean  v1.4.0
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -167,16 +167,17 @@ It looks like this:
 ```
   ━━▶ Dev Cache
     ℹ Scanning...
-      • npm                    340 MB   ✓ safe
-      • pnpm                   456 MB   ✓ store prune
-      • pip                     89 MB   ✓ safe
-      • uv                    234 MB   ✓ safe
-      • cargo registry/src   1.20 GB   ✓ re-extract only
-      • cargo registry/cache  890 MB   ⚠ re-download on next build
-      • go modules            670 MB   ⚠ re-download on next build
-      ─ Total: 3.86 GB   |   Will clean now: 2.31 GB
+      • npm                    542.56 MB   ✓ safe
+      • pnpm                     5.74 KB   ✓ store prune
+      • pip                      9.83 MB   ✓ safe
+      • uv                     305.98 MB   ✓ safe
+      • nuget                   33.40 MB   ✓ safe
+      • cargo registry/src     147.99 MB   ✓ re-extract only
+      • cargo registry/cache    43.84 MB   ⚠ re-download on next build
+      • go modules             230.37 MB   ⚠ re-download on next build
+      ─ Total: 1.28 GB   |   Will clean now: 1.02 GB
       ℹ Pass --deep to also clean caches that trigger re-downloads
-    ✔ Freed 2.31 GB
+    ✔ Freed 1.02 GB
 ```
 
 A few things it explicitly *won't* do (these are the ones that bite people):
@@ -318,7 +319,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 55 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards that make sure the dev cleaner never accidentally targets `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`. Those are the ones that would actually ruin someone's day.
+There are 59 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards that make sure the dev cleaner never accidentally targets `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`. Those are the ones that would actually ruin someone's day.
 
 ---
 
@@ -341,7 +342,7 @@ cargo build && cargo test
 **Things I'd love help with:**
 - More distros (Guix, Slackware...)
 - Integration tests with Docker containers
-- More dev tools in `--dev` (conda, mix, rebar, sbt...)
+- More dev tools in `--dev` (mix, rebar, sbt...)
 - Better distro-specific docs for Alpine / Void / Nix edge cases
 - A couple more real-world smoke tests on HDD systems
 
