@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.4.0] - 2026-06-28
+
+### Added
+- **Three more dev-tool caches** in `--dev`, all command-based and safe:
+  - **conda**: `conda clean --all --yes` (removes tarballs, index cache, and
+    unused packages — never touches your `envs/`).
+  - **ccache**: `ccache -C` clears the C/C++ compiler cache. Especially handy
+    on Arch, where `makepkg` uses it and it can grow to several GB.
+  - **NuGet / .NET**: `dotnet nuget locals all --clear` clears the global
+    package cache (`~/.nuget/packages`), restored on next restore/build.
+- **Distinct short vs long help.** `-h` prints a concise flag summary;
+  `--help` now prints the full description with usage examples. (Previously
+  both printed the same short text.)
+
+### Tests
+- Path-shape / safety guards for the three new tools: conda never targets
+  `envs/`, ccache resolves to a ccache dir, NuGet targets `.nuget/packages`.
+
 ## [1.3.1] - 2026-06-14
 
 ### Fixed

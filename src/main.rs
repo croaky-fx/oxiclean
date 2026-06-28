@@ -62,7 +62,7 @@ impl SystemInfo {
 ///   oxiclean --all --dev --dry-run  Preview everything including dev caches
 ///   oxiclean --generate-completion bash > ~/.local/share/bash-completion/completions/oxiclean
 #[derive(Parser)]
-#[command(name = "oxiclean", version, about, long_about = None)]
+#[command(name = "oxiclean", version, about)]
 struct Cli {
     /// Clean user cache (~/.cache)
     #[arg(short = 'c', long)]

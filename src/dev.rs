@@ -94,6 +94,56 @@ fn deno_dir_path() -> Option<PathBuf> {
     home_join(".cache/deno")
 }
 
+/// Resolve conda's package cache. Tries `conda info --json` and reads the
+/// first entry of `pkgs_dirs`; falls back to `~/.conda/pkgs`.
+fn conda_cache_path() -> Option<PathBuf> {
+    if utils::which("conda") {
+        if let Some(out) = utils::capture("conda", &["info", "--json"]) {
+            if let Some(p) = parse_conda_pkgs_dir(&out) {
+                return Some(PathBuf::from(p));
+            }
+        }
+    }
+    home_join(".conda/pkgs")
+}
+
+/// Extract the first string in the JSON `"pkgs_dirs": [ ... ]` array, without
+/// pulling in a JSON dependency for this single field. Returns `None` if the
+/// key is missing or the array is empty — the caller then falls back. The
+/// search for the opening quote is bounded by the array's closing `]` so an
+/// empty `[]` can't accidentally match the next key's quote.
+fn parse_conda_pkgs_dir(json: &str) -> Option<String> {
+    let start = json.find("\"pkgs_dirs\"")?;
+    let open = start + json[start..].find('[')?;
+    let close = open + json[open..].find(']')?;
+    let array = &json[open + 1..close]; // contents between [ and ]
+    let q1 = array.find('"')?;
+    let q2 = q1 + 1 + array[q1 + 1..].find('"')?;
+    let path = &array[q1 + 1..q2];
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+/// ccache cache directory. Reads `CCACHE_DIR` env var, falls back to `~/.cache/ccache`.
+fn ccache_dir_path() -> Option<PathBuf> {
+    if let Ok(env) = std::env::var("CCACHE_DIR") {
+        if !env.is_empty() {
+            return Some(PathBuf::from(env));
+        }
+    }
+    home_join(".cache/ccache")
+}
+
+/// NuGet's global package cache (`~/.nuget/packages`). `dotnet nuget locals`
+/// honours `NUGET_PACKAGES`, but that is rarely set and the default location
+/// is overwhelmingly the one in use, so we report the default.
+fn nuget_cache_path() -> Option<PathBuf> {
+    home_join(".nuget/packages")
+}
+
 // ─── Scanners (read-only) ────────────────────────────
 
 fn scan_simple(name: &'static str, path: Option<PathBuf>, note: &'static str) -> Option<DevCache> {
@@ -176,6 +226,19 @@ pub fn scan_all() -> Vec<DevCache> {
         home_join(".cache/pypoetry/cache"),
         "safe (virtualenvs preserved)",
     ) {
+        out.push(c);
+    }
+    if let Some(c) = scan_simple("conda", conda_cache_path(), "safe") {
+        out.push(c);
+    }
+
+    // ── C/C++ ──
+    if let Some(c) = scan_simple("ccache", ccache_dir_path(), "safe") {
+        out.push(c);
+    }
+
+    // ── .NET ──
+    if let Some(c) = scan_simple("nuget", nuget_cache_path(), "safe") {
         out.push(c);
     }
 
@@ -533,6 +596,32 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         }
         "composer" => 0,
 
+        "conda" if utils::which("conda") => {
+            let before = conda_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            utils::run("conda", &["clean", "--all", "--yes"]);
+            let after = conda_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            before.saturating_sub(after)
+        }
+        "conda" => 0,
+
+        // ── C/C++ ──
+        "ccache" if utils::which("ccache") => {
+            let before = ccache_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            utils::run("ccache", &["-C"]);
+            let after = ccache_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            before.saturating_sub(after)
+        }
+        "ccache" => 0,
+
+        // ── .NET ──
+        "nuget" if utils::which("dotnet") => {
+            let before = nuget_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            utils::run("dotnet", &["nuget", "locals", "all", "--clear"]);
+            let after = nuget_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            before.saturating_sub(after)
+        }
+        "nuget" => 0,
+
         // ── JVM ──
         "gradle" => {
             // ONLY the `caches/` subtree of `~/.gradle`. NEVER `wrapper/`.
@@ -758,6 +847,56 @@ mod tests {
             let s = p.to_string_lossy().to_string();
             assert!(s.ends_with("_cacache"));
             assert!(!s.contains("node_modules"));
+        }
+    }
+
+    /// conda must use the official `conda clean` command (which only removes
+    /// tarballs/index/unused pkgs), and its path must point at the package
+    /// cache, never at `envs/` where real environments live.
+    #[test]
+    fn test_conda_path_is_pkgs_not_envs() {
+        if let Some(p) = conda_cache_path() {
+            let s = p.to_string_lossy().to_string();
+            assert!(!s.contains("/envs/"), "conda must never target envs/: {s}");
+        }
+    }
+
+    /// The hand-rolled `pkgs_dirs` parser must read the first array entry, and
+    /// must return `None` (so the caller falls back) for an empty array or a
+    /// missing key — never the quote of the following JSON key.
+    #[test]
+    fn test_parse_conda_pkgs_dir() {
+        let json = r#"{"pkgs_dirs": ["/home/u/.conda/pkgs", "/opt/conda/pkgs"], "envs_dirs": ["/home/u/.conda/envs"]}"#;
+        assert_eq!(
+            parse_conda_pkgs_dir(json).as_deref(),
+            Some("/home/u/.conda/pkgs")
+        );
+
+        // Empty array must NOT leak into envs_dirs' value.
+        let empty = r#"{"pkgs_dirs": [], "envs_dirs": ["/home/u/.conda/envs"]}"#;
+        assert_eq!(parse_conda_pkgs_dir(empty), None);
+
+        // Missing key.
+        assert_eq!(parse_conda_pkgs_dir(r#"{"envs_dirs": []}"#), None);
+    }
+
+    /// ccache is a pure compiler cache — fully safe to wipe. Just guard that
+    /// the resolved path is the ccache dir and not something unrelated.
+    #[test]
+    fn test_ccache_path_shape() {
+        if let Some(p) = ccache_dir_path() {
+            let s = p.to_string_lossy().to_string();
+            assert!(s.contains("ccache"), "ccache path must mention ccache: {s}");
+        }
+    }
+
+    /// NuGet's global packages cache is safe to clear (restored on next build).
+    /// Guard the path shape.
+    #[test]
+    fn test_nuget_path_shape() {
+        if let Some(p) = nuget_cache_path() {
+            let s = p.to_string_lossy().to_string();
+            assert!(s.ends_with(".nuget/packages"), "unexpected nuget path: {s}");
         }
     }
 }

@@ -80,10 +80,11 @@ $ oxiclean -A -y
 
 **Dev tool caches** (opt-in with `--dev`, not part of `--all`):
 - Node ecosystem: npm, yarn (classic + berry), pnpm, bun, deno
-- Python: pip, uv, pipenv, poetry (cache only — your virtualenvs stay)
+- Python: pip, uv, pipenv, poetry (cache only — your virtualenvs stay), conda (`conda clean`, never your envs)
 - Rust: cargo registry + git checkouts (your installed binaries in `~/.cargo/bin` are never touched)
 - Go modules (needs `--deep` since it re-downloads)
 - Ruby gems (old versions), PHP composer, Gradle caches, Maven
+- C/C++: ccache, and .NET: NuGet global packages
 
 It handles **50+ distributions** across 10 package manager families. If you're on something obscure it doesn't know, it'll still clean the universal stuff (cache, trash, journal, Flatpak, Snap) without complaining.
 
