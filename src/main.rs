@@ -46,23 +46,27 @@ impl SystemInfo {
 }
 
 /// ⚡ OxiClean — Fast Cross-Distribution Linux System Cleaner
-///
-/// A comprehensive system cleanup tool that works across all major
-/// Linux distributions. Detects your distro automatically and runs
-/// the appropriate cleanup commands.
-///
-/// EXAMPLES:
-///   oxiclean --all                  Clean everything (with prompts)
-///   oxiclean --all --yes            Clean everything (no prompts)
-///   oxiclean --all --yes --deep     Aggressive clean (no prompts)
-///   oxiclean --cache --trash        Only clean cache & trash
-///   oxiclean --all --dry-run        Preview what would be cleaned
-///   oxiclean --packages --orphans   Clean pkg cache & orphans only
-///   oxiclean --dev                  Clean dev-tool caches (npm, cargo, ...)
-///   oxiclean --all --dev --dry-run  Preview everything including dev caches
-///   oxiclean --generate-completion bash > ~/.local/share/bash-completion/completions/oxiclean
 #[derive(Parser)]
-#[command(name = "oxiclean", version, about)]
+#[command(
+    name = "oxiclean",
+    version,
+    about = "Fast cross-distribution Linux system cleaner",
+    long_about = "⚡ OxiClean — Fast Cross-Distribution Linux System Cleaner\n\n\
+        A comprehensive system cleanup tool that works across all major Linux\n\
+        distributions. Detects your distro automatically and runs the\n\
+        appropriate cleanup commands.\n\
+        \n\
+        EXAMPLES:\n  \
+        oxiclean --all                  Clean everything (with prompts)\n  \
+        oxiclean --all --yes            Clean everything (no prompts)\n  \
+        oxiclean --all --yes --deep     Aggressive clean (no prompts)\n  \
+        oxiclean --cache --trash        Only clean cache & trash\n  \
+        oxiclean --all --dry-run        Preview what would be cleaned\n  \
+        oxiclean --packages --orphans   Clean pkg cache & orphans only\n  \
+        oxiclean --dev                  Clean dev-tool caches (npm, cargo, ...)\n  \
+        oxiclean --all --dev --dry-run  Preview everything including dev caches\n  \
+        oxiclean --generate-completion bash > ~/.local/share/bash-completion/completions/oxiclean"
+)]
 struct Cli {
     /// Clean user cache (~/.cache)
     #[arg(short = 'c', long)]

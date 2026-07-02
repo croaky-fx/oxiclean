@@ -90,6 +90,14 @@ It handles **50+ distributions** across 10 package manager families. If you're o
 
 ## Installation
 
+**Quick install (prebuilt binary):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/croaky-fx/oxiclean/main/install.sh | sh
+```
+Detects your CPU and libc (glibc/musl), downloads the latest release to a temp
+dir, verifies it, and installs to `/usr/local/bin` (asks for sudo only for that
+final step). Force a libc with `OXICLEAN_LIBC=musl` if auto-detection is wrong.
+
 **Arch (AUR):**
 ```bash
 paru -S oxiclean
@@ -101,7 +109,7 @@ paru -S oxiclean
 git clone https://github.com/croaky-fx/oxiclean.git
 cd oxiclean
 cargo build --release
-sudo cp target/release/oxiclean /usr/local/bin/
+sudo install -Dm755 target/release/oxiclean /usr/local/bin/oxiclean
 ```
 
 **Cargo:**
@@ -109,14 +117,14 @@ sudo cp target/release/oxiclean /usr/local/bin/
 cargo install --git https://github.com/croaky-fx/oxiclean.git
 ```
 
-**Pre-built binary:**
+**Manual (prebuilt binary):**
 ```bash
 curl -LO https://github.com/croaky-fx/oxiclean/releases/latest/download/oxiclean-x86_64-linux-gnu
 chmod +x oxiclean-x86_64-linux-gnu
-sudo mv oxiclean-x86_64-linux-gnu /usr/local/bin/oxiclean
+sudo install -Dm755 oxiclean-x86_64-linux-gnu /usr/local/bin/oxiclean
 ```
 
-Requires: Rust 1.70+, Linux, sudo or doas.
+Requires: Linux, and sudo or doas. Building from source needs Rust 1.70+.
 
 ---
 
@@ -195,23 +203,23 @@ explicit choice.
 
 ```
 Options:
-  -c, --cache       Clean user cache (~/.cache)
-  -p, --packages    Clean package manager cache
-  -o, --orphans     Remove orphaned packages
-  -a, --aur         Clean AUR helper cache (Arch-based only)
-  -f, --flatpak     Clean Flatpak unused runtimes & cache
-  -s, --snap        Clean Snap disabled revisions & cache
-  -j, --journal     Vacuum systemd journal logs
-  -t, --trash       Empty trash
-  -D, --dev         Clean dev-tool caches (npm, cargo, pip, etc.)
-  -A, --all         Run all system cleanup operations (not --dev)
-  -d, --deep                        Enable aggressive/deep cleaning mode
-  -y, --yes                         Skip all confirmation prompts
-  -n, --dry-run                     Preview actions without making changes
-  -q, --quiet                       Reduce output noise (good for cron / CI)
-      --generate-completion <SHELL> Print shell completion script and exit
-  -h, --help                        Print help
-  -V, --version                     Print version
+  -c, --cache                        Clean user cache (~/.cache)
+  -p, --packages                     Clean package manager cache
+  -o, --orphans                      Remove orphaned packages
+  -a, --aur                          Clean AUR helper cache (Arch-based only)
+  -f, --flatpak                      Clean Flatpak unused runtimes & cache
+  -s, --snap                         Clean Snap disabled revisions & cache
+  -j, --journal                      Vacuum systemd journal logs
+  -t, --trash                        Empty trash
+  -D, --dev                          Clean dev-tool caches (npm, cargo, pip, ...)
+  -A, --all                          Run all cleanup operations (not --dev)
+  -d, --deep                         Enable aggressive/deep cleaning mode
+  -y, --yes                          Skip all confirmation prompts
+  -n, --dry-run                      Preview actions without making changes
+  -q, --quiet                        Reduce output noise (good for cron / CI)
+      --generate-completion <SHELL>  Print shell completion script and exit
+  -h, --help                         Print help (see more with '--help')
+  -V, --version                      Print version
 ```
 
 ### Shell completions

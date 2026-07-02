@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.4.1] - 2026-07-02
+
+### Added
+- `install.sh` — a prebuilt-binary installer you can pipe from curl. It detects
+  your CPU arch and libc (glibc vs musl, via the musl loader file with an `ldd`
+  fallback), downloads the latest release to a temp dir, verifies it's a real
+  ELF binary and runs `--version` before touching anything, then installs to
+  `/usr/local/bin` — asking for sudo/doas only for that final step, not for the
+  whole script. Override detection with `OXICLEAN_LIBC=musl|gnu`.
+
+### Fixed
+- `--help` no longer prints the EXAMPLES block as one collapsed line. The long
+  help is now an explicit string with real line breaks, so each example sits on
+  its own line. (`-h` stays a concise summary.)
+
+### Docs
+- README: new curl-based install method, fixed the misaligned "All flags"
+  block, and refreshed the `--help` line text.
+
 ## [1.4.0] - 2026-06-28
 
 ### Added
