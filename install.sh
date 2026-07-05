@@ -34,7 +34,8 @@ detect_arch() {
 	arch="$(uname -m)"
 	case "$arch" in
 	x86_64 | amd64) echo "x86_64" ;;
-	*) die "unsupported architecture: $arch (only x86_64 has prebuilt binaries — build from source instead)" ;;
+	aarch64 | arm64) echo "aarch64" ;;
+	*) die "unsupported architecture: $arch (prebuilt binaries are x86_64 and aarch64 only — build from source with: cargo install --git https://github.com/${REPO})" ;;
 	esac
 }
 
