@@ -10,6 +10,10 @@ url="https://github.com/croaky-fx/oxiclean"
 license=('MIT')
 depends=('gcc-libs')
 makedepends=('cargo' 'git')
+# ring (rustls' crypto backend) ships hand-written assembly that a makepkg
+# build with LTO enabled compiles with -flto; ld.lld then can't resolve its
+# symbols. Disable LTO for this package so the release binary links.
+options=(!lto)
 source=("$pkgname::git+$url#tag=v$pkgver")
 sha256sums=('SKIP')
 
