@@ -1,6 +1,7 @@
 mod clean;
 mod detect;
 mod dev;
+mod update;
 mod utils;
 
 use clap::{CommandFactory, Parser};
@@ -132,6 +133,11 @@ struct Cli {
     /// Supported values come from clap_complete (bash, zsh, fish, elvish, powershell).
     #[arg(long = "generate-completion", value_name = "SHELL")]
     generate_completion: Option<Shell>,
+
+    /// Update oxiclean to the latest GitHub release (prebuilt-binary installs
+    /// only; package-manager installs are told to use their package manager).
+    #[arg(short = 'u', long)]
+    update: bool,
 }
 
 fn main() {
@@ -147,6 +153,11 @@ fn main() {
     // Register --quiet BEFORE anything that might print (including the
     // banner and detection output).
     utils::set_quiet(cli.quiet);
+
+    // Self-update is a standalone mode — it ignores the cleanup flags.
+    if cli.update {
+        std::process::exit(update::run(cli.yes));
+    }
 
     let do_cache = cli.all || cli.cache;
     let do_packages = cli.all || cli.packages;

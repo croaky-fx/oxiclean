@@ -1,6 +1,6 @@
 [package]
 name = "oxiclean"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 description = "Fast cross-distribution Linux system cleaner"
 authors = ["croaky-fx <217624563+croaky-fx@users.noreply.github.com>"]
@@ -10,9 +10,12 @@ license = "MIT"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "=4.5.20"
 colored = "2"
+ureq = { version = "3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = true
 strip = true
 codegen-units = 1
+panic = "abort"

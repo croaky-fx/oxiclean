@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.4.2] - 2026-07-05
+
+### Added
+- **`--update` / `-u` — built-in self-update.** Checks GitHub for a newer
+  release, prints the release notes, and (after you confirm, or with `-y` for
+  cron) downloads the matching prebuilt binary for your CPU and libc, verifies
+  it's a real ELF that reports the expected version, and swaps it in atomically
+  (ETXTBSY-safe: copy to a sibling temp file, then `rename` over the target).
+  - **Refuses to touch package-manager installs.** If pacman/dpkg owns the
+    binary, self-updating would corrupt their database — so it prints the right
+    command instead (`paru -Syu oxiclean`, `apt install --only-upgrade`, …).
+  - **Networking is built in** (`ureq` + `rustls`), so no external `curl`/`wget`
+    is needed. The musl build stays fully static.
+  - Unsupported architectures are told to build from source.
+- **ARM64 prebuilt binaries.** The release workflow now also builds
+  `aarch64-linux-gnu` and `aarch64-linux-musl` (via a cross toolchain).
+
+### Changed
+- The binary is now ~2 MB (was ~1 MB) — the cost of a bundled TLS stack for
+  dependency-free self-update. Release profile switched to `opt-level = "z"`
+  and `panic = "abort"` to claw back what it can.
+- Release notes are no longer auto-generated from PRs by the workflow (they were
+  consistently wrong); they're written per release instead.
+
 ## [1.4.1] - 2026-07-02
 
 ### Added

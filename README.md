@@ -128,6 +128,30 @@ Requires: Linux, and sudo or doas. Building from source needs Rust 1.70+.
 
 ---
 
+## Updating
+
+If you installed the prebuilt binary (via `install.sh` or by hand), update in
+place:
+
+```bash
+oxiclean --update
+```
+
+It checks GitHub for a newer release, shows the release notes, and — after you
+confirm — downloads the right binary for your CPU and libc, verifies it, and
+swaps it in atomically. Use `oxiclean --update -y` to skip the prompt (handy in
+a cron job). Networking is built in (via `ureq` + `rustls`), so no `curl` or
+`wget` is required.
+
+If oxiclean was installed by a **package manager** (AUR, apt, …), `--update`
+won't touch it — self-updating a managed binary would corrupt the package
+database. It tells you the right command instead (e.g. `paru -Syu oxiclean`).
+
+Unsupported CPU architectures (anything other than x86_64 / aarch64) are asked
+to build from source rather than downloading a binary that doesn't exist.
+
+---
+
 ## Usage
 
 I'd recommend running with `--dry-run` first, at least the first time:
@@ -217,6 +241,7 @@ Options:
   -y, --yes                          Skip all confirmation prompts
   -n, --dry-run                      Preview actions without making changes
   -q, --quiet                        Reduce output noise (good for cron / CI)
+  -u, --update                       Update to the latest GitHub release
       --generate-completion <SHELL>  Print shell completion script and exit
   -h, --help                         Print help (see more with '--help')
   -V, --version                      Print version
@@ -296,7 +321,11 @@ It reads `/etc/os-release` to figure out your distro, then checks `$PATH` for wh
 
 Freed space is measured by checking directory sizes before and after — not estimated. The one exception is orphan removal, since those files are scattered across the system.
 
-The binary itself stays small and has no runtime dependencies. It uses `clap` for CLI parsing, `colored` for terminal colors, and `clap_complete` only to print shell completion scripts when you ask for them.
+The binary is a single self-contained file (~2 MB). It uses `clap` for CLI
+parsing, `colored` for terminal colors, `clap_complete` for shell completions,
+and `ureq` + `rustls` for the built-in `--update` command — the TLS stack is
+what takes most of the size, but it means self-update needs no external `curl`
+or `wget`. The `musl` build has no runtime dependencies at all (fully static).
 
 ---
 
@@ -306,6 +335,7 @@ The binary itself stays small and has no runtime dependencies. It uses `clap` fo
 oxiclean/
 ├── Cargo.toml
 ├── PKGBUILD
+├── install.sh      # Prebuilt-binary installer (curl | sh)
 ├── tests/
 │   └── cli_test.rs
 └── src/
@@ -313,6 +343,7 @@ oxiclean/
     ├── detect.rs   # Distro detection, privilege/disk detection
     ├── clean.rs    # System cleaning operations
     ├── dev.rs      # Dev-tool cache cleanup (npm, cargo, pip, ...)
+    ├── update.rs   # Self-update (--update): GitHub check, verify, swap
     └── utils.rs    # Command execution, file ops, helpers
 ```
 
@@ -327,7 +358,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 59 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards that make sure the dev cleaner never accidentally targets `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`. Those are the ones that would actually ruin someone's day.
+There are 68 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`, and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
 
 ---
 
