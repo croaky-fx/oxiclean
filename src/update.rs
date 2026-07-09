@@ -135,6 +135,16 @@ fn query_owner(tool: &str, args: &[&str], exe: &Path) -> Ownership {
 /// failed — return the command the user should run instead. `None` means every
 /// package manager present cleanly disowned the binary, so self-update is safe.
 fn managed_by(exe: &Path) -> Option<String> {
+    // Each probe's ownership tool exits 0 when it owns the path and 1 when it
+    // cleanly doesn't — the exact contract `query_owner` relies on. We include
+    // pacman, dpkg, and rpm because those are the ecosystems oxiclean is (or
+    // could realistically be) packaged for. apk and xbps are deliberately
+    // *excluded*: their "not owned" exit codes aren't reliably 1 (so a clean
+    // miss could be misread as Errored and needlessly block a legitimate
+    // self-update), `xbps-query -o` is a pattern/regex search rather than an
+    // exact-path lookup, and there is no oxiclean package for either distro to
+    // guard against. Add them only once a real package exists and their exit
+    // semantics are verified.
     let probes: &[(&str, &[&str], &str)] = &[
         (
             "pacman",
@@ -146,6 +156,7 @@ fn managed_by(exe: &Path) -> Option<String> {
             &["-S"],
             "sudo apt update && sudo apt install --only-upgrade oxiclean",
         ),
+        ("rpm", &["-qf"], "sudo dnf upgrade oxiclean"),
     ];
     for (tool, args, cmd) in probes {
         match query_owner(tool, args, exe) {

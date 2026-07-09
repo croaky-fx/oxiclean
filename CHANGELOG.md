@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.5.0] - 2026-07-08
+
+### Fixed
+- **`--cache` no longer destroys expensive caches.** Wiping `~/.cache` wholesale
+  also deleted HuggingFace/torch model weights — multi-gigabyte downloads a user
+  grabbed on purpose — plus dev-tool caches (`uv`, `pip`, `pipenv`, `pypoetry`,
+  `deno`, `ccache`, `yarn`) that `--dev` already manages with the correct
+  per-tool commands. `--cache`/`--all` now **skip** these (in every mode,
+  including `--deep`) and say so: `⊘ Protected (clean with --dev): …`. They stay
+  removable via `--dev`. Honours `XDG_CACHE_HOME`, and `HF_HOME`/`HF_HUB_CACHE`
+  when the model cache is relocated inside the cache dir.
+- **Self-update guards rpm installs too.** `managed_by()` now also probes
+  `rpm -qf`, so a self-update refuses to overwrite an rpm-owned binary (which
+  would corrupt the rpm database), matching the existing pacman/dpkg guards.
+- **Clear message when no privilege tool exists.** With no root, `sudo`, or
+  `doas`, system-level cleanup now explains what to install instead of failing
+  with a generic "couldn't acquire privileges" after a silent `sudo` fallback.
+  User-level operations (`--cache`, `--trash`, `--dev`) still run.
+
+### Added
+- **Immutable / atomic system support.**
+  - **Fedora Atomic** (Silverblue, Kinoite, Bazzite): detected via
+    `/run/ostree-booted`; package cleanup uses `rpm-ostree cleanup -bm` (base
+    deployments + cached metadata only — never the destructive `-p`/`-r` that
+    touch bootable deployments).
+  - **Image-based read-only systems** (SteamOS, openSUSE MicroOS, …): detected
+    by a read-only `/usr`; package-cache cleanup is skipped with a clear note,
+    since those systems reclaim OS space through atomic image swaps. User-level
+    cleanup still runs.
+- **`--trim` / `-T` — SSD/NVMe TRIM (`fstrim`).** Filesystem maintenance, so it
+  is **not** part of `--all`. Trims only fstab-listed mounts (removable/USB
+  drives are skipped by construction) and is a safe no-op on HDDs.
+
 ## [1.4.2] - 2026-07-05
 
 ### Added

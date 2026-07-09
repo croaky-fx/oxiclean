@@ -231,34 +231,69 @@ pub fn nix_is_multiuser() -> bool {
 }
 
 // ══════════════════════════════════════════════════
+//  Immutable / atomic system detection
+// ══════════════════════════════════════════════════
+
+/// True on an OSTree-based atomic system (Fedora Silverblue, Kinoite, Bazzite,
+/// and other rpm-ostree variants). The kernel/initramfs drops `/run/ostree-booted`
+/// only when booted into an OSTree deployment, so it's the unambiguous marker —
+/// same spirit as the `/nix/store` check for Nix. These systems report as their
+/// base distro (Fedora) by ID, but their storage is reclaimed with
+/// `rpm-ostree cleanup`, not `dnf clean`.
+pub fn is_ostree() -> bool {
+    std::path::Path::new("/run/ostree-booted").exists()
+}
+
+/// True when the root filesystem is mounted read-only — the hallmark of an
+/// image-based immutable system (SteamOS, openSUSE MicroOS, …). We check `/usr`
+/// specifically because that's the tree these systems lock down; on a normal
+/// system `/usr` has no separate mount and this resolves to `/` (read-write).
+/// Returns false if `/proc/mounts` can't be read, so a normal system is never
+/// mistaken for an immutable one.
+pub fn is_readonly_rootfs() -> bool {
+    match fs::read_to_string("/proc/mounts") {
+        Ok(m) => path_is_readonly_in(&m, "/usr").unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+// ══════════════════════════════════════════════════
 //  Privilege Escalation
 // ══════════════════════════════════════════════════
 
 /// Available privilege-escalation helpers. `Root` means we are already uid 0
-/// and no escalation is needed.
+/// and no escalation is needed. `None` means the system has *no* escalation
+/// tool at all (no sudo, no doas, and we aren't root) — callers must surface a
+/// clear "install sudo or doas" message rather than trying and failing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Privilege {
     Doas,
     Sudo,
     Root,
+    None,
 }
 
 impl Privilege {
-    /// Binary name used to invoke this helper. `Root` returns an empty string
-    /// because the command runs directly with no wrapper.
+    /// Binary name used to invoke this helper. `Root` and `None` return an
+    /// empty string — `Root` runs the command directly with no wrapper, and
+    /// `None` has no wrapper to run at all.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Doas => "doas",
             Self::Sudo => "sudo",
             Self::Root => "",
+            Self::None => "",
         }
     }
 }
 
 /// Pick the best available privilege-escalation method.
-/// Order: already-root → doas → sudo.
+/// Order: already-root → doas → sudo → none.
 /// `doas` is preferred over `sudo` because on minimal systems (Alpine, Void)
-/// it is often the only one installed.
+/// it is often the only one installed. `None` is returned when the system has
+/// no escalation tool — we deliberately do NOT std::process::exit here so that
+/// --dry-run and user-only operations (cache, trash, dev) still work without
+/// privileges; the caller decides how to handle the missing helper.
 pub fn find_privilege() -> Privilege {
     if crate::utils::is_root() {
         return Privilege::Root;
@@ -269,10 +304,7 @@ pub fn find_privilege() -> Privilege {
     if crate::utils::which("sudo") {
         return Privilege::Sudo;
     }
-    // Fall back to sudo — callers will see the failure when they try to use it.
-    // We deliberately do NOT std::process::exit here so that --dry-run and
-    // user-only operations (cache, trash) still work without privileges.
-    Privilege::Sudo
+    Privilege::None
 }
 
 // ══════════════════════════════════════════════════
@@ -344,6 +376,37 @@ pub fn find_mount_device_in(mounts: &str, mount_point: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Pure helper: given `/proc/mounts` content and a path, decide whether the
+/// filesystem backing that path is mounted read-only.
+///
+/// Uses longest-prefix matching so `/usr` resolves to its own mount if one
+/// exists, otherwise to `/`. The `ro`/`rw` flag is the *first* comma-separated
+/// mount option (field 4) — we match it as an exact token so `errors=remount-ro`
+/// or `relatime` are never mistaken for a read-only flag. Returns `None` when no
+/// mount covers the path (caller decides the default).
+pub fn path_is_readonly_in(mounts: &str, path: &str) -> Option<bool> {
+    let mut best_len = 0usize;
+    let mut best_ro: Option<bool> = None;
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let mount_point = parts[1];
+        let covers = mount_point == "/"
+            || mount_point == path
+            || path.starts_with(&format!("{mount_point}/"));
+        // Keep the longest (most specific) mount that covers the path; on a
+        // length tie the later line wins, matching kernel overmount semantics.
+        if !covers || mount_point.len() < best_len {
+            continue;
+        }
+        best_len = mount_point.len();
+        best_ro = Some(parts[3].split(',').any(|opt| opt == "ro"));
+    }
+    best_ro
 }
 
 /// Detect the type of the disk that hosts `/home` (falling back to `/`).
@@ -436,6 +499,9 @@ mod tests {
         // Root means "no escalation wrapper" — name() must return an empty string
         // so that callers never accidentally exec a binary called "".
         assert_eq!(Privilege::Root.name(), "");
+        // None means "no escalation tool exists" — also an empty name so it is
+        // never spawned; callers gate on the variant, not the name.
+        assert_eq!(Privilege::None.name(), "");
     }
 
     #[test]
@@ -445,6 +511,7 @@ mod tests {
         assert_eq!(p, Privilege::Doas);
         assert_ne!(p, Privilege::Sudo);
         assert_ne!(p, Privilege::Root);
+        assert_ne!(p, Privilege::None);
     }
 
     #[test]
@@ -542,5 +609,62 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
         let mounts = "/dev/sda1 / ext4 rw 0 0\n";
         assert_eq!(find_mount_device_in(mounts, "/home"), None);
         assert_eq!(find_mount_device_in("", "/"), None);
+    }
+
+    // ── path_is_readonly_in: immutable-system detection (pure) ──
+
+    #[test]
+    fn test_readonly_normal_system_is_rw() {
+        // Ordinary system: root is rw, /usr has no separate mount → resolves to /.
+        let mounts = "\
+/dev/sda2 / ext4 rw,relatime 0 0
+/dev/sda3 /home ext4 rw,relatime 0 0
+";
+        assert_eq!(path_is_readonly_in(mounts, "/usr"), Some(false));
+    }
+
+    #[test]
+    fn test_readonly_dedicated_usr_mount_wins() {
+        // Immutable-style layout: /usr is its own read-only mount. Longest-prefix
+        // match must pick /usr (ro), not the rw root.
+        let mounts = "\
+/dev/sda2 / ext4 rw,relatime 0 0
+/dev/sda4 /usr ext4 ro,relatime 0 0
+";
+        assert_eq!(path_is_readonly_in(mounts, "/usr"), Some(true));
+    }
+
+    #[test]
+    fn test_readonly_root_ro_propagates() {
+        // SteamOS-style: the whole rootfs is ro and /usr has no separate mount.
+        let mounts = "/dev/sda2 / btrfs ro,relatime 0 0\n";
+        assert_eq!(path_is_readonly_in(mounts, "/usr"), Some(true));
+    }
+
+    #[test]
+    fn test_readonly_ro_token_is_exact() {
+        // `errors=remount-ro` and `relatime` must NOT be read as a read-only
+        // flag — only the standalone `ro` token counts.
+        let mounts = "/dev/sda2 / ext4 rw,errors=remount-ro,relatime 0 0\n";
+        assert_eq!(path_is_readonly_in(mounts, "/usr"), Some(false));
+    }
+
+    #[test]
+    fn test_readonly_no_covering_mount_is_none() {
+        // Nothing covers the path (no root, no /usr) → None, so the live
+        // detector defaults to "not read-only" and never false-positives.
+        let mounts = "proc /proc proc rw 0 0\n";
+        assert_eq!(path_is_readonly_in(mounts, "/usr"), None);
+        assert_eq!(path_is_readonly_in("", "/usr"), None);
+    }
+
+    #[test]
+    fn test_readonly_no_false_prefix_match() {
+        // A mount at /usrlocal must not be treated as covering /usr.
+        let mounts = "\
+/dev/sda2 / ext4 rw 0 0
+/dev/sda5 /usrlocal ext4 ro 0 0
+";
+        assert_eq!(path_is_readonly_in(mounts, "/usr"), Some(false));
     }
 }

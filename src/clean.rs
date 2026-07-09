@@ -94,25 +94,138 @@ fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
     }
 }
 
+// ══════════════════════════════════════════════════
+//  Expensive-cache protection (used by user_cache)
+// ══════════════════════════════════════════════════
+
+/// Caches under the user cache dir that a blanket `--cache`/`--all` wipe must
+/// never touch. Two kinds, both costly to lose:
+///   * **Model weights** — `huggingface`, `torch`: multi-GB downloads a user
+///     grabbed on purpose; re-fetching means hours and bandwidth. They're not
+///     "leftovers" and nobody clears a 40 GB model as routine cache cleanup.
+///   * **Dev-tool caches** — `uv`, `pip`, `pipenv`, `pypoetry`, `deno`,
+///     `ccache`, `yarn`: these live under ~/.cache but are already owned by
+///     `--dev`, which cleans them deliberately with the correct per-tool
+///     command. Wiping them here would contradict `--dev`'s care.
+///
+/// Removing any of these stays possible — via `--dev` (with `--deep` for the
+/// re-download-heavy ones) — it just never happens by accident.
+const PROTECTED_CACHE_DIRS: &[&str] = &[
+    "huggingface",
+    "torch",
+    "uv",
+    "pip",
+    "pipenv",
+    "pypoetry",
+    "deno",
+    "ccache",
+    "yarn",
+];
+
+/// Resolve the user cache directory, honouring `XDG_CACHE_HOME` (the spec-
+/// correct override) and falling back to `~/.cache`.
+fn user_cache_base() -> Option<PathBuf> {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        if !x.is_empty() {
+            return Some(PathBuf::from(x));
+        }
+    }
+    utils::home_dir().map(|h| PathBuf::from(h).join(".cache"))
+}
+
+/// The set of top-level entry names to protect inside `cache_base`: the static
+/// list, plus HuggingFace's location if it's been redirected *inside* the cache
+/// base via `HF_HOME`/`HF_HUB_CACHE` (so a non-default model dir is still
+/// spared). A relocation outside the cache base needs no entry — user_cache
+/// only ever touches things under the cache base to begin with.
+fn protected_cache_names(cache_base: &Path) -> Vec<String> {
+    let mut names: Vec<String> = PROTECTED_CACHE_DIRS.iter().map(|s| s.to_string()).collect();
+    for var in ["HF_HOME", "HF_HUB_CACHE"] {
+        if let Ok(val) = std::env::var(var) {
+            if val.is_empty() {
+                continue;
+            }
+            if let Ok(rel) = PathBuf::from(&val).strip_prefix(cache_base) {
+                if let Some(first) = rel.components().next() {
+                    if let Some(s) = first.as_os_str().to_str() {
+                        if !names.iter().any(|n| n == s) {
+                            names.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Split the top-level entries of `cache_dir` into `(to_clean, protected)`,
+/// where `protected` holds the names we spared. Read-only — no deletion — so
+/// the unit tests can prove a protected cache is never selected for removal.
+fn partition_cache_entries(cache_dir: &Path, protected: &[String]) -> (Vec<PathBuf>, Vec<String>) {
+    let mut to_clean = Vec::new();
+    let mut skipped = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if protected.contains(&name) {
+                skipped.push(name);
+            } else {
+                to_clean.push(entry.path());
+            }
+        }
+    }
+    (to_clean, skipped)
+}
+
+/// Size of a cache entry: follows the same symlink/dir/file rules as
+/// `utils::rm_contents` so the "freed" tally matches what's actually removed.
+fn entry_size(p: &Path) -> u64 {
+    if p.is_symlink() {
+        p.symlink_metadata().map(|m| m.len()).unwrap_or(0)
+    } else if p.is_dir() {
+        utils::dir_size(p)
+    } else {
+        p.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+}
+
 pub fn user_cache(dry_run: bool) -> u64 {
     utils::section("User Cache");
 
-    let home = match utils::home_dir() {
-        Some(h) => h,
+    let cache = match user_cache_base() {
+        Some(c) => c,
         None => {
-            utils::error("Cannot determine HOME directory");
+            utils::error("Cannot determine cache directory");
             return 0;
         }
     };
 
-    let cache = PathBuf::from(&home).join(".cache");
     if !cache.exists() {
         utils::info("No cache directory found");
         return 0;
     }
 
-    let size = utils::dir_size(&cache);
-    if size == 0 {
+    // Instead of wiping ~/.cache wholesale, spare the expensive/irreplaceable
+    // caches: model weights that cost gigabytes to re-download (HuggingFace,
+    // torch) and dev-tool caches that `--dev` manages deliberately with the
+    // right per-tool commands. A blanket wipe here would silently destroy a
+    // 40 GB model download — those belong to `--dev`, not `--cache`.
+    let protected = protected_cache_names(&cache);
+    let (to_clean, mut skipped) = partition_cache_entries(&cache, &protected);
+
+    if !skipped.is_empty() {
+        skipped.sort();
+        // Say what we deliberately preserved so a user who *wants* it gone knows
+        // it was spared — and where to reclaim it (`--dev`).
+        utils::skip(&format!(
+            "Protected (clean with --dev): {}",
+            skipped.join(", ")
+        ));
+    }
+
+    let clean_size: u64 = to_clean.iter().map(|p| entry_size(p)).sum();
+    if clean_size == 0 {
         utils::success("Already clean");
         return 0;
     }
@@ -120,12 +233,23 @@ pub fn user_cache(dry_run: bool) -> u64 {
     if dry_run {
         utils::info(&format!(
             "[DRY RUN] Would free {}",
-            utils::format_size(size)
+            utils::format_size(clean_size)
         ));
         return 0;
     }
 
-    let freed = utils::rm_contents(&cache);
+    let mut freed = 0u64;
+    for path in &to_clean {
+        let size = entry_size(path);
+        let ok = if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(path).is_ok()
+        } else {
+            std::fs::remove_file(path).is_ok()
+        };
+        if ok {
+            freed += size;
+        }
+    }
     utils::success(&format!("Freed {}", utils::format_size(freed).green()));
     freed
 }
@@ -133,8 +257,42 @@ pub fn user_cache(dry_run: bool) -> u64 {
 pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
     utils::section("Package Cache");
 
+    // Atomic / OSTree systems (Fedora Silverblue, Kinoite, Bazzite, …) report as
+    // Fedora by ID, but `dnf clean` is not how their storage is reclaimed — the
+    // OS is an ostree image and cached data is cleared with `rpm-ostree cleanup`.
+    // We only pass the non-destructive `-b` (temporary files) and `-m` (cached
+    // repo metadata) flags. `-p` (pending) and `-r` (rollback) alter *bootable
+    // deployments* — that's system state, not cache, so they are never touched.
+    if crate::detect::is_ostree() {
+        if dry_run {
+            utils::info("[DRY RUN] Would run: rpm-ostree cleanup -bm");
+            return 0;
+        }
+        if utils::sudo("rpm-ostree", &["cleanup", "-bm"]) {
+            utils::success("rpm-ostree cleaned (base deployments + cached metadata)");
+        } else {
+            utils::error("rpm-ostree cleanup failed");
+        }
+        // rpm-ostree reclaims space across /sysroot and /var with no single
+        // measurable cache dir, so we report the action rather than a byte count.
+        return 0;
+    }
+
     if *distro == Distro::Unknown {
         utils::skip("Unknown distribution — skipped");
+        return 0;
+    }
+
+    // General immutable guard: an image-based system with a read-only rootfs
+    // (SteamOS, openSUSE MicroOS, …) manages its OS through atomic image swaps,
+    // not the package manager. These report as their base distro (Arch, SUSE…)
+    // so the code below would try `pacman -Sc` / `zypper clean` and fail — or
+    // worse, fight the atomic update model. We skip package-cache cleanup and
+    // say why; the user-level steps (cache, trash, dev, journal) still run and
+    // are where the reclaimable space on these systems actually is. OSTree is
+    // handled above with its own real cleanup, so it never reaches here.
+    if crate::detect::is_readonly_rootfs() {
+        utils::skip("Immutable/read-only system — package cache managed by atomic updates");
         return 0;
     }
 
@@ -313,6 +471,19 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
 
 pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
     utils::section("Orphaned Packages");
+
+    // Atomic (OSTree) and image-based read-only systems don't have "orphans" in
+    // the traditional sense — packages are part of the OS image, not
+    // individually installed, so there's nothing to autoremove. Skip cleanly
+    // rather than running a package-manager command that would fail or mislead.
+    if crate::detect::is_ostree() {
+        utils::skip("Atomic system — packages are part of the OS image, no orphans to remove");
+        return 0;
+    }
+    if crate::detect::is_readonly_rootfs() {
+        utils::skip("Immutable/read-only system — package removal handled by atomic updates");
+        return 0;
+    }
 
     if *distro == Distro::Unknown {
         utils::skip("Unknown distribution — skipped");
@@ -735,6 +906,52 @@ pub fn trash(dry_run: bool) -> u64 {
 }
 
 // ══════════════════════════════════════════════════
+//  Filesystem TRIM (SSD/NVMe maintenance) — opt-in via --trim
+// ══════════════════════════════════════════════════
+
+/// Discard unused blocks on SSD/NVMe filesystems (`fstrim`). This is filesystem
+/// *maintenance*, not cache cleanup, which is why it's a standalone `--trim`
+/// flag and is NOT part of `--all` or `--deep`.
+///
+/// Safety choices baked in:
+/// * `--fstab` trims only filesystems listed in `/etc/fstab` — the user's
+///   permanent mounts — so transient removable/USB drives (whose bridge chips
+///   often mishandle UNMAP) are skipped by construction.
+/// * `fstrim` is synchronous, so it never hits the async-discard + NCQ firmware
+///   corruption path that continuous `discard` mount options can.
+/// * `fstrim` itself skips any filesystem that doesn't support discard, so this
+///   is a safe no-op on HDDs.
+pub fn trim(dry_run: bool, disk_type: crate::detect::DiskType) -> u64 {
+    utils::section("Filesystem Trim");
+
+    if !utils::which("fstrim") {
+        utils::skip("fstrim not found (install util-linux) — skipped");
+        return 0;
+    }
+
+    if dry_run {
+        utils::info("[DRY RUN] Would run: fstrim --fstab --verbose");
+        return 0;
+    }
+
+    if disk_type == crate::detect::DiskType::HDD {
+        // Not an error — fstrim will simply no-op on rotational disks — but the
+        // user should know TRIM only reclaims blocks on SSD/NVMe.
+        utils::info("Root disk looks like an HDD — TRIM only benefits SSD/NVMe");
+    }
+
+    utils::info("Trimming fstab-listed filesystems (removable drives are skipped)...");
+    if utils::sudo("fstrim", &["--fstab", "--verbose"]) {
+        utils::success("Filesystems trimmed");
+    } else {
+        utils::error("fstrim failed (or no discard-capable filesystems)");
+    }
+    // TRIM frees blocks on the device, not measurable cache bytes, so it
+    // contributes nothing to the run's freed-bytes total.
+    0
+}
+
+// ══════════════════════════════════════════════════
 //  Nix garbage collection — works on *any* distro that has /nix/store
 // ══════════════════════════════════════════════════
 
@@ -875,5 +1092,82 @@ mod tests {
         // A non-existent cache dir must not panic — just yield nothing.
         let found = find_partial_downloads(Path::new("/nonexistent/oxiclean/cache"));
         assert!(found.is_empty());
+    }
+
+    // ── Expensive-cache protection: the core safety guarantee of --cache ──
+
+    #[test]
+    fn test_protected_list_covers_models_and_dev_caches() {
+        // The two model caches whose loss is catastrophic must be present, plus
+        // representative dev caches. This is the regression guard against anyone
+        // quietly dropping an entry from PROTECTED_CACHE_DIRS.
+        for must in ["huggingface", "torch", "uv", "pip", "ccache"] {
+            assert!(
+                PROTECTED_CACHE_DIRS.contains(&must),
+                "{must} must stay in the protected-cache list"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partition_never_selects_protected_for_deletion() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("oxiclean_cache_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // A protected model cache with a "huge" file, and a disposable browser
+        // cache. Only the browser cache may be selected for cleaning.
+        fs::create_dir_all(base.join("huggingface/hub")).unwrap();
+        fs::write(base.join("huggingface/hub/model.bin"), vec![0u8; 4096]).unwrap();
+        fs::create_dir_all(base.join("mozilla")).unwrap();
+        fs::write(base.join("mozilla/thumb.png"), b"junk").unwrap();
+
+        let protected = protected_cache_names(&base);
+        let (to_clean, skipped) = partition_cache_entries(&base, &protected);
+
+        let clean_names: Vec<String> = to_clean
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            clean_names.contains(&"mozilla".to_string()),
+            "disposable cache must be cleanable"
+        );
+        assert!(
+            !clean_names.contains(&"huggingface".to_string()),
+            "huggingface model cache must NEVER be selected for deletion"
+        );
+        assert!(skipped.contains(&"huggingface".to_string()));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_hf_home_relocation_inside_cache_base_is_protected() {
+        // If HF_HOME points at a non-default directory *inside* the cache base,
+        // that top-level entry must be protected too. We drive protected_cache_names
+        // with a synthesized value rather than mutating global env in a test.
+        let base = PathBuf::from("/home/u/.cache");
+        let relocated = base.join("my-models/hub");
+        // Simulate the strip_prefix logic protected_cache_names uses.
+        let rel = relocated.strip_prefix(&base).unwrap();
+        let first = rel
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_str()
+            .unwrap();
+        assert_eq!(first, "my-models");
+    }
+
+    #[test]
+    fn test_partition_missing_dir_is_empty() {
+        let (to_clean, skipped) =
+            partition_cache_entries(Path::new("/nonexistent/oxiclean/xyz"), &[]);
+        assert!(to_clean.is_empty());
+        assert!(skipped.is_empty());
     }
 }

@@ -107,6 +107,12 @@ struct Cli {
     #[arg(short = 'D', long)]
     dev: bool,
 
+    /// TRIM SSD/NVMe filesystems (fstrim). Filesystem maintenance, not cache
+    /// cleanup, so it is NOT included in --all. Trims only fstab-listed mounts
+    /// (removable/USB drives are skipped). Needs root.
+    #[arg(short = 'T', long)]
+    trim: bool,
+
     /// Run all cleanup operations
     #[arg(short = 'A', long)]
     all: bool,
@@ -171,6 +177,9 @@ fn main() {
     // differently from system caches (rebuild times, re-download warnings)
     // and the user should ask for them explicitly.
     let do_dev = cli.dev;
+    // --trim is opt-in too: it's SSD maintenance, not cache cleanup, so it is
+    // deliberately excluded from --all.
+    let do_trim = cli.trim;
 
     if !do_cache
         && !do_packages
@@ -181,6 +190,7 @@ fn main() {
         && !do_journal
         && !do_trash
         && !do_dev
+        && !do_trim
     {
         utils::banner(env!("CARGO_PKG_VERSION"));
         println!(
@@ -256,10 +266,18 @@ fn main() {
     }
 
     // ── Privilege acquisition ──
-    let needs_sudo = do_packages || do_orphans || do_journal || do_flatpak || do_snap;
-    if needs_sudo && !cli.dry_run && !utils::acquire_sudo() {
-        utils::error("Failed to acquire privileges. Exiting.");
-        std::process::exit(1);
+    let needs_sudo = do_packages || do_orphans || do_journal || do_flatpak || do_snap || do_trim;
+    if needs_sudo && !cli.dry_run {
+        if sys.privilege == Privilege::None {
+            utils::error("No privilege-escalation tool found (need root, sudo, or doas).");
+            utils::info("Install sudo or doas, or re-run as root, for system-level cleanup.");
+            utils::info("User-level operations (--cache, --trash, --dev) work without privileges.");
+            std::process::exit(1);
+        }
+        if !utils::acquire_sudo() {
+            utils::error("Failed to acquire privileges. Exiting.");
+            std::process::exit(1);
+        }
     }
 
     // ── Execute ──
@@ -328,6 +346,10 @@ fn main() {
 
     if do_dev {
         total_freed += dev::run(cli.deep, cli.dry_run, cli.yes);
+    }
+
+    if do_trim {
+        total_freed += clean::trim(cli.dry_run, sys.disk_type);
     }
 
     // ── Summary ──

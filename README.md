@@ -68,7 +68,10 @@ $ oxiclean -A -y
 ## What it cleans
 
 **System stuff** (the default with `--all`):
-- `~/.cache` — the obvious stuff
+- `~/.cache` — the obvious stuff, but it **spares expensive caches**: HuggingFace/torch
+  model weights (multi-GB, and nobody clears a 40 GB model as routine cleanup) and
+  dev-tool caches that `--dev` owns. Those are skipped with a note and stay removable
+  via `--dev`.
 - Package manager cache (pacman, apt, dnf, zypper, xbps, apk, portage...)
 - Orphaned packages — things nothing depends on anymore
 - AUR helper cache (paru, yay, trizen, etc.)
@@ -236,7 +239,8 @@ Options:
   -j, --journal                      Vacuum systemd journal logs
   -t, --trash                        Empty trash
   -D, --dev                          Clean dev-tool caches (npm, cargo, pip, ...)
-  -A, --all                          Run all cleanup operations (not --dev)
+  -T, --trim                         TRIM SSD/NVMe filesystems (not in --all)
+  -A, --all                          Run all cleanup operations (not --dev/--trim)
   -d, --deep                         Enable aggressive/deep cleaning mode
   -y, --yes                          Skip all confirmation prompts
   -n, --dry-run                      Preview actions without making changes
@@ -282,6 +286,13 @@ Not glamorous, but it works fine and keeps the binary simple.
 | Gentoo, Funtoo, Calculate | `portage` | ✅ | ✅ |
 | Solus | `eopkg` | ✅ | ✅ |
 | Clear Linux | `swupd` | ✅ | ℹ️ |
+| Fedora Atomic (Silverblue, Kinoite, Bazzite) | `rpm-ostree` | ✅ | ℹ️ |
+| Immutable / read-only (SteamOS, MicroOS…) | atomic image | ➖ | ➖ |
+
+Atomic systems are handled specially: Fedora Atomic uses `rpm-ostree cleanup -bm`
+(safe base + metadata only). Other immutable systems with a read-only `/usr`
+skip package-cache cleanup entirely — their OS space is reclaimed by atomic
+image swaps, not the package manager — while user-level cleanup still runs.
 
 ---
 
@@ -358,7 +369,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 68 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`, and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
+There are 79 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
 
 ---
 

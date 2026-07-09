@@ -63,7 +63,9 @@ pub fn current_privilege() -> Privilege {
 }
 
 /// Run `cmd` with the requested privilege helper. `Privilege::Root` runs
-/// the command directly because we are already uid 0.
+/// the command directly because we are already uid 0. `Privilege::None` means
+/// no escalation tool exists — there is nothing to run, so we report failure
+/// without spawning anything (the caller should have already warned the user).
 pub fn elevate(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
     match privilege {
         Privilege::Root => run(cmd, args),
@@ -72,6 +74,7 @@ pub fn elevate(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
             a.extend_from_slice(args);
             run(privilege.name(), &a)
         }
+        Privilege::None => false,
     }
 }
 
@@ -84,6 +87,7 @@ pub fn acquire_privilege(privilege: Privilege) -> bool {
         Privilege::Root => true,
         Privilege::Sudo => run("sudo", &["-v"]),
         Privilege::Doas => run("doas", &["true"]),
+        Privilege::None => false,
     }
 }
 
@@ -418,6 +422,16 @@ mod tests {
     fn test_elevate_root_propagates_failure() {
         // `false` exits non-zero; elevate must surface that.
         assert!(!elevate(Privilege::Root, "false", &[]));
+    }
+
+    #[test]
+    fn test_elevate_none_never_spawns() {
+        // Privilege::None means no escalation tool exists. elevate must return
+        // false WITHOUT trying to run anything — even a command that would
+        // otherwise succeed (`true`) must not run, because there's no helper.
+        assert!(!elevate(Privilege::None, "true", &[]));
+        // acquire_privilege must likewise refuse rather than "succeed".
+        assert!(!acquire_privilege(Privilege::None));
     }
 
     #[test]
