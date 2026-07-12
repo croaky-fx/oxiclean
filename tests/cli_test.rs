@@ -134,3 +134,90 @@ fn test_quiet_hides_banner_and_info_lines() {
         stdout
     );
 }
+
+// ── v1.6.0: --json output ──
+
+#[test]
+fn test_json_output_is_valid_json() {
+    // The core contract of --json: stdout is a single, parseable JSON object
+    // and nothing else. Cache is user-level so this runs without root in CI.
+    let output = oxiclean()
+        .args(["--cache", "--json", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json output did not parse as JSON ({e}). stdout was:\n{stdout}")
+    });
+
+    // Shape checks: the keys automation would rely on must be present and typed.
+    assert!(parsed["version"].is_string(), "version must be a string");
+    assert!(
+        parsed["dry_run"].as_bool() == Some(true),
+        "dry_run must be true here"
+    );
+    assert!(
+        parsed["total_freed_bytes"].is_number(),
+        "total_freed_bytes must be numeric"
+    );
+    assert!(
+        parsed["operations"].is_object(),
+        "operations must be an object"
+    );
+    // We asked for --cache, so that operation must appear.
+    assert!(
+        parsed["operations"]["cache"].is_number(),
+        "cache op must be reported. got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_json_output_has_no_banner_or_color() {
+    // JSON mode must emit ONLY the object — no banner text, no ANSI escapes.
+    let output = oxiclean()
+        .args(["--cache", "--json", "--dry-run"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Oxi"),
+        "JSON mode must not print the banner. stdout was:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "JSON mode must not emit ANSI color codes. stdout was:\n{stdout}"
+    );
+    // Exactly one line of output.
+    assert_eq!(
+        stdout.trim().lines().count(),
+        1,
+        "JSON mode must print exactly one line. stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_skip_without_all_errors() {
+    // --skip only makes sense with --all; on its own it must fail loudly.
+    let output = oxiclean()
+        .args(["--cache", "--skip", "packages", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "--skip without --all should be a non-zero exit"
+    );
+}
+
+#[test]
+fn test_skip_unknown_name_errors() {
+    let output = oxiclean()
+        .args(["--all", "--skip", "notarealop", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an unknown --skip name should be a non-zero exit"
+    );
+}

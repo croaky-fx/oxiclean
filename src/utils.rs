@@ -40,6 +40,13 @@ static PRIVILEGE: OnceLock<Privilege> = OnceLock::new();
 /// user actually needs to see.
 static QUIET: OnceLock<bool> = OnceLock::new();
 
+/// JSON-mode flag set by `--json`. When true, ALL human-facing output helpers
+/// (banner, section, success, warning, error, info, skip) are silenced so the
+/// only thing on stdout is the final JSON object that `main()` prints. Also
+/// forces [`confirm`] to decline, so a stray prompt can never block a
+/// non-interactive run.
+static JSON: OnceLock<bool> = OnceLock::new();
+
 /// Record the detected privilege helper. Called once from `main()`.
 /// Subsequent calls are silently ignored — `OnceLock` semantics.
 pub fn set_privilege(p: Privilege) {
@@ -54,6 +61,26 @@ pub fn set_quiet(q: bool) {
 /// Returns true if `--quiet` was passed at startup.
 pub fn is_quiet() -> bool {
     *QUIET.get().unwrap_or(&false)
+}
+
+/// Enable JSON mode. Called once from `main()` when `--json` is passed.
+pub fn set_json(j: bool) {
+    let _ = JSON.set(j);
+    if j {
+        // A machine consumer wants plain text; strip ANSI colors everywhere.
+        colored::control::set_override(false);
+    }
+}
+
+/// Returns true if `--json` was passed at startup. In JSON mode every human
+/// output helper is silenced and prompts auto-decline.
+pub fn is_json() -> bool {
+    *JSON.get().unwrap_or(&false)
+}
+
+/// True when no human-facing chatter should be printed at all (JSON mode).
+fn silent() -> bool {
+    is_json()
 }
 
 /// Current privilege helper, or `Privilege::Sudo` if `main()` never set one
@@ -132,11 +159,13 @@ pub fn acquire_sudo() -> bool {
     if p == Privilege::Root {
         return true;
     }
-    println!();
-    println!(
-        "  {}",
-        format!("🔐 Requesting privileges ({})...", p.name()).yellow()
-    );
+    if !silent() {
+        println!();
+        println!(
+            "  {}",
+            format!("🔐 Requesting privileges ({})...", p.name()).yellow()
+        );
+    }
     acquire_privilege(p)
 }
 
@@ -226,8 +255,14 @@ pub fn home_dir() -> Option<String> {
     env::var("HOME").ok()
 }
 
-/// Ask user for yes/no confirmation
+/// Ask user for yes/no confirmation. In JSON mode there is no interactive
+/// terminal, so we decline by default rather than block on stdin — callers
+/// that must proceed non-interactively pass `--yes`, which short-circuits
+/// before reaching here.
 pub fn confirm(msg: &str) -> bool {
+    if silent() {
+        return false;
+    }
     print!("  {} {} ", "?".cyan().bold(), msg);
     io::stdout().flush().ok();
     let mut input = String::new();
@@ -240,9 +275,10 @@ pub fn confirm(msg: &str) -> bool {
 // ═══════════════════════════════════════════════════
 
 pub fn banner(version: &str) {
-    if is_quiet() {
+    if is_quiet() || silent() {
         // Quiet mode: skip the banner entirely. Most automated/scripted
-        // users want plain output they can pipe somewhere.
+        // users want plain output they can pipe somewhere. JSON mode: nothing
+        // but the final object may hit stdout.
         return;
     }
     println!();
@@ -266,34 +302,46 @@ pub fn banner(version: &str) {
 }
 
 pub fn section(title: &str) {
+    if silent() {
+        return;
+    }
     println!();
     println!("  {} {}", "━━▶".cyan().bold(), title.white().bold());
 }
 
 pub fn success(msg: &str) {
+    if silent() {
+        return;
+    }
     println!("    {} {}", "✔".green().bold(), msg);
 }
 
 pub fn warning(msg: &str) {
+    if silent() {
+        return;
+    }
     println!("    {} {}", "⚠".yellow().bold(), msg);
 }
 
 pub fn error(msg: &str) {
+    if silent() {
+        return;
+    }
     println!("    {} {}", "✘".red().bold(), msg);
 }
 
-/// Informational line. Suppressed by `--quiet` because these are the
-/// noisiest lines and the user can survive without them.
+/// Informational line. Suppressed by `--quiet` (noisiest lines) and by JSON
+/// mode. The user can survive without them.
 pub fn info(msg: &str) {
-    if is_quiet() {
+    if is_quiet() || silent() {
         return;
     }
     println!("    {} {}", "ℹ".blue(), msg);
 }
 
-/// "Skipped" line. Also suppressed by `--quiet`; nothing to act on.
+/// "Skipped" line. Suppressed by `--quiet` and JSON mode; nothing to act on.
 pub fn skip(msg: &str) {
-    if is_quiet() {
+    if is_quiet() || silent() {
         return;
     }
     println!("    {} {}", "⊘".dimmed(), msg.dimmed());

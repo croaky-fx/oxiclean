@@ -74,6 +74,109 @@ pub(crate) fn should_deep(deep: bool, yes: bool, prompt: &str) -> bool {
     utils::confirm(prompt)
 }
 
+// ══════════════════════════════════════════════════
+//  Gentoo build-tmp cleanup (used by pkg_cache Gentoo arm)
+// ══════════════════════════════════════════════════
+
+/// Parse `PORTAGE_TMPDIR` out of make.conf content. Portage builds under
+/// `$PORTAGE_TMPDIR/portage`, defaulting to `/var/tmp` when unset (so the build
+/// tree is `/var/tmp/portage`). Pure — no I/O — so the parsing is unit-tested.
+/// Returns the *tmpdir* value (not the `/portage` subdir); the caller appends
+/// `portage`. Later assignments win, matching shell/make semantics.
+fn parse_portage_tmpdir(make_conf: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in make_conf.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("PORTAGE_TMPDIR=") {
+            let val = rest.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                found = Some(val.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Resolve the portage build-tmp directory: `$PORTAGE_TMPDIR/portage`, honouring
+/// make.conf and falling back to the `/var/tmp` default. The returned path is
+/// *always* validated to end in `/portage` by the caller before any deletion.
+fn portage_build_dir() -> PathBuf {
+    let make_conf = std::fs::read_to_string("/etc/portage/make.conf").unwrap_or_default();
+    let base = parse_portage_tmpdir(&make_conf).unwrap_or_else(|| "/var/tmp".to_string());
+    PathBuf::from(base).join("portage")
+}
+
+/// Final safety gate before deleting anything under the portage build tree:
+/// the resolved path must be `<real-dir>/portage` — it must end in a `portage`
+/// component AND be nested at least one directory below root. A malformed
+/// `PORTAGE_TMPDIR` (empty, or `/`) would otherwise expand to `/portage`; we
+/// reject that so an aim at a bare top-level dir can never slip through.
+fn portage_dir_is_safe(dir: &Path) -> bool {
+    dir.file_name().map(|n| n == "portage").unwrap_or(false) && dir.components().count() >= 3
+}
+
+/// True when an `emerge` build is in progress. Deleting `/var/tmp/portage`
+/// mid-build corrupts the running compile, so this is a hard guard. Uses
+/// `pgrep -f emerge`: run without a shell, the only cmdlines containing
+/// "emerge" are real emerge processes (pgrep excludes its own PID). Fails
+/// *closed* — if we can't tell, we assume a build is running and skip.
+fn emerge_running() -> bool {
+    match std::process::Command::new("pgrep")
+        .args(["-f", "emerge"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(s) => s.success(), // exit 0 = at least one match
+        Err(_) => true,       // pgrep missing / failed → assume unsafe
+    }
+}
+
+/// Remove failed-build leftovers under the portage build tree. These are the
+/// half-unpacked/half-compiled remnants of interrupted or failed `emerge` runs
+/// — pure garbage that portage does not reuse. We only ever delete the
+/// *contents*, never the `portage` dir itself, and only after four guards pass:
+/// the dir exists, no emerge is running, the path resolves under a real
+/// tmpdir, and it ends in `/portage`.
+fn clean_portage_tmp(dry_run: bool) -> u64 {
+    let build_dir = portage_build_dir();
+
+    if !build_dir.exists() || !portage_dir_is_safe(&build_dir) {
+        return 0;
+    }
+    if emerge_running() {
+        utils::skip("emerge is running — leaving build tmp untouched");
+        return 0;
+    }
+
+    let size = utils::dir_size(&build_dir);
+    if size == 0 {
+        return 0;
+    }
+    if dry_run {
+        utils::info(&format!(
+            "[DRY RUN] Would clear failed-build leftovers in {} ({})",
+            build_dir.display(),
+            utils::format_size(size)
+        ));
+        return 0;
+    }
+
+    // The contents are root-owned (built via sudo emerge), so delete through
+    // sudo. `-mindepth 1` keeps the `portage` dir itself; `-delete` handles the
+    // nested trees. We report the pre-measured size as freed.
+    let target = build_dir.to_string_lossy().into_owned();
+    utils::sudo("find", &[&target, "-mindepth", "1", "-delete"]);
+    utils::success(&format!(
+        "Cleared portage build leftovers ({})",
+        utils::format_size(size).green()
+    ));
+    size
+}
+
 fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
     match distro {
         Distro::Arch => Some(PathBuf::from("/var/cache/pacman/pkg")),
@@ -278,11 +381,6 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         return 0;
     }
 
-    if *distro == Distro::Unknown {
-        utils::skip("Unknown distribution — skipped");
-        return 0;
-    }
-
     // General immutable guard: an image-based system with a read-only rootfs
     // (SteamOS, openSUSE MicroOS, …) manages its OS through atomic image swaps,
     // not the package manager. These report as their base distro (Arch, SUSE…)
@@ -290,9 +388,16 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
     // worse, fight the atomic update model. We skip package-cache cleanup and
     // say why; the user-level steps (cache, trash, dev, journal) still run and
     // are where the reclaimable space on these systems actually is. OSTree is
-    // handled above with its own real cleanup, so it never reaches here.
+    // handled above with its own real cleanup, so it never reaches here. This
+    // runs before the Unknown check (mirroring `orphans`) so an unrecognised
+    // *and* read-only system is still correctly treated as immutable.
     if crate::detect::is_readonly_rootfs() {
         utils::skip("Immutable/read-only system — package cache managed by atomic updates");
+        return 0;
+    }
+
+    if *distro == Distro::Unknown {
+        utils::skip("Unknown distribution — skipped");
         return 0;
     }
 
@@ -307,6 +412,10 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
 
     let cache_dir = pkg_cache_dir(distro);
     let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
+
+    // Bytes reclaimed outside the measured package-cache dir (e.g. Gentoo's
+    // build-tmp tree), added to the final total.
+    let mut extra_freed = 0u64;
 
     match distro {
         Distro::Arch => {
@@ -435,6 +544,11 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                     utils::success("Distfiles cleaned");
                 }
             }
+            // Also sweep failed-build leftovers under $PORTAGE_TMPDIR/portage —
+            // interrupted/failed emerges leave gigabytes of half-built trees
+            // there that portage never reuses. Guarded (no build running, path
+            // validated); measured separately from the distfiles cache.
+            extra_freed += clean_portage_tmp(dry_run);
         }
 
         Distro::Solus => {
@@ -446,12 +560,23 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Clear => {
-            let staged = PathBuf::from("/var/lib/swupd/staged");
-            if staged.exists() {
-                utils::sudo("rm", &["-rf", "/var/lib/swupd/staged"]);
-                utils::success("swupd staged files cleaned");
+            // swupd has its own cache-cleaning subcommand that understands the
+            // version/age heuristics for what's safe to drop. `swupd clean`
+            // removes staged files and stale metadata; `--all` (deep) also drops
+            // recent manifests. Prefer it over a raw `rm` of the staged dir so we
+            // don't fight swupd's own bookkeeping.
+            if utils::which("swupd") {
+                let mut args = vec!["clean"];
+                if deep {
+                    args.push("--all");
+                }
+                if utils::sudo("swupd", &args) {
+                    utils::success("swupd cache cleaned");
+                } else {
+                    utils::error("swupd clean failed");
+                }
             } else {
-                utils::info("No staged files to clean");
+                utils::skip("swupd not found — skipped");
             }
         }
 
@@ -459,7 +584,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
     }
 
     let size_after = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
-    let freed = size_before.saturating_sub(size_after);
+    let freed = size_before.saturating_sub(size_after) + extra_freed;
     if freed > 0 {
         utils::info(&format!(
             "Package cache freed: {}",
@@ -603,12 +728,13 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Alpine => {
-            if dry_run {
-                utils::info("[DRY RUN] Would check for orphans");
-                return 0;
-            }
-            utils::info("Alpine manages deps via world file");
-            utils::warning("Automatic orphan removal not supported on Alpine");
+            // apk has no separate "autoremove": it prunes now-unneeded
+            // dependencies automatically whenever a package is removed with
+            // `apk del`. There is nothing to collect after the fact, so the
+            // old "not supported" wording was misleading — say what's true.
+            utils::success(
+                "apk removes unused dependencies automatically on 'apk del' — nothing to clean",
+            );
         }
 
         Distro::Gentoo => {
@@ -906,6 +1032,120 @@ pub fn trash(dry_run: bool) -> u64 {
 }
 
 // ══════════════════════════════════════════════════
+//  Crash-dump cleanup (systemd-coredump + Apport)
+// ══════════════════════════════════════════════════
+
+/// Remove saved crash dumps. Two mechanisms are supported, each detected by the
+/// existence of its directory (same spirit as `is_ostree`/`has_nix`):
+///
+///   * **systemd-coredump** — `/var/lib/systemd/coredump/`. Dumps are large
+///     `.zst` blobs of a crashed process's memory. We remove the files directly
+///     with a privileged `find … -type f -delete`. (`coredumpctl` has no
+///     portable `delete` verb — it's absent on current systemd, e.g. v260 —
+///     so relying on it silently fails; direct file removal is the one method
+///     that works everywhere. The journal keeps brief metadata that shows as
+///     `COREFILE=missing` until the journal next rotates — cosmetic, not data.)
+///   * **Apport** — `/var/crash/` (Debian/Ubuntu). We delete only the top-level
+///     `*.crash`/`*.uploaded` report *files*, never subdirectories: kdump stores
+///     kernel `vmcore` dumps in dated subdirs there, and those are something the
+///     admin configured on purpose — not routine cache.
+///
+/// Dumps can contain passwords and keys from the crashed process's memory, so
+/// clearing them is also a small privacy win. Both directories are root-owned,
+/// so deletion goes through sudo. Non-systemd, non-Apport systems (runit,
+/// OpenRC, …) scatter `core` files in each process's cwd with no central
+/// directory — nothing safe to sweep — so we simply report nothing to do.
+pub fn coredumps(dry_run: bool) -> u64 {
+    utils::section("Crash Dumps");
+
+    let sd_dir = PathBuf::from("/var/lib/systemd/coredump");
+    let apport_dir = PathBuf::from("/var/crash");
+    let has_sd = sd_dir.exists();
+    let has_apport = apport_dir.exists();
+
+    if !has_sd && !has_apport {
+        utils::skip("No crash-dump directory found — nothing to clean");
+        return 0;
+    }
+
+    let mut freed = 0u64;
+
+    // ── systemd-coredump ──
+    if has_sd {
+        let size = utils::dir_size(&sd_dir);
+        if size == 0 {
+            utils::success("systemd-coredump: already empty");
+        } else if dry_run {
+            utils::info(&format!(
+                "[DRY RUN] Would clear systemd coredumps ({})",
+                utils::format_size(size)
+            ));
+        } else {
+            // Direct file removal — the only portable method. `coredumpctl`
+            // has no `delete` verb on current systemd, so it can't be relied on.
+            utils::sudo(
+                "find",
+                &["/var/lib/systemd/coredump", "-type", "f", "-delete"],
+            );
+            let after = utils::dir_size(&sd_dir);
+            let got = size.saturating_sub(after);
+            freed += got;
+            utils::success(&format!(
+                "systemd coredumps cleared ({})",
+                utils::format_size(got).green()
+            ));
+        }
+    }
+
+    // ── Apport (/var/crash) ──
+    if has_apport {
+        // Measure only the flat report files we'd actually delete, so the
+        // reported size never includes kdump vmcore subdirs we deliberately keep.
+        let size = apport_report_size(&apport_dir);
+        if size == 0 {
+            utils::success("Apport: no crash reports to clean");
+        } else if dry_run {
+            utils::info(&format!(
+                "[DRY RUN] Would clear Apport crash reports ({})",
+                utils::format_size(size)
+            ));
+        } else {
+            // -maxdepth 1 -type f: top-level report files only, never the
+            // dated kdump subdirectories.
+            utils::sudo(
+                "find",
+                &["/var/crash", "-maxdepth", "1", "-type", "f", "-delete"],
+            );
+            let after = apport_report_size(&apport_dir);
+            let got = size.saturating_sub(after);
+            freed += got;
+            utils::success(&format!(
+                "Apport reports cleared ({})",
+                utils::format_size(got).green()
+            ));
+        }
+    }
+
+    freed
+}
+
+/// Total size of the top-level regular files directly inside `/var/crash`
+/// (Apport reports). Excludes subdirectories so kdump's `vmcore` dumps, which
+/// live in dated subdirs, are never counted or touched.
+fn apport_report_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() && !p.is_symlink() {
+                total += p.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+// ══════════════════════════════════════════════════
 //  Filesystem TRIM (SSD/NVMe maintenance) — opt-in via --trim
 // ══════════════════════════════════════════════════
 
@@ -995,6 +1235,16 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
             utils::sudo("nix-collect-garbage", &["-d"]);
         }
         utils::success("Old generations removed");
+
+        // `nix-collect-garbage -d` cleans the classic (nix-env) profile
+        // generations but does NOT touch flake-profile history. On a flakes
+        // setup those accumulate separately; `nix profile wipe-history` drops
+        // the non-current versions of the default profile so their store paths
+        // become collectable. Best-effort: only meaningful when the new `nix`
+        // CLI with flakes support is present, and a no-op otherwise.
+        if utils::which("nix") {
+            utils::run("nix", &["profile", "wipe-history"]);
+        }
 
         // `nix store --optimise` walks the entire store and hard-links
         // identical files. On a spinning disk that can take *hours*.
@@ -1169,5 +1419,67 @@ mod tests {
             partition_cache_entries(Path::new("/nonexistent/oxiclean/xyz"), &[]);
         assert!(to_clean.is_empty());
         assert!(skipped.is_empty());
+    }
+
+    // ── Gentoo build-tmp: parse PORTAGE_TMPDIR + validate before deleting ──
+
+    #[test]
+    fn test_parse_portage_tmpdir_default_and_custom() {
+        // Unset → None (caller falls back to /var/tmp).
+        assert_eq!(parse_portage_tmpdir("# empty make.conf\nUSE=\"x\"\n"), None);
+        // Quoted and unquoted forms both parse to the bare path.
+        assert_eq!(
+            parse_portage_tmpdir("PORTAGE_TMPDIR=\"/mnt/build\"\n").as_deref(),
+            Some("/mnt/build")
+        );
+        assert_eq!(
+            parse_portage_tmpdir("PORTAGE_TMPDIR=/scratch\n").as_deref(),
+            Some("/scratch")
+        );
+    }
+
+    #[test]
+    fn test_parse_portage_tmpdir_ignores_comments_and_takes_last() {
+        // A commented assignment must be ignored; a later real one wins.
+        let conf = "#PORTAGE_TMPDIR=/ignored\nPORTAGE_TMPDIR=/first\nPORTAGE_TMPDIR=\"/second\"\n";
+        assert_eq!(parse_portage_tmpdir(conf).as_deref(), Some("/second"));
+    }
+
+    #[test]
+    fn test_portage_dir_is_safe_requires_portage_leaf() {
+        // Correct build dir: ends in /portage, has depth.
+        assert!(portage_dir_is_safe(Path::new("/var/tmp/portage")));
+        assert!(portage_dir_is_safe(Path::new("/mnt/build/portage")));
+        // Must reject anything that isn't a `portage` leaf — the exact paths a
+        // malformed PORTAGE_TMPDIR could otherwise expand to.
+        assert!(!portage_dir_is_safe(Path::new("/var/tmp")));
+        assert!(!portage_dir_is_safe(Path::new("/")));
+        assert!(!portage_dir_is_safe(Path::new("/portage"))); // depth < 2
+        assert!(!portage_dir_is_safe(Path::new("/var/tmp/portage-old")));
+    }
+
+    // ── Apport: measure only flat report files, never kdump subdirs ──
+
+    #[test]
+    fn test_apport_report_size_ignores_subdirs() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("oxiclean_apport_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // Two flat Apport report files...
+        fs::write(base.join("_usr_bin_foo.1000.crash"), vec![0u8; 100]).unwrap();
+        fs::write(base.join("_usr_bin_bar.1000.uploaded"), vec![0u8; 50]).unwrap();
+        // ...and a kdump-style subdir with a big vmcore that must NOT be counted.
+        fs::create_dir_all(base.join("202607091200")).unwrap();
+        fs::write(base.join("202607091200/vmcore"), vec![0u8; 100_000]).unwrap();
+
+        assert_eq!(
+            apport_report_size(&base),
+            150,
+            "only the two flat report files (100+50) count; the vmcore subdir is excluded"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

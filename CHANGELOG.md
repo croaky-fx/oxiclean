@@ -1,5 +1,51 @@
 # Changelog
 
+## [1.6.0] - 2026-07-11
+
+### Added
+- **`--json` output.** Emits a single machine-readable JSON object instead of
+  the human report — one line, no banner, no colors, no prompts — so cron jobs
+  and scripts can parse the result. Includes the version, distro, dry-run/deep
+  flags, per-operation freed bytes, the total, and elapsed time. Implies
+  non-interactive: destructive prompts are declined unless `--yes`/`--deep` is
+  also given, so it never blocks on stdin.
+- **Crash-dump cleanup (`--coredumps` / `-C`, also part of `--all`).** Clears
+  saved crash dumps from systemd-coredump (`/var/lib/systemd/coredump`) and
+  Apport (`/var/crash`), each detected by directory existence. Dumps hold a
+  copy of a crashed process's memory — often megabytes each, and a potential
+  home for passwords and keys — so clearing them reclaims space and is a small
+  privacy win. For Apport only the top-level report files are removed; kdump's
+  `vmcore` subdirectories are left alone. Non-systemd/non-Apport inits have no
+  central dump directory and are skipped cleanly.
+- **`--skip <ops>` (with `--all`).** Run everything except the named operations,
+  e.g. `oxiclean --all --skip packages,journal` — handy on a metered connection
+  or to keep journal logs. Comma-separated; only the `--all` operations are
+  valid names. Using `--skip` without `--all`, or with an unknown name, is a
+  clear error rather than a silent no-op.
+
+### Changed
+- **Gentoo also clears `$PORTAGE_TMPDIR/portage`.** Interrupted or failed
+  `emerge` runs leave gigabytes of half-built trees there that portage never
+  reuses. Four guards make this safe: it does nothing while an `emerge` is
+  running, reads `PORTAGE_TMPDIR` from `make.conf` (defaulting to `/var/tmp`),
+  removes only the directory's *contents*, and refuses any path that doesn't
+  resolve to a nested `…/portage`. The distfiles cleanup (`eclean`) is
+  unchanged.
+- **Clear Linux uses `swupd clean`** (and `swupd clean --all` under `--deep`)
+  instead of a raw `rm` of the staged directory, so swupd's own bookkeeping
+  stays consistent.
+- **Nix deep clean also runs `nix profile wipe-history`**, dropping flake-profile
+  generations that `nix-collect-garbage -d` leaves behind so their store paths
+  become collectable.
+- **Alpine's orphan message is now accurate.** apk prunes unused dependencies
+  automatically on `apk del`, so the step reports that there's nothing to do
+  instead of the old misleading "not supported".
+
+### Internal
+- Operation resolution moved out of `main()` into a small, unit-tested `Ops`
+  type. This locks down the invariant that `--all` never enables `--dev` or
+  `--trim` (they stay opt-in), guarded by tests rather than an inline comment.
+
 ## [1.5.0] - 2026-07-08
 
 ### Fixed

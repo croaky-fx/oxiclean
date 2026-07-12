@@ -79,6 +79,8 @@ $ oxiclean -A -y
 - Snap disabled revisions
 - Systemd journal logs
 - Trash
+- Crash dumps — systemd-coredump and Apport reports (they can hold passwords/keys
+  from the crashed process, so clearing them is a small privacy win too)
 - Nix garbage collection — works on any distro that has `/nix/store`, not just NixOS
 
 **Dev tool caches** (opt-in with `--dev`, not part of `--all`):
@@ -183,6 +185,22 @@ oxiclean --cache --trash
 oxiclean --packages --orphans
 oxiclean --journal
 oxiclean --flatpak --snap
+oxiclean --coredumps           # just clear saved crash dumps
+```
+
+Or run everything *except* a couple of things with `--skip` (only valid
+alongside `--all`):
+
+```bash
+oxiclean --all --skip packages         # everything but the package cache
+oxiclean --all --skip journal,orphans  # keep logs and orphaned packages
+```
+
+For scripts and cron, `--json` prints a single machine-readable line instead of
+the human report — no banner, no colors, no prompts:
+
+```bash
+oxiclean --all --yes --json | jq .total_freed_bytes
 ```
 
 ### Cleaning dev tool caches
@@ -238,13 +256,16 @@ Options:
   -s, --snap                         Clean Snap disabled revisions & cache
   -j, --journal                      Vacuum systemd journal logs
   -t, --trash                        Empty trash
+  -C, --coredumps                    Clear crash dumps (systemd-coredump & Apport)
   -D, --dev                          Clean dev-tool caches (npm, cargo, pip, ...)
   -T, --trim                         TRIM SSD/NVMe filesystems (not in --all)
   -A, --all                          Run all cleanup operations (not --dev/--trim)
+      --skip <OPS>                   Skip operations when using --all (comma-separated)
   -d, --deep                         Enable aggressive/deep cleaning mode
   -y, --yes                          Skip all confirmation prompts
   -n, --dry-run                      Preview actions without making changes
   -q, --quiet                        Reduce output noise (good for cron / CI)
+      --json                         Machine-readable JSON output (implies non-interactive)
   -u, --update                       Update to the latest GitHub release
       --generate-completion <SHELL>  Print shell completion script and exit
   -h, --help                         Print help (see more with '--help')
@@ -369,7 +390,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 79 unit tests and 13 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
+There are 92 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion; `--all` never enabling `--dev`/`--trim`; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
 
 ---
 
@@ -385,13 +406,12 @@ cargo build && cargo test
 1. Add a variant to the `Distro` enum in `detect.rs`
 2. Add its ID to the detection arrays
 3. Add cache cleaning in `clean.rs → pkg_cache()`
-4. Add orphan removal in `clean.rs → orphans()`
+4. Add orphan removal in `clean.rs → orphans()` (skip if the distro is atomic/immutable — it has no orphans)
 5. Update the README table
 6. Test it (a VM or container works fine)
 
 **Things I'd love help with:**
-- More distros (Guix, Slackware...)
-- Integration tests with Docker containers
+- Testing on immutable systems (Silverblue, Kinoite, Bazzite, SteamOS, MicroOS) — the atomic/read-only paths are the newest and least battle-tested
 - More dev tools in `--dev` (mix, rebar, sbt...)
 - Better distro-specific docs for Alpine / Void / Nix edge cases
 - A couple more real-world smoke tests on HDD systems
