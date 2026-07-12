@@ -21,7 +21,7 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.4.0
+    ⚡ Oxi Clean  v1.6.1
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -34,7 +34,8 @@ $ oxiclean -A -y
   🔐 Requesting privileges (sudo)...
 
   ━━▶ User Cache
-    ✔ Freed 846.36 MB
+    ⊘ Some dev-tool caches skipped — remove them with --dev
+    ✔ Freed 1.44 GB
 
   ━━▶ Package Cache
     ✔ pacman cache cleaned
@@ -49,19 +50,22 @@ $ oxiclean -A -y
     ✔ Flatpak cleanup done
 
   ━━▶ Journal
-    ℹ Current usage: 47.8M
+    ℹ Current usage: 48.6M
     ✔ Journal vacuumed
 
   ━━▶ Trash
-    ✔ Trash is empty
+    ✔ Freed 9.94 MB
+
+  ━━▶ Crash Dumps
+    ✔ systemd-coredump: already empty
 
   ══════════════════════════════════════════════
-  ⚡ Total freed: 846.36 MB
-  ⏱  Completed in: 21.30s
+  ⚡ Total freed: 1.45 GB
+  ⏱  Completed in: 11.38s
   ══════════════════════════════════════════════
 ```
 
-*(Real run on CachyOS with a 5400rpm HDD. pacman/paru also print their own `[Y/n]` prompts during the run — those are pacman's, not oxiclean's, and they auto-answer with `--noconfirm`; they're trimmed here for clarity. A run that removes orphaned packages takes longer, mostly because snapper takes pre/post snapshots around the removal.)*
+*(Real run on CachyOS with a 5400rpm HDD. The `⊘` line is the safety guard in action: dev-tool caches under `~/.cache` are left for `--dev` to handle with the right per-tool command, and model weights (HuggingFace/torch) are kept silently — nothing here ever deletes them. pacman/paru also print their own `[Y/n]` prompts during the run — those are pacman's, not oxiclean's, and they auto-answer with `--noconfirm`; they're trimmed here for clarity. A run that removes orphaned packages takes longer, mostly because snapper takes pre/post snapshots around the removal.)*
 
 ---
 
@@ -69,9 +73,9 @@ $ oxiclean -A -y
 
 **System stuff** (the default with `--all`):
 - `~/.cache` — the obvious stuff, but it **spares expensive caches**: HuggingFace/torch
-  model weights (multi-GB, and nobody clears a 40 GB model as routine cleanup) and
-  dev-tool caches that `--dev` owns. Those are skipped with a note and stay removable
-  via `--dev`.
+  model weights (multi-GB, and nobody clears a 40 GB model as routine cleanup) are kept
+  silently, and dev-tool caches that `--dev` owns are left for `--dev` to handle (with a
+  one-line hint so you know they were skipped).
 - Package manager cache (pacman, apt, dnf, zypper, xbps, apk, portage...)
 - Orphaned packages — things nothing depends on anymore
 - AUR helper cache (paru, yay, trizen, etc.)
@@ -390,7 +394,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 92 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion; `--all` never enabling `--dev`/`--trim`; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
+There are 93 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
 
 ---
 

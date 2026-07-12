@@ -201,29 +201,37 @@ fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
 //  Expensive-cache protection (used by user_cache)
 // ══════════════════════════════════════════════════
 
-/// Caches under the user cache dir that a blanket `--cache`/`--all` wipe must
-/// never touch. Two kinds, both costly to lose:
-///   * **Model weights** — `huggingface`, `torch`: multi-GB downloads a user
-///     grabbed on purpose; re-fetching means hours and bandwidth. They're not
-///     "leftovers" and nobody clears a 40 GB model as routine cache cleanup.
-///   * **Dev-tool caches** — `uv`, `pip`, `pipenv`, `pypoetry`, `deno`,
-///     `ccache`, `yarn`: these live under ~/.cache but are already owned by
-///     `--dev`, which cleans them deliberately with the correct per-tool
-///     command. Wiping them here would contradict `--dev`'s care.
-///
-/// Removing any of these stays possible — via `--dev` (with `--deep` for the
-/// re-download-heavy ones) — it just never happens by accident.
-const PROTECTED_CACHE_DIRS: &[&str] = &[
-    "huggingface",
-    "torch",
-    "uv",
-    "pip",
-    "pipenv",
-    "pypoetry",
-    "deno",
-    "ccache",
-    "yarn",
-];
+// Caches under the user cache dir that a blanket `--cache`/`--all` wipe must
+// never touch. Split into two kinds because they're reported differently:
+//
+//   * `PROTECTED_MODEL_DIRS` — model weights. Protected **silently**: they are
+//     never cleaned by `--cache` *or* `--dev`, so mentioning them (let alone
+//     hinting "clean with --dev") would be a false promise. Just kept, quietly.
+//   * `PROTECTED_DEV_DIRS` — dev-tool caches that `--dev` owns and cleans with
+//     the correct per-tool command. When one of these is present we skip it
+//     here and print a single hint pointing the user at `--dev`.
+//
+// Both lists together are what `partition_cache_entries` protects from
+// deletion; only the dev list drives the printed hint.
+
+/// Model-weight caches: multi-GB downloads a user grabbed on purpose (nobody
+/// clears a 40 GB model as routine cleanup). Not "leftovers", and not something
+/// `--dev` touches either — so `--cache` keeps them silently.
+const PROTECTED_MODEL_DIRS: &[&str] = &["huggingface", "torch"];
+
+/// Dev-tool caches that live under `~/.cache` but are owned by `--dev`. Wiping
+/// them from `--cache` would contradict `--dev`'s per-tool handling, so they're
+/// spared here and their presence prints a "use --dev" hint.
+const PROTECTED_DEV_DIRS: &[&str] = &["uv", "pip", "pipenv", "pypoetry", "deno", "ccache", "yarn"];
+
+/// Every top-level name protected from a `--cache` wipe (models + dev caches).
+fn all_protected_dirs() -> Vec<&'static str> {
+    PROTECTED_MODEL_DIRS
+        .iter()
+        .chain(PROTECTED_DEV_DIRS.iter())
+        .copied()
+        .collect()
+}
 
 /// Resolve the user cache directory, honouring `XDG_CACHE_HOME` (the spec-
 /// correct override) and falling back to `~/.cache`.
@@ -242,7 +250,7 @@ fn user_cache_base() -> Option<PathBuf> {
 /// spared). A relocation outside the cache base needs no entry — user_cache
 /// only ever touches things under the cache base to begin with.
 fn protected_cache_names(cache_base: &Path) -> Vec<String> {
-    let mut names: Vec<String> = PROTECTED_CACHE_DIRS.iter().map(|s| s.to_string()).collect();
+    let mut names: Vec<String> = all_protected_dirs().iter().map(|s| s.to_string()).collect();
     for var in ["HF_HOME", "HF_HUB_CACHE"] {
         if let Ok(val) = std::env::var(var) {
             if val.is_empty() {
@@ -293,6 +301,15 @@ fn entry_size(p: &Path) -> u64 {
     }
 }
 
+/// True if any of the spared entries is a dev-tool cache (so we should print
+/// the `--dev` hint). Model caches are excluded — they're kept silently because
+/// nothing, not even `--dev`, removes them.
+fn skipped_has_dev_cache(skipped: &[String]) -> bool {
+    skipped
+        .iter()
+        .any(|name| PROTECTED_DEV_DIRS.contains(&name.as_str()))
+}
+
 pub fn user_cache(dry_run: bool) -> u64 {
     utils::section("User Cache");
 
@@ -315,16 +332,14 @@ pub fn user_cache(dry_run: bool) -> u64 {
     // right per-tool commands. A blanket wipe here would silently destroy a
     // 40 GB model download — those belong to `--dev`, not `--cache`.
     let protected = protected_cache_names(&cache);
-    let (to_clean, mut skipped) = partition_cache_entries(&cache, &protected);
+    let (to_clean, skipped) = partition_cache_entries(&cache, &protected);
 
-    if !skipped.is_empty() {
-        skipped.sort();
-        // Say what we deliberately preserved so a user who *wants* it gone knows
-        // it was spared — and where to reclaim it (`--dev`).
-        utils::skip(&format!(
-            "Protected (clean with --dev): {}",
-            skipped.join(", ")
-        ));
+    // Only announce the skip when a dev-tool cache was actually spared, and
+    // point the user at the flag that *can* clean it. Model caches (HuggingFace,
+    // torch) are kept silently: neither `--cache` nor `--dev` removes them, so
+    // naming them here would just be noise (and "clean with --dev" a false lead).
+    if skipped_has_dev_cache(&skipped) {
+        utils::skip("Some dev-tool caches skipped — remove them with --dev");
     }
 
     let clean_size: u64 = to_clean.iter().map(|p| entry_size(p)).sum();
@@ -1348,15 +1363,46 @@ mod tests {
 
     #[test]
     fn test_protected_list_covers_models_and_dev_caches() {
-        // The two model caches whose loss is catastrophic must be present, plus
-        // representative dev caches. This is the regression guard against anyone
-        // quietly dropping an entry from PROTECTED_CACHE_DIRS.
-        for must in ["huggingface", "torch", "uv", "pip", "ccache"] {
+        // The two model caches whose loss is catastrophic must stay in the model
+        // list; representative dev caches must stay in the dev list. This guards
+        // against anyone quietly dropping an entry from either.
+        for must in ["huggingface", "torch"] {
             assert!(
-                PROTECTED_CACHE_DIRS.contains(&must),
-                "{must} must stay in the protected-cache list"
+                PROTECTED_MODEL_DIRS.contains(&must),
+                "{must} must stay in the protected model list"
             );
         }
+        for must in ["uv", "pip", "ccache"] {
+            assert!(
+                PROTECTED_DEV_DIRS.contains(&must),
+                "{must} must stay in the protected dev-cache list"
+            );
+        }
+        // The two lists must not overlap — a name is either a silently-kept
+        // model or a dev cache that drives the hint, never both.
+        for m in PROTECTED_MODEL_DIRS {
+            assert!(
+                !PROTECTED_DEV_DIRS.contains(m),
+                "{m} must not be in both lists"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dev_hint_only_fires_for_dev_caches() {
+        // A model-only skip must stay silent (no --dev hint): --dev can't clean
+        // models, so hinting at it would mislead.
+        assert!(!skipped_has_dev_cache(&["huggingface".to_string()]));
+        assert!(!skipped_has_dev_cache(&["torch".to_string()]));
+        // A dev cache present → hint fires.
+        assert!(skipped_has_dev_cache(&["pip".to_string()]));
+        // Mixed → still fires (there IS a dev cache to point at).
+        assert!(skipped_has_dev_cache(&[
+            "huggingface".to_string(),
+            "uv".to_string()
+        ]));
+        // Nothing skipped → no hint.
+        assert!(!skipped_has_dev_cache(&[]));
     }
 
     #[test]

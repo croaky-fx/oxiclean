@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.1] - 2026-07-12
+
+### Changed
+- **`--cache` reports spared caches more honestly.** The old line named every
+  protected entry and told you to "clean with --dev" — but model weights
+  (HuggingFace, torch) aren't cleaned by `--dev` either, so that hint was a
+  false lead, and listing them was just noise. Now model caches are kept
+  **silently**, and the `--dev` hint prints only when a dev-tool cache was
+  actually spared (`⊘ Some dev-tool caches skipped — remove them with --dev`),
+  and only then. The protection itself is unchanged — nothing about which
+  directories are kept has changed.
+
 ## [1.6.0] - 2026-07-11
 
 ### Added
