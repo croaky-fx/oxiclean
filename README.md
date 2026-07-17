@@ -394,7 +394,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 93 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
+There are 95 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
 
 ---
 

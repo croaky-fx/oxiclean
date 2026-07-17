@@ -177,17 +177,37 @@ fn clean_portage_tmp(dry_run: bool) -> u64 {
     size
 }
 
+/// Resolve the package-cache directory to measure on Fedora/RHEL. dnf5 keeps
+/// its cache under `/var/cache/libdnf5`; dnf4 and yum use `/var/cache/dnf` and
+/// `/var/cache/yum`. `dnf clean all` cleans whichever backend is active, so we
+/// measure the one that actually holds data.
+fn fedora_cache_dir() -> PathBuf {
+    resolve_fedora_cache_dir(
+        Path::new("/var/cache/libdnf5").is_dir(),
+        utils::which("dnf"),
+    )
+}
+
+/// Pure path-selection logic, split out from [`fedora_cache_dir`] so it can be
+/// tested without touching the filesystem. Prefer the libdnf5 dir when present,
+/// then the dnf4 dir, then yum. We pick a single active dir rather than summing
+/// them so a stale sibling left over from a dnf4→dnf5 migration can't be
+/// double-counted into the freed total.
+fn resolve_fedora_cache_dir(libdnf5_exists: bool, has_dnf: bool) -> PathBuf {
+    if libdnf5_exists {
+        PathBuf::from("/var/cache/libdnf5")
+    } else if has_dnf {
+        PathBuf::from("/var/cache/dnf")
+    } else {
+        PathBuf::from("/var/cache/yum")
+    }
+}
+
 fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
     match distro {
         Distro::Arch => Some(PathBuf::from("/var/cache/pacman/pkg")),
         Distro::Debian => Some(PathBuf::from("/var/cache/apt/archives")),
-        Distro::Fedora => {
-            if utils::which("dnf") {
-                Some(PathBuf::from("/var/cache/dnf"))
-            } else {
-                Some(PathBuf::from("/var/cache/yum"))
-            }
-        }
+        Distro::Fedora => Some(fedora_cache_dir()),
         Distro::Suse => Some(PathBuf::from("/var/cache/zypp/packages")),
         Distro::Void => Some(PathBuf::from("/var/cache/xbps")),
         Distro::Alpine => Some(PathBuf::from("/var/cache/apk")),
@@ -1357,6 +1377,38 @@ mod tests {
         // A non-existent cache dir must not panic — just yield nothing.
         let found = find_partial_downloads(Path::new("/nonexistent/oxiclean/cache"));
         assert!(found.is_empty());
+    }
+
+    // ── Fedora cache-dir selection: dnf5 vs dnf4 vs yum ──
+
+    #[test]
+    fn test_resolve_fedora_cache_dir_prefers_libdnf5() {
+        // dnf5 (Fedora 41+ default) keeps its cache in /var/cache/libdnf5. When
+        // that dir exists it wins, regardless of whether the `dnf` binary is
+        // present — otherwise the freed-size measurement reads the wrong (often
+        // empty) legacy dir and wrongly reports 0 bytes freed.
+        assert_eq!(
+            resolve_fedora_cache_dir(true, true),
+            PathBuf::from("/var/cache/libdnf5")
+        );
+        assert_eq!(
+            resolve_fedora_cache_dir(true, false),
+            PathBuf::from("/var/cache/libdnf5")
+        );
+    }
+
+    #[test]
+    fn test_resolve_fedora_cache_dir_falls_back_to_dnf4_then_yum() {
+        // No libdnf5 dir but a dnf binary → the dnf4 location.
+        assert_eq!(
+            resolve_fedora_cache_dir(false, true),
+            PathBuf::from("/var/cache/dnf")
+        );
+        // Neither → the legacy yum location.
+        assert_eq!(
+            resolve_fedora_cache_dir(false, false),
+            PathBuf::from("/var/cache/yum")
+        );
     }
 
     // ── Expensive-cache protection: the core safety guarantee of --cache ──

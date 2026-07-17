@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.2] - 2026-07-17
+
+### Fixed
+- **Fedora/RHEL: package-cache size was measured at the wrong path on dnf5.**
+  dnf5 (the default since Fedora 41) keeps its cache under `/var/cache/libdnf5`,
+  but the freed-size measurement still read the legacy `/var/cache/dnf`. The
+  cleanup itself worked, but the report showed `0 B` freed because it measured
+  an empty directory. It now measures whichever backend is active — libdnf5,
+  then dnf4, then yum — so the freed total is accurate again.
+
 ## [1.6.1] - 2026-07-12
 
 ### Changed
