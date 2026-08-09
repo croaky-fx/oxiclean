@@ -201,12 +201,115 @@ pub fn pretty_name() -> String {
 //  Tool Detection
 // ═══════════════════════════════════════════════════
 
-/// Detect available AUR helper (Arch-based only)
-pub fn aur_helper() -> Option<&'static str> {
-    ["paru", "yay", "trizen", "pikaur", "aura"]
+/// An AUR helper we know how to clean, with the flags that helper actually
+/// wants. The flags differ enough that one shared `-Sc` was wrong for at least
+/// one of them (see `trizen` below), so they belong in the table rather than at
+/// the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurHelper {
+    /// Binary name, also used as the display label and cache-dir name.
+    pub bin: &'static str,
+    /// Safe clean: drop cached sources/builds, keep what is still installed.
+    /// `None` when the helper has no command that cleans *its own* cache — see
+    /// `aura`, which is handled through `prune_dirs` instead.
+    pub clean: Option<&'static [&'static str]>,
+    /// Aggressive clean, gated behind `--deep`: drop everything cached.
+    pub deep_clean: Option<&'static [&'static str]>,
+    /// Subdirectories of the helper's cache dir that we clear ourselves, for
+    /// helpers whose CLI has no equivalent command. Build leftovers only —
+    /// always safe, nothing here re-downloads.
+    pub prune_dirs: &'static [&'static str],
+    /// Extra subdirectories cleared only under `--deep`, because emptying them
+    /// costs a re-download on the next build.
+    pub prune_dirs_deep: &'static [&'static str],
+}
+
+/// Every AUR helper we support, in display order.
+///
+/// This used to be a bare name list that `find()` reduced to a single winner,
+/// which meant the *array order* silently decided which helper got cleaned:
+/// with both paru and yay installed, paru won for no reason other than being
+/// written first, and yay's cache was never touched on any machine, ever.
+/// Having two helpers installed and using only one is common, and the unused
+/// one still accumulates clone/build caches. So we clean every helper present
+/// and this order is now presentation only.
+const AUR_HELPERS: &[AurHelper] = &[
+    AurHelper {
+        bin: "paru",
+        clean: Some(&["-Sc", "--noconfirm"]),
+        deep_clean: Some(&["-Scc", "--noconfirm"]),
+        prune_dirs: &[],
+        prune_dirs_deep: &[],
+    },
+    AurHelper {
+        bin: "yay",
+        clean: Some(&["-Sc", "--noconfirm"]),
+        deep_clean: Some(&["-Scc", "--noconfirm"]),
+        prune_dirs: &[],
+        prune_dirs_deep: &[],
+    },
+    AurHelper {
+        // `-a` restricts the clean to trizen's own AUR cache. Without it,
+        // trizen's clean also runs `pacman -Scc` on the shared pacman cache —
+        // which removes EVERY cached package, including ones still installed.
+        // That is the aggressive behaviour we deliberately keep behind --deep,
+        // so a plain run on a trizen system was quietly overreaching. It was
+        // also redundant: pkg_cache() already ran `pacman -Sc` moments earlier.
+        // https://github.com/trizen/trizen/blob/master/TRIZEN.md
+        bin: "trizen",
+        clean: Some(&["-Sca", "--noconfirm"]),
+        deep_clean: Some(&["-Scca", "--noconfirm"]),
+        prune_dirs: &[],
+        prune_dirs_deep: &[],
+    },
+    AurHelper {
+        bin: "pikaur",
+        clean: Some(&["-Sc", "--noconfirm"]),
+        deep_clean: Some(&["-Scc", "--noconfirm"]),
+        prune_dirs: &[],
+        prune_dirs_deep: &[],
+    },
+    AurHelper {
+        // aura has no command that cleans aura's own cache, so we clear the
+        // directories ourselves.
+        //
+        // Its `-C` family is the *downgrade* namespace, and `-Cc` there means
+        // "keep the N most recent versions of each package" — it takes a
+        // mandatory count (`clean: Option<usize>` in aura's own flags.rs) and
+        // operates on `env.caches()`, i.e. the **pacman** cache. So `-Cc`
+        // would (a) fail outright without a number, (b) duplicate the
+        // `pacman -Sc` that pkg_cache already ran, and (c) still never touch
+        // aura's own cache. `-Sc` is passed straight through to pacman for the
+        // same reason — aura is a pacman superset.
+        //
+        // What actually grows is `~/.cache/aura/builds` (unpacked build trees),
+        // `~/.cache/aura/cache` (built tarballs) and `~/.cache/aura/packages`
+        // (AUR git clones). The last two cost a rebuild or a re-clone, so they
+        // wait for `--deep`, matching how `--dev` gates its own caches.
+        //
+        // Two sibling dirs are deliberately absent from both lists because they
+        // are state, not cache: `snapshots/` holds user-saved restore points
+        // that `-B` restores from, and `hashes/` is the bookkeeping that tells
+        // aura when each AUR package was last built. Clearing `packages/` is
+        // relative to the cache dir, so an `AURDEST` that relocates the clones
+        // elsewhere simply finds nothing here rather than deleting the wrong
+        // tree.
+        // https://github.com/fosskers/aura → rust/aura-pm/src/dirs.rs
+        bin: "aura",
+        clean: None,
+        deep_clean: None,
+        prune_dirs: &["builds"],
+        prune_dirs_deep: &["cache", "packages"],
+    },
+];
+
+/// Every AUR helper installed on this system, in [`AUR_HELPERS`] order.
+pub fn aur_helpers() -> Vec<AurHelper> {
+    AUR_HELPERS
         .iter()
         .copied()
-        .find(|h| crate::utils::which(h))
+        .filter(|h| crate::utils::which(h.bin))
+        .collect()
 }
 
 /// Check if Flatpak is installed
@@ -435,6 +538,130 @@ pub fn detect_root_disk_type() -> DiskType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AUR helper table ──
+
+    #[test]
+    fn test_trizen_clean_is_aur_scoped() {
+        // Regression guard for a real overreach: without `-a`, trizen's clean
+        // also runs `pacman -Scc` on the shared pacman cache, wiping every
+        // cached package including installed ones. That is --deep behaviour,
+        // so a plain run must never trigger it. Both flag sets stay scoped.
+        let trizen = AUR_HELPERS.iter().find(|h| h.bin == "trizen").unwrap();
+        assert!(trizen.clean.unwrap().contains(&"-Sca"));
+        assert!(trizen.deep_clean.unwrap().contains(&"-Scca"));
+    }
+
+    #[test]
+    fn test_aura_never_uses_a_clean_command() {
+        // aura has no command that cleans aura's own cache: `-Sc` passes
+        // through to pacman, and `-Cc` needs a mandatory count and also targets
+        // the pacman cache. Either would duplicate pkg_cache's `pacman -Sc`
+        // while leaving aura's cache untouched, so aura must stay on the
+        // prune-by-directory path.
+        let aura = AUR_HELPERS.iter().find(|h| h.bin == "aura").unwrap();
+        assert!(aura.clean.is_none());
+        assert!(aura.deep_clean.is_none());
+        assert!(!aura.prune_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_pruned_dirs_never_include_user_state() {
+        // `snapshots/` holds user-saved package restore points that aura's `-B`
+        // restores from, and `hashes/` is build bookkeeping — both are state, not
+        // cache. Nothing we prune may name either, in the safe or the deep list.
+        for h in AUR_HELPERS {
+            for dir in h.prune_dirs.iter().chain(h.prune_dirs_deep.iter()) {
+                assert_ne!(*dir, "snapshots", "{} would delete restore points", h.bin);
+                assert_ne!(*dir, "hashes", "{} would delete build bookkeeping", h.bin);
+                assert!(
+                    !dir.is_empty() && !dir.contains('/') && !dir.contains(".."),
+                    "{} has a prune dir that is not a plain child name: {:?}",
+                    h.bin,
+                    dir
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hand_pruned_helpers_never_share_a_dir_between_modes() {
+        // A dir listed in both lists would be cleared twice in a --deep run.
+        for h in AUR_HELPERS {
+            for d in h.prune_dirs_deep {
+                assert!(
+                    !h.prune_dirs.contains(d),
+                    "{} lists {:?} in both prune lists",
+                    h.bin,
+                    d
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_every_helper_is_cleanable_exactly_one_way() {
+        // A helper must either drive its own clean command or be pruned by
+        // directory — never both (double work) and never neither (silently
+        // reports "already clean" forever).
+        for h in AUR_HELPERS {
+            let by_command = h.clean.is_some();
+            let by_prune = !h.prune_dirs.is_empty();
+            assert!(
+                by_command != by_prune,
+                "{} must be cleaned by exactly one mechanism",
+                h.bin
+            );
+            // Deep flags only make sense alongside a safe counterpart.
+            if h.clean.is_none() {
+                assert!(h.deep_clean.is_none(), "{} has orphaned deep flags", h.bin);
+            }
+        }
+    }
+
+    #[test]
+    fn test_command_helpers_are_noninteractive_and_distinct() {
+        // A missing --noconfirm would hang a --yes/cron run waiting on stdin,
+        // and a helper whose deep flags equal its safe flags would silently
+        // apply deep behaviour to every plain run.
+        for h in AUR_HELPERS {
+            let (Some(clean), Some(deep)) = (h.clean, h.deep_clean) else {
+                continue;
+            };
+            assert!(
+                clean.contains(&"--noconfirm"),
+                "{} safe clean would block on stdin",
+                h.bin
+            );
+            assert!(
+                deep.contains(&"--noconfirm"),
+                "{} deep clean would block on stdin",
+                h.bin
+            );
+            assert_ne!(
+                clean, deep,
+                "{} would apply deep behaviour on a plain run",
+                h.bin
+            );
+        }
+    }
+
+    #[test]
+    fn test_aur_helpers_returns_only_installed_in_table_order() {
+        // aur_helpers() filters the table by which(); the result must stay a
+        // subsequence of the table so output order is deterministic and no
+        // unknown binary can appear.
+        let found = aur_helpers();
+        let table: Vec<&str> = AUR_HELPERS.iter().map(|h| h.bin).collect();
+        let mut idx = 0usize;
+        for h in &found {
+            let pos = table[idx..]
+                .iter()
+                .position(|b| *b == h.bin)
+                .unwrap_or_else(|| panic!("{} is out of table order or unknown", h.bin));
+            idx += pos + 1;
+        }
+    }
 
     // ── detection logic tests (pure, no I/O) ──
 

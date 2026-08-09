@@ -21,13 +21,13 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.6.1
+    ⚡ Oxi Clean  v1.7.0
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
   System: CachyOS
   Distro: Arch Linux (pacman)
-  AUR: paru
+  AUR: paru, yay
   Flatpak: detected ✔
   ⚠ HDD detected — cleanup may take longer
 
@@ -35,7 +35,7 @@ $ oxiclean -A -y
 
   ━━▶ User Cache
     ⊘ Some dev-tool caches skipped — remove them with --dev
-    ✔ Freed 1.44 GB
+    ✔ Freed 113.30 MB
 
   ━━▶ Package Cache
     ✔ pacman cache cleaned
@@ -44,28 +44,28 @@ $ oxiclean -A -y
     ✔ No orphans found
 
   ━━▶ AUR Cache
-    ✔ paru cache cleaned
+    ✔ paru — freed 128.40 MB
+    ✔ yay — already clean
 
   ━━▶ Flatpak
-    ✔ Flatpak cleanup done
+    ✔ No unused runtimes
 
   ━━▶ Journal
-    ℹ Current usage: 48.6M
-    ✔ Journal vacuumed
+    ✔ Already under 50M (41.90 MB) — nothing to vacuum
 
   ━━▶ Trash
-    ✔ Freed 9.94 MB
+    ✔ Trash is empty
 
   ━━▶ Crash Dumps
     ✔ systemd-coredump: already empty
 
   ══════════════════════════════════════════════
-  ⚡ Total freed: 1.45 GB
-  ⏱  Completed in: 11.38s
+  ⚡ Total freed: 241.70 MB
+  ⏱  Completed in: 6.48s
   ══════════════════════════════════════════════
 ```
 
-*(Real run on CachyOS with a 5400rpm HDD. The `⊘` line is the safety guard in action: dev-tool caches under `~/.cache` are left for `--dev` to handle with the right per-tool command, and model weights (HuggingFace/torch) are kept silently — nothing here ever deletes them. pacman/paru also print their own `[Y/n]` prompts during the run — those are pacman's, not oxiclean's, and they auto-answer with `--noconfirm`; they're trimmed here for clarity. A run that removes orphaned packages takes longer, mostly because snapper takes pre/post snapshots around the removal.)*
+*(Real run on CachyOS with a 5400rpm HDD. The `⊘` line is the safety guard in action: dev-tool caches under `~/.cache` are left for `--dev` to handle with the right per-tool command, and model weights (HuggingFace/torch) are kept silently — nothing here ever deletes them. Both installed AUR helpers get cleaned, each with its own freed figure. The helpers print plenty of their own output during a run; it's captured so the report stays readable — pass `--verbose` if you want to see it, and a command that fails shows its stderr either way.)*
 
 ---
 
@@ -78,7 +78,9 @@ $ oxiclean -A -y
   one-line hint so you know they were skipped).
 - Package manager cache (pacman, apt, dnf, zypper, xbps, apk, portage...)
 - Orphaned packages — things nothing depends on anymore
-- AUR helper cache (paru, yay, trizen, etc.)
+- AUR helper cache (paru, yay, trizen, etc.) — *every* helper you have installed,
+  not just the first one found. Two helpers installed and one in use is common,
+  and the unused one keeps accumulating clone/build caches.
 - Flatpak unused runtimes
 - Snap disabled revisions
 - Systemd journal logs
@@ -243,6 +245,9 @@ A few things it explicitly *won't* do (these are the ones that bite people):
 - Poetry's `virtualenvs/` directory is preserved — only the package download `cache/` is cleaned
 - Gradle's `wrapper/` (which holds the actual Gradle distributions) stays — only `caches/` goes
 - npm globals (`~/.npm/lib/node_modules`) stay — only `_cacache/` goes
+- aura's `~/.cache/aura/snapshots/` stays — those are saved restore points you
+  feed back to `aura -B`, not cache. Only `builds/` is pruned on a normal run
+  (tarball cache and git clones need `--deep`)
 
 `--all` does *not* include `--dev` on purpose. Dev caches have very different
 tradeoffs (some trigger gigabyte-scale re-downloads) and they should be an
@@ -270,6 +275,7 @@ Options:
   -n, --dry-run                      Preview actions without making changes
   -q, --quiet                        Reduce output noise (good for cron / CI)
       --json                         Machine-readable JSON output (implies non-interactive)
+  -v, --verbose                      Show raw helper command output (captured by default)
   -u, --update                       Update to the latest GitHub release
       --generate-completion <SHELL>  Print shell completion script and exit
   -h, --help                         Print help (see more with '--help')
@@ -328,6 +334,14 @@ image swaps, not the package manager — while user-level cleanup still runs.
 **Results vary a lot.** Whether you free 5MB or 2GB depends on how long since you last cleaned, your distro, and your disk. The tool's value isn't in big numbers — it's in not having to remember 10 different commands for 10 different distros.
 
 **`--deep` is a bit more aggressive.** Things like `pacman -Scc` (removes *all* cached packages, not just old ones), `flatpak repair`, or the cargo/go caches that'll re-download. Useful for squeezing out more space, but worth knowing what you're getting into. Run `--dry-run --deep` first if unsure.
+
+**The helpers' own output is captured, not lost.** pacman, the AUR helpers,
+flatpak and journalctl each print several lines of their own, which used to be
+most of what a `--all` run showed. They're captured now so the report reads as a
+report. Nothing is hidden that you'd need: a command that **fails** replays its
+stderr under the error line, and `--verbose` gives you the raw output back.
+Package removal, Nix GC and `fstrim` still print live — they're slow enough that
+silence would look like a hang, and `fstrim`'s output is the result itself.
 
 **It needs sudo or doas for some things** — package cache, orphan removal, journal. Detected automatically at startup; on Alpine and Void where `doas` is the default, no configuration needed. For user-level stuff (your `~/.cache`, trash, dev caches) it won't ask.
 
@@ -394,7 +408,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 95 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
+There are 108 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; trizen's clean staying scoped to the AUR cache so a plain run can't wipe every cached pacman package; aura's prune lists never naming `snapshots/` (saved restore points) or `hashes/` (build bookkeeping), and its cache dir never being wiped wholesale in either mode; deferring an AUR helper's cache to the AUR section never stranding it when that section isn't running; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
 
 ---
 
@@ -416,6 +430,15 @@ cargo build && cargo test
 
 **Things I'd love help with:**
 - Testing on immutable systems (Silverblue, Kinoite, Bazzite, SteamOS, MicroOS) — the atomic/read-only paths are the newest and least battle-tested
+- **Testing on a real `aura` install.** aura has no command that cleans its own
+  cache (`-Sc` passes through to pacman; `-Cc` is the downgrade namespace, takes a
+  mandatory version count, and also targets the pacman cache), so oxiclean clears
+  `~/.cache/aura/builds` directly, with built tarballs and AUR git clones behind
+  `--deep`, and `snapshots/` (restore points) plus `hashes/` (build bookkeeping)
+  never touched. That logic is covered by unit tests but has only been exercised
+  against a stubbed binary and a hand-made directory tree — a check against a
+  real aura install, especially that the directory names still match, would be
+  genuinely useful.
 - More dev tools in `--dev` (mix, rebar, sbt...)
 - Better distro-specific docs for Alpine / Void / Nix edge cases
 - A couple more real-world smoke tests on HDD systems

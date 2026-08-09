@@ -1,8 +1,27 @@
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 
-use crate::detect::Distro;
+use crate::detect::{AurHelper, Distro};
 use crate::utils;
+
+// Which helper commands are allowed to print their own output.
+//
+// Default is `utils::*_quiet`: cache-clearing commands emit several lines each
+// and on a full `--all` run there was more foreign output than ours, which
+// buried the section results. Those are captured (and their stderr replayed if
+// they fail). `--verbose` turns capturing off globally.
+//
+// Three kinds of command stay on the plain `utils::run`/`utils::sudo`, because
+// hiding them would cost the user something real rather than just noise:
+//
+//   1. Package *removal* (`pacman -Rns`, `apt-get autoremove`, `emerge
+//      --depclean`, ...) — destructive and slow. On a btrfs system with
+//      snapper hooks this takes tens of seconds; silence would read as a hang.
+//   2. Nix garbage collection — routinely runs for minutes.
+//   3. `fstrim --verbose` — its output *is* the result. We have no
+//      oxiclean-generated line that carries the same information.
+//
+// The line is: we hide chatter, never results or progress.
 
 /// Remove partial-download leftovers from interrupted `pacman -Syu` runs.
 ///
@@ -29,7 +48,7 @@ fn cleanup_pacman_partial_downloads() {
         .collect();
     let mut args: Vec<&str> = vec!["-rf"];
     args.extend(paths.iter().map(|s| s.as_str()));
-    utils::sudo("rm", &args);
+    utils::sudo_quiet("rm", &args);
 }
 
 /// True if `name` is a pacman partial-download leftover that is always safe to
@@ -169,7 +188,7 @@ fn clean_portage_tmp(dry_run: bool) -> u64 {
     // sudo. `-mindepth 1` keeps the `portage` dir itself; `-delete` handles the
     // nested trees. We report the pre-measured size as freed.
     let target = build_dir.to_string_lossy().into_owned();
-    utils::sudo("find", &[&target, "-mindepth", "1", "-delete"]);
+    utils::sudo_quiet("find", &[&target, "-mindepth", "1", "-delete"]);
     utils::success(&format!(
         "Cleared portage build leftovers ({})",
         utils::format_size(size).green()
@@ -265,12 +284,38 @@ fn user_cache_base() -> Option<PathBuf> {
 }
 
 /// The set of top-level entry names to protect inside `cache_base`: the static
-/// list, plus HuggingFace's location if it's been redirected *inside* the cache
-/// base via `HF_HOME`/`HF_HUB_CACHE` (so a non-default model dir is still
-/// spared). A relocation outside the cache base needs no entry — user_cache
-/// only ever touches things under the cache base to begin with.
-fn protected_cache_names(cache_base: &Path) -> Vec<String> {
+/// list, the cache dirs of any AUR helper the AUR section is going to clean,
+/// plus HuggingFace's location if it's been redirected *inside* the cache base
+/// via `HF_HOME`/`HF_HUB_CACHE` (so a non-default model dir is still spared).
+/// A relocation outside the cache base needs no entry — user_cache only ever
+/// touches things under the cache base to begin with.
+///
+/// AUR helper cache dirs are held back for two different reasons, deliberately
+/// kept apart:
+///
+/// * A **hand-pruned** helper (`clean: None`) keeps *state* inside its cache
+///   dir. aura's `snapshots/` are user-saved restore points that `-B` restores
+///   from, and `hashes/` is its build bookkeeping. A wholesale wipe of
+///   `~/.cache/aura` destroys both, so that dir is held back **unconditionally**
+///   — even when the AUR section is not running, because "clean less" beats
+///   "delete the user's restore points".
+/// * Every **command-driven** helper is merely *deferred*: its own `-Sc` cleans
+///   the same dir, so we skip it here only when the AUR section will actually
+///   run. Under `--cache` alone (or `--all --skip aur`) nothing else would touch
+///   it, so it is cleaned here as before — deferring never means "nobody cleans
+///   it".
+fn protected_cache_names(
+    cache_base: &Path,
+    helpers: &[AurHelper],
+    aur_running: bool,
+) -> Vec<String> {
     let mut names: Vec<String> = all_protected_dirs().iter().map(|s| s.to_string()).collect();
+    names.extend(
+        helpers
+            .iter()
+            .filter(|h| aur_running || h.clean.is_none())
+            .map(|h| h.bin.to_string()),
+    );
     for var in ["HF_HOME", "HF_HUB_CACHE"] {
         if let Ok(val) = std::env::var(var) {
             if val.is_empty() {
@@ -330,7 +375,18 @@ fn skipped_has_dev_cache(skipped: &[String]) -> bool {
         .any(|name| PROTECTED_DEV_DIRS.contains(&name.as_str()))
 }
 
-pub fn user_cache(dry_run: bool) -> u64 {
+/// True if any of the spared entries belongs to a hand-pruned helper (i.e. one
+/// with no clean command). We only print the hint when the AUR section is not
+/// running, so the user knows why we touched less than expected.
+fn skipped_has_hand_pruned_helper(skipped: &[String], helpers: &[AurHelper]) -> bool {
+    skipped.iter().any(|name| {
+        helpers
+            .iter()
+            .any(|h| h.bin == name.as_str() && h.clean.is_none())
+    })
+}
+
+pub fn user_cache(dry_run: bool, helpers: &[AurHelper], aur_running: bool) -> u64 {
     utils::section("User Cache");
 
     let cache = match user_cache_base() {
@@ -351,7 +407,7 @@ pub fn user_cache(dry_run: bool) -> u64 {
     // torch) and dev-tool caches that `--dev` manages deliberately with the
     // right per-tool commands. A blanket wipe here would silently destroy a
     // 40 GB model download — those belong to `--dev`, not `--cache`.
-    let protected = protected_cache_names(&cache);
+    let protected = protected_cache_names(&cache, helpers, aur_running);
     let (to_clean, skipped) = partition_cache_entries(&cache, &protected);
 
     // Only announce the skip when a dev-tool cache was actually spared, and
@@ -362,7 +418,29 @@ pub fn user_cache(dry_run: bool) -> u64 {
         utils::skip("Some dev-tool caches skipped — remove them with --dev");
     }
 
-    let clean_size: u64 = to_clean.iter().map(|p| entry_size(p)).sum();
+    // A hand-pruned helper's cache dir is held back even when the AUR section
+    // is not running, because it stores state (aura's snapshots) that only that
+    // section knows how to step around. Say so, or `--cache` looks like it
+    // silently ignored a directory.
+    if !aur_running && skipped_has_hand_pruned_helper(&skipped, helpers) {
+        utils::skip("AUR helper cache skipped — clean it with --aur");
+    }
+
+    // Size every entry ONCE and carry the number forward. `entry_size` is a
+    // recursive stat-walk, and `~/.cache` is usually the deepest tree we touch
+    // (browser caches run to hundreds of thousands of small files) — walking it
+    // to total up and then re-walking each entry to attribute freed bytes made
+    // the most expensive step in the run cost exactly double, which is very
+    // noticeable on a spinning disk.
+    let sized: Vec<(PathBuf, u64)> = to_clean
+        .into_iter()
+        .map(|p| {
+            let size = entry_size(&p);
+            (p, size)
+        })
+        .collect();
+
+    let clean_size: u64 = sized.iter().map(|(_, size)| size).sum();
     if clean_size == 0 {
         utils::success("Already clean");
         return 0;
@@ -377,8 +455,7 @@ pub fn user_cache(dry_run: bool) -> u64 {
     }
 
     let mut freed = 0u64;
-    for path in &to_clean {
-        let size = entry_size(path);
+    for (path, size) in &sized {
         let ok = if path.is_dir() && !path.is_symlink() {
             std::fs::remove_dir_all(path).is_ok()
         } else {
@@ -406,7 +483,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
             utils::info("[DRY RUN] Would run: rpm-ostree cleanup -bm");
             return 0;
         }
-        if utils::sudo("rpm-ostree", &["cleanup", "-bm"]) {
+        if utils::sudo_quiet("rpm-ostree", &["cleanup", "-bm"]) {
             utils::success("rpm-ostree cleaned (base deployments + cached metadata)");
         } else {
             utils::error("rpm-ostree cleanup failed");
@@ -463,7 +540,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
             // see https://forum.endeavouros.com/t/error-cleaning-package-cache/73965
             cleanup_pacman_partial_downloads();
 
-            if utils::sudo("pacman", &["-Sc", "--noconfirm"]) {
+            if utils::sudo_quiet("pacman", &["-Sc", "--noconfirm"]) {
                 utils::success("pacman cache cleaned");
             } else {
                 utils::error("pacman -Sc failed");
@@ -473,7 +550,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 yes,
                 "Run pacman -Scc? (removes ALL cached packages) [y/N]:",
             ) {
-                if utils::sudo("pacman", &["-Scc", "--noconfirm"]) {
+                if utils::sudo_quiet("pacman", &["-Scc", "--noconfirm"]) {
                     utils::success("pacman deep clean done");
                 } else {
                     utils::error("pacman -Scc failed");
@@ -482,7 +559,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Debian => {
-            if utils::sudo("apt-get", &["clean"]) {
+            if utils::sudo_quiet("apt-get", &["clean"]) {
                 utils::success("apt cache cleaned");
             } else {
                 utils::error("apt-get clean failed");
@@ -492,7 +569,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 yes,
                 "Run apt autoclean? (removes outdated debs) [y/N]:",
             ) {
-                if utils::sudo("apt-get", &["autoclean", "-y"]) {
+                if utils::sudo_quiet("apt-get", &["autoclean", "-y"]) {
                     utils::success("autoclean done");
                 } else {
                     utils::error("autoclean failed");
@@ -502,7 +579,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
 
         Distro::Fedora => {
             let pm = if utils::which("dnf") { "dnf" } else { "yum" };
-            if utils::sudo(pm, &["clean", "all"]) {
+            if utils::sudo_quiet(pm, &["clean", "all"]) {
                 utils::success(&format!("{} cache cleaned", pm));
             } else {
                 utils::error(&format!("{} clean failed", pm));
@@ -510,7 +587,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Suse => {
-            if utils::sudo("zypper", &["clean", "--all"]) {
+            if utils::sudo_quiet("zypper", &["clean", "--all"]) {
                 utils::success("zypper cache cleaned");
             } else {
                 utils::error("zypper clean failed");
@@ -539,7 +616,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Void => {
-            if utils::sudo("xbps-remove", &["-O", "-y"]) {
+            if utils::sudo_quiet("xbps-remove", &["-O", "-y"]) {
                 utils::success("xbps cache cleaned");
             } else {
                 utils::error("xbps-remove -O failed");
@@ -547,13 +624,13 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Alpine => {
-            if utils::sudo("apk", &["cache", "clean"]) {
+            if utils::sudo_quiet("apk", &["cache", "clean"]) {
                 utils::success("apk cache cleaned");
             } else {
                 utils::warning("apk cache clean failed");
                 let apk_cache = PathBuf::from("/var/cache/apk");
                 if apk_cache.exists() {
-                    utils::sudo("find", &["/var/cache/apk", "-type", "f", "-delete"]);
+                    utils::sudo_quiet("find", &["/var/cache/apk", "-type", "f", "-delete"]);
                     utils::success("apk cache directory cleaned");
                 }
             }
@@ -561,13 +638,13 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
 
         Distro::Gentoo => {
             if utils::which("eclean") {
-                if utils::sudo("eclean", &["distfiles"]) {
+                if utils::sudo_quiet("eclean", &["distfiles"]) {
                     utils::success("Distfiles cleaned");
                 } else {
                     utils::error("eclean distfiles failed");
                 }
                 if should_deep(deep, yes, "Also clean binary packages? [y/N]:")
-                    && utils::sudo("eclean", &["packages"])
+                    && utils::sudo_quiet("eclean", &["packages"])
                 {
                     utils::success("Binary packages cleaned");
                 }
@@ -575,7 +652,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 utils::warning("eclean not found — install app-portage/gentoolkit");
                 let distfiles = PathBuf::from("/var/cache/distfiles");
                 if distfiles.exists() {
-                    utils::sudo("find", &["/var/cache/distfiles", "-type", "f", "-delete"]);
+                    utils::sudo_quiet("find", &["/var/cache/distfiles", "-type", "f", "-delete"]);
                     utils::success("Distfiles cleaned");
                 }
             }
@@ -587,7 +664,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Solus => {
-            if utils::sudo("eopkg", &["delete-cache"]) {
+            if utils::sudo_quiet("eopkg", &["delete-cache"]) {
                 utils::success("eopkg cache cleaned");
             } else {
                 utils::error("eopkg delete-cache failed");
@@ -605,7 +682,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 if deep {
                     args.push("--all");
                 }
-                if utils::sudo("swupd", &args) {
+                if utils::sudo_quiet("swupd", &args) {
                     utils::success("swupd cache cleaned");
                 } else {
                     utils::error("swupd clean failed");
@@ -808,56 +885,134 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
     0
 }
 
-pub fn aur_cache(helper: &str, deep: bool, dry_run: bool, yes: bool) -> u64 {
+/// Clean the cache of every installed AUR helper.
+///
+/// One line per helper with its own freed figure, rather than a single merged
+/// total: if a helper stops cleaning properly, a permanently-zero line next to
+/// a working one makes that visible immediately, where a combined number would
+/// hide it.
+pub fn aur_cache(helpers: &[AurHelper], deep: bool, dry_run: bool, yes: bool) -> u64 {
     utils::section("AUR Cache");
 
-    if dry_run {
-        utils::info(&format!(
-            "[DRY RUN] Would run: {} -Sc{}",
-            helper,
-            if deep { "c" } else { "" }
-        ));
+    if helpers.is_empty() {
+        utils::skip("No AUR helper found — skipped");
         return 0;
     }
 
-    let cache_dir = utils::home_dir().map(|h| PathBuf::from(&h).join(".cache").join(helper));
-    let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
-
-    // AUR helpers (paru, yay, …) clean the shared pacman cache too, so the same
-    // partial-download leftovers would make them print the `Error reading fd 7`
-    // noise. Sweep them first — see `cleanup_pacman_partial_downloads`.
-    cleanup_pacman_partial_downloads();
-
-    if utils::run(helper, &["-Sc", "--noconfirm"]) {
-        utils::success(&format!("{} cache cleaned", helper));
-    } else {
-        utils::error(&format!("{} -Sc failed", helper));
+    if dry_run {
+        for h in helpers {
+            match if deep { h.deep_clean } else { h.clean } {
+                Some(args) => utils::info(&format!(
+                    "[DRY RUN] Would run: {} {}",
+                    h.bin,
+                    args.join(" ")
+                )),
+                None => {
+                    for dir in prune_targets(h, deep) {
+                        utils::info(&format!("[DRY RUN] Would clear: {}/{}", h.bin, dir));
+                    }
+                }
+            }
+        }
+        return 0;
     }
 
-    if should_deep(
-        deep,
-        yes,
-        &format!(
-            "Run {} -Scc? (removes ALL cached AUR packages) [y/N]:",
-            helper
-        ),
-    ) {
-        if utils::run(helper, &["-Scc", "--noconfirm"]) {
-            utils::success(&format!("{} deep clean done", helper));
-        } else {
-            utils::error(&format!("{} -Scc failed", helper));
+    // Every helper cleans the shared pacman cache as well, so an interrupted
+    // download's leftovers would make each of them print the `Error reading
+    // fd 7` noise. One sweep up front covers all of them —
+    // see `cleanup_pacman_partial_downloads`.
+    cleanup_pacman_partial_downloads();
+
+    helpers.iter().map(|h| clean_one_helper(h, deep, yes)).sum()
+}
+
+/// The helper's own cache directory. Goes through [`user_cache_base`] so
+/// `XDG_CACHE_HOME` is honoured — building `~/.cache` by hand here would miss a
+/// relocated cache and report 0 B freed on every run.
+fn helper_cache_dir(h: &AurHelper) -> Option<PathBuf> {
+    user_cache_base().map(|base| base.join(h.bin))
+}
+
+/// Subdirectories to clear for a helper we prune by hand. The re-download-
+/// costing ones are only included under `--deep`, matching how `--dev` gates
+/// its own caches.
+fn prune_targets(h: &AurHelper, deep: bool) -> Vec<&'static str> {
+    let mut dirs: Vec<&'static str> = h.prune_dirs.to_vec();
+    if deep {
+        dirs.extend_from_slice(h.prune_dirs_deep);
+    }
+    dirs
+}
+
+/// Clean a single helper and report its result. Split out so the per-helper
+/// loop above stays readable.
+fn clean_one_helper(h: &AurHelper, deep: bool, yes: bool) -> u64 {
+    let cache_dir = helper_cache_dir(h);
+    let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
+
+    match h.clean {
+        // Helpers with a real clean command: let the helper do it, so its own
+        // bookkeeping stays consistent.
+        Some(args) => {
+            if !utils::run_quiet(h.bin, args) {
+                utils::error(&format!("{} {} failed", h.bin, args.join(" ")));
+                return 0;
+            }
+            if let Some(deep_args) = h.deep_clean {
+                if should_deep(
+                    deep,
+                    yes,
+                    &format!(
+                        "Run {} {}? (removes ALL cached AUR packages) [y/N]:",
+                        h.bin,
+                        deep_args.join(" ")
+                    ),
+                ) && !utils::run_quiet(h.bin, deep_args)
+                {
+                    utils::error(&format!("{} {} failed", h.bin, deep_args.join(" ")));
+                }
+            }
+        }
+        // Helpers with no usable clean command (aura): clear the specific
+        // build/tarball subdirectories ourselves. Never the whole cache dir —
+        // that would take `snapshots/` with it.
+        None => {
+            let Some(base) = cache_dir.as_ref() else {
+                utils::error(&format!("{}: cannot determine cache directory", h.bin));
+                return 0;
+            };
+            for dir in prune_targets(h, deep) {
+                let target = base.join(dir);
+                if target.is_dir() {
+                    utils::rm_contents(&target);
+                }
+            }
         }
     }
 
     let size_after = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
     let freed = size_before.saturating_sub(size_after);
     if freed > 0 {
-        utils::info(&format!(
-            "AUR cache freed: {}",
+        utils::success(&format!(
+            "{} — freed {}",
+            h.bin,
             utils::format_size(freed).green()
         ));
+    } else {
+        utils::success(&format!("{} — already clean", h.bin));
     }
     freed
+}
+
+/// Number of installed Flatpak refs across both the user and system
+/// installations. `--columns=ref` keeps the output one machine-stable token per
+/// line, with no header, so counting non-empty lines is enough. A failed or
+/// missing `flatpak` yields 0, which makes the caller's before/after difference
+/// 0 — it reports "no unused runtimes" rather than inventing a count.
+fn flatpak_ref_count() -> usize {
+    utils::capture("flatpak", &["list", "--columns=ref"])
+        .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
 }
 
 pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
@@ -871,16 +1026,28 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
         return 0;
     }
 
-    utils::info("Removing unused Flatpak runtimes (user)...");
-    utils::run("flatpak", &["uninstall", "--unused", "-y"]);
+    // Count installed refs around the uninstall instead of reading flatpak's
+    // own words. "Nothing unused to uninstall" is a translated string, so
+    // matching it would silently stop working outside an English locale;
+    // counting lines works everywhere. Both scopes are collapsed into one
+    // number because the user/system split is an implementation detail — what
+    // they want to know is how many runtimes went away.
+    let before = flatpak_ref_count();
 
-    utils::info("Removing unused Flatpak runtimes (system)...");
-    utils::sudo("flatpak", &["uninstall", "--unused", "-y"]);
+    utils::run_quiet("flatpak", &["uninstall", "--unused", "-y"]);
+    utils::sudo_quiet("flatpak", &["uninstall", "--unused", "-y"]);
+
+    match before.saturating_sub(flatpak_ref_count()) {
+        0 => utils::success("No unused runtimes"),
+        n => utils::success(&format!("Removed {} unused runtime(s)", n)),
+    }
 
     if deep {
-        utils::info("Repairing Flatpak installation (deep mode)...");
-        utils::sudo("flatpak", &["repair"]);
-        utils::success("Flatpak repair done");
+        if utils::sudo_quiet("flatpak", &["repair"]) {
+            utils::success("Flatpak installation repaired");
+        } else {
+            utils::error("Flatpak repair failed");
+        }
     }
 
     let mut freed = 0u64;
@@ -894,7 +1061,7 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
         }
     }
 
-    utils::sudo(
+    utils::sudo_quiet(
         "find",
         &[
             "/var/tmp",
@@ -910,16 +1077,16 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
 
     let sys_fp_tmp = PathBuf::from("/var/lib/flatpak/repo/tmp");
     if sys_fp_tmp.exists() {
-        utils::sudo(
+        utils::sudo_quiet(
             "find",
             &["/var/lib/flatpak/repo/tmp", "-mindepth", "1", "-delete"],
         );
     }
 
+    // The runtime count above is already this section's result line, so only
+    // add a second one when the tmp-dir sweep actually reclaimed something.
     if freed > 0 {
         utils::success(&format!("Freed {}", utils::format_size(freed).green()));
-    } else {
-        utils::success("Flatpak cleanup done");
     }
 
     freed
@@ -953,7 +1120,7 @@ pub fn snap(dry_run: bool) -> u64 {
         utils::info(&format!("Found {} disabled revision(s)", disabled.len()));
         for (name, rev) in &disabled {
             utils::info(&format!("Removing {} (rev {})...", name, rev));
-            if utils::sudo("snap", &["remove", name, "--revision", rev]) {
+            if utils::sudo_quiet("snap", &["remove", name, "--revision", rev]) {
                 utils::success(&format!("Removed {} rev {}", name, rev));
             } else {
                 utils::error(&format!("Failed to remove {} rev {}", name, rev));
@@ -966,13 +1133,56 @@ pub fn snap(dry_run: bool) -> u64 {
     if snap_cache.exists() {
         let size = utils::dir_size(&snap_cache);
         if size > 0 {
-            utils::sudo("find", &["/var/lib/snapd/cache", "-type", "f", "-delete"]);
+            utils::sudo_quiet("find", &["/var/lib/snapd/cache", "-type", "f", "-delete"]);
             freed += size;
             utils::success(&format!("Freed {}", utils::format_size(size).green()));
         }
     }
 
     freed
+}
+
+/// How much journal we keep. `journalctl --vacuum-size` takes the suffixed
+/// form; the byte value is what we compare the current usage against.
+const JOURNAL_LIMIT: &str = "50M";
+const JOURNAL_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Pull the byte count out of `journalctl --disk-usage`.
+///
+/// The command answers with a whole sentence — "Archived and active journals
+/// take up 48.1M in the file system." — so the old code printed that sentence
+/// verbatim after its own "Current usage:" label, which read as duplicated and
+/// swallowed most of the line width.
+///
+/// We scan for the first token that looks like a size (digits, optional
+/// decimal, optional unit suffix) rather than matching the sentence, because
+/// systemd translates its output: on a non-English locale the words change but
+/// the number does not. Anything we cannot parse returns `None`, and the caller
+/// then vacuums unconditionally — exactly the old behaviour, so a locale we
+/// did not anticipate degrades to correct-but-chattier rather than to wrong.
+fn parse_journal_usage(text: &str) -> Option<u64> {
+    for token in text.split_whitespace() {
+        let token = token.trim_end_matches(['.', ',']);
+        let split = token.find(|c: char| !c.is_ascii_digit() && c != '.');
+        let (num, unit) = match split {
+            Some(i) => token.split_at(i),
+            None => (token, ""),
+        };
+        let value: f64 = match num.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let multiplier = match unit {
+            "" | "B" => 1.0,
+            "K" | "KB" | "KiB" => 1024.0,
+            "M" | "MB" | "MiB" => 1024.0 * 1024.0,
+            "G" | "GB" | "GiB" => 1024.0 * 1024.0 * 1024.0,
+            "T" | "TB" | "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+            _ => continue,
+        };
+        return Some((value * multiplier) as u64);
+    }
+    None
 }
 
 pub fn journal(dry_run: bool) -> u64 {
@@ -983,32 +1193,66 @@ pub fn journal(dry_run: bool) -> u64 {
         return 0;
     }
 
-    if let Some(usage) = utils::capture("journalctl", &["--disk-usage"]) {
-        utils::info(&format!("Current usage: {}", usage));
+    let raw_usage = utils::capture("journalctl", &["--disk-usage"]);
+    let usage_bytes = raw_usage.as_deref().and_then(parse_journal_usage);
+    let usage_label = usage_bytes.map(utils::format_size);
+
+    // `--vacuum-size` bounds the *archived* journals, and `--disk-usage`
+    // reports archived + active. So a total already under the limit guarantees
+    // the archived part is too, and the vacuum provably has nothing to do.
+    // Skipping it saves a privileged subprocess and three lines of
+    // "freed 0B of archived journals from ..." that told the user nothing.
+    if let (Some(bytes), Some(label)) = (usage_bytes, &usage_label) {
+        if bytes <= JOURNAL_LIMIT_BYTES {
+            utils::success(&format!(
+                "Already under {} ({}) — nothing to vacuum",
+                JOURNAL_LIMIT, label
+            ));
+            return 0;
+        }
     }
 
     if dry_run {
-        utils::info("[DRY RUN] Would vacuum journal to 50M");
+        match &usage_label {
+            Some(label) => utils::info(&format!(
+                "[DRY RUN] Would vacuum journal to {} (currently {})",
+                JOURNAL_LIMIT, label
+            )),
+            None => utils::info(&format!(
+                "[DRY RUN] Would vacuum journal to {}",
+                JOURNAL_LIMIT
+            )),
+        }
         return 0;
     }
 
     let journal_dir = PathBuf::from("/var/log/journal");
     let size_before = utils::dir_size(&journal_dir);
 
-    utils::info("Vacuuming journal (keeping 50M)...");
-    if utils::sudo("journalctl", &["--vacuum-size=50M"]) {
-        utils::success("Journal vacuumed");
-    } else {
+    if !utils::sudo_quiet("journalctl", &[&format!("--vacuum-size={}", JOURNAL_LIMIT)]) {
         utils::error("Journal vacuum failed");
+        return 0;
     }
 
     let size_after = utils::dir_size(&journal_dir);
     let freed = size_before.saturating_sub(size_after);
+
+    // `/var/log/journal` is root-owned and typically unreadable to us, so
+    // `dir_size` returns 0 and the difference is 0 even when the vacuum did
+    // remove data. Report the measurement only when we actually have one.
     if freed > 0 {
-        utils::info(&format!(
-            "Journal freed: {}",
+        utils::success(&format!(
+            "Vacuumed to {} — freed {}",
+            JOURNAL_LIMIT,
             utils::format_size(freed).green()
         ));
+    } else {
+        match &usage_label {
+            Some(label) => {
+                utils::success(&format!("Vacuumed to {} (was {})", JOURNAL_LIMIT, label))
+            }
+            None => utils::success(&format!("Vacuumed to {}", JOURNAL_LIMIT)),
+        }
     }
     freed
 }
@@ -1118,7 +1362,7 @@ pub fn coredumps(dry_run: bool) -> u64 {
         } else {
             // Direct file removal — the only portable method. `coredumpctl`
             // has no `delete` verb on current systemd, so it can't be relied on.
-            utils::sudo(
+            utils::sudo_quiet(
                 "find",
                 &["/var/lib/systemd/coredump", "-type", "f", "-delete"],
             );
@@ -1147,7 +1391,7 @@ pub fn coredumps(dry_run: bool) -> u64 {
         } else {
             // -maxdepth 1 -type f: top-level report files only, never the
             // dated kdump subdirectories.
-            utils::sudo(
+            utils::sudo_quiet(
                 "find",
                 &["/var/crash", "-maxdepth", "1", "-type", "f", "-delete"],
             );
@@ -1308,6 +1552,123 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── journal usage parsing ──
+
+    #[test]
+    fn test_parse_journal_usage_real_output() {
+        // The exact sentence journalctl prints on an English locale.
+        let text = "Archived and active journals take up 48.1M in the file system.";
+        let bytes = parse_journal_usage(text).expect("should parse 48.1M");
+        assert_eq!(bytes, (48.1 * 1024.0 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn test_parse_journal_usage_units() {
+        assert_eq!(parse_journal_usage("takes up 512B here"), Some(512));
+        assert_eq!(parse_journal_usage("takes up 2K here"), Some(2 * 1024));
+        assert_eq!(
+            parse_journal_usage("takes up 1.5G here"),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
+        // Trailing punctuation must not defeat the unit lookup.
+        assert_eq!(parse_journal_usage("up to 4M."), Some(4 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_parse_journal_usage_unparseable_is_none() {
+        // A translated or unexpected line must yield None so the caller
+        // vacuums unconditionally rather than wrongly deciding it can skip.
+        assert_eq!(parse_journal_usage(""), None);
+        assert_eq!(parse_journal_usage("no numbers at all here"), None);
+        // A bare number with an unknown suffix is not a size we understand.
+        assert_eq!(parse_journal_usage("12Q of something"), None);
+    }
+
+    #[test]
+    fn test_journal_skip_threshold_matches_limit_string() {
+        // The byte constant and the string handed to --vacuum-size must agree,
+        // or we would skip the vacuum against one limit while journalctl
+        // enforces another.
+        assert_eq!(
+            parse_journal_usage(JOURNAL_LIMIT),
+            Some(JOURNAL_LIMIT_BYTES)
+        );
+    }
+
+    #[test]
+    fn test_aur_deferral_never_strands_a_cache() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("oxiclean_defer_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("paru")).unwrap();
+        fs::write(base.join("paru/clone.tar"), vec![0u8; 4096]).unwrap();
+        fs::create_dir_all(base.join("aura/snapshots")).unwrap();
+        fs::write(base.join("aura/snapshots/restore.json"), vec![0u8; 512]).unwrap();
+
+        let paru = crate::detect::AurHelper {
+            bin: "paru",
+            clean: Some(&["-Sc", "--noconfirm"]),
+            deep_clean: Some(&["-Scc", "--noconfirm"]),
+            prune_dirs: &[],
+            prune_dirs_deep: &[],
+        };
+        let aura = crate::detect::AurHelper {
+            bin: "aura",
+            clean: None,
+            deep_clean: None,
+            prune_dirs: &["builds"],
+            prune_dirs_deep: &["cache", "packages"],
+        };
+        let helpers = [paru, aura];
+
+        // AUR section running → paru's dir is deferred to it, not deleted here.
+        let names = protected_cache_names(&base, &helpers, true);
+        let (to_clean, skipped) = partition_cache_entries(&base, &names);
+        assert!(skipped.iter().any(|n| n == "paru"));
+        assert!(!to_clean.iter().any(|p| p.ends_with("paru")));
+
+        // AUR section NOT running (--cache alone, or --all --skip aur) → nobody
+        // else would ever clean paru's dir, so user_cache must still take it.
+        // This is the half that makes deferral safe rather than a silent leak.
+        let names = protected_cache_names(&base, &helpers, false);
+        let (to_clean, skipped) = partition_cache_entries(&base, &names);
+        assert!(!skipped.iter().any(|n| n == "paru"));
+        assert!(to_clean.iter().any(|p| p.ends_with("paru")));
+
+        // aura is different: its cache dir holds `snapshots/` (user restore
+        // points), so a blanket wipe would destroy state no cleaner should
+        // touch. It must be held back in BOTH modes — including the one where
+        // the AUR section is not running and nothing else will clean it.
+        // Cleaning less is the right trade against deleting restore points.
+        for aur_running in [true, false] {
+            let names = protected_cache_names(&base, &helpers, aur_running);
+            let (to_clean, skipped) = partition_cache_entries(&base, &names);
+            assert!(
+                skipped.iter().any(|n| n == "aura"),
+                "aura cache dir must never be wiped wholesale (aur_running={})",
+                aur_running
+            );
+            assert!(!to_clean.iter().any(|p| p.ends_with("aura")));
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_prune_targets_gate_redownload_dirs_behind_deep() {
+        let aura = crate::detect::AurHelper {
+            bin: "aura",
+            clean: None,
+            deep_clean: None,
+            prune_dirs: &["builds"],
+            prune_dirs_deep: &["cache"],
+        };
+        // Safe run touches build leftovers only; the tarball cache (which costs
+        // a rebuild/re-download) waits for --deep.
+        assert_eq!(prune_targets(&aura, false), vec!["builds"]);
+        assert_eq!(prune_targets(&aura, true), vec!["builds", "cache"]);
+    }
 
     // ── should_deep: destructive behaviour — must not surprise the user ──
 
@@ -1471,7 +1832,7 @@ mod tests {
         fs::create_dir_all(base.join("mozilla")).unwrap();
         fs::write(base.join("mozilla/thumb.png"), b"junk").unwrap();
 
-        let protected = protected_cache_names(&base);
+        let protected = protected_cache_names(&base, &[], false);
         let (to_clean, skipped) = partition_cache_entries(&base, &protected);
 
         let clean_names: Vec<String> = to_clean

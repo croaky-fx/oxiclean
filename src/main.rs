@@ -9,14 +9,14 @@ use clap_complete::aot::{generate, Shell};
 use colored::Colorize;
 use std::time::Instant;
 
-use crate::detect::{DiskType, Distro, Privilege};
+use crate::detect::{AurHelper, DiskType, Distro, Privilege};
 
 /// Everything we detect once at startup. Keeping it in one struct avoids
 /// threading six separate parameters through `main()` and the cleanup calls.
 struct SystemInfo {
     pretty_name: String,
     distro: Distro,
-    aur_helper: Option<&'static str>,
+    aur_helpers: Vec<AurHelper>,
     has_flatpak: bool,
     has_snap: bool,
     has_nix: bool,
@@ -29,12 +29,12 @@ impl SystemInfo {
         Self {
             pretty_name: detect::pretty_name(),
             distro: detect::distro(),
-            aur_helper: {
+            aur_helpers: {
                 // AUR helpers are only meaningful on Arch-family distros.
                 if detect::distro() == Distro::Arch {
-                    detect::aur_helper()
+                    detect::aur_helpers()
                 } else {
-                    None
+                    Vec::new()
                 }
             },
             has_flatpak: detect::has_flatpak(),
@@ -153,6 +153,16 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Show raw helper command output (captured by default)
+    ///
+    /// Helpers like pacman, paru, flatpak and journalctl each print several
+    /// lines of their own; that output is captured so the report stays
+    /// readable. A command that fails replays its stderr either way, so this is
+    /// for debugging a package manager that is misbehaving. Ignored with --json,
+    /// which must own stdout.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
     /// Print shell completion script to stdout and exit.
     /// Supported values come from clap_complete (bash, zsh, fish, elvish, powershell).
     #[arg(long = "generate-completion", value_name = "SHELL")]
@@ -260,6 +270,13 @@ impl Ops {
     }
 
     /// True if any selected operation needs elevated privileges.
+    /// Operations that will reach for root at some point, so `main()` can cache
+    /// credentials up front while it still owns the terminal.
+    ///
+    /// `aur` belongs here even though it looks user-level: an AUR helper's `-Sc`
+    /// clears the *shared* pacman cache and calls `sudo` itself, and we sweep
+    /// root-owned partial downloads out of the way first. Without the up-front
+    /// prompt those calls hit a terminal that is no longer theirs to read from.
     fn needs_sudo(&self) -> bool {
         self.packages
             || self.orphans
@@ -268,6 +285,7 @@ impl Ops {
             || self.snap
             || self.trim
             || self.coredumps
+            || self.aur
     }
 }
 
@@ -286,6 +304,9 @@ fn main() {
     // (only the final JSON object reaches stdout) and forces non-interactive.
     utils::set_quiet(cli.quiet);
     utils::set_json(cli.json);
+    // --json must own stdout completely, so it beats --verbose: a machine
+    // consumer parsing one JSON line cannot also receive pacman's chatter.
+    utils::set_verbose(cli.verbose && !cli.json);
 
     // Self-update is a standalone mode — it ignores the cleanup flags.
     if cli.update {
@@ -347,8 +368,9 @@ fn main() {
             sys.distro.name().cyan(),
             sys.distro.pkg_manager().dimmed()
         );
-        if let Some(h) = sys.aur_helper {
-            println!("  {} {}", "AUR:".white().bold(), h.cyan());
+        if !sys.aur_helpers.is_empty() {
+            let names: Vec<&str> = sys.aur_helpers.iter().map(|h| h.bin).collect();
+            println!("  {} {}", "AUR:".white().bold(), names.join(", ").cyan());
         }
         if sys.has_flatpak {
             println!("  {} {}", "Flatpak:".white().bold(), "detected ✔".green());
@@ -424,7 +446,13 @@ fn main() {
     };
 
     if ops.cache {
-        let f = clean::user_cache(cli.dry_run);
+        // The helper list always goes in; `ops.aur` says whether the AUR section
+        // will run. A command-driven helper's dir is deferred to that section
+        // only when it runs, so the freed bytes land under the right heading
+        // without ever leaving the dir uncleaned. A hand-pruned helper's dir is
+        // held back either way — it stores state (aura's snapshots) that a
+        // wholesale wipe would destroy.
+        let f = clean::user_cache(cli.dry_run, &sys.aur_helpers, ops.aur);
         record("cache", f, &mut total_freed, &mut results);
     }
 
@@ -449,12 +477,9 @@ fn main() {
     if ops.aur {
         let mut f = 0u64;
         if sys.distro == Distro::Arch {
-            if let Some(helper) = sys.aur_helper {
-                f = clean::aur_cache(helper, cli.deep, cli.dry_run, yes);
-            } else {
-                utils::section("AUR Cache");
-                utils::skip("No AUR helper found (paru, yay, trizen...)");
-            }
+            // Empty-list handling lives in aur_cache so the skip line is
+            // worded in one place.
+            f = clean::aur_cache(&sys.aur_helpers, cli.deep, cli.dry_run, yes);
         } else if cli.aur {
             utils::section("AUR Cache");
             utils::skip("Not an Arch-based system — skipped");

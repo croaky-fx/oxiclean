@@ -1,5 +1,95 @@
 # Changelog
 
+## [1.7.0] - 2026-08-09
+
+### Changed
+- **The report is the output again.** Every helper we drive — pacman, the AUR
+  helpers, flatpak, journalctl — printed its own several lines into the middle
+  of the report. A full `--all` run was around 62 lines, of which roughly 35
+  belonged to other programs, so the section results they were meant to
+  summarise got buried. Their output is now captured instead of inherited: on
+  success nothing is printed, and on **failure** the captured stderr is replayed
+  under the error line, which is strictly more visible than before — an error
+  used to scroll past inside a screenful of unrelated success chatter. The same
+  run is now about 33 lines.
+
+  Three kinds of command deliberately still print: package *removal*
+  (`pacman -Rns`, `apt-get autoremove`, `emerge --depclean`, …), which is slow
+  enough that silence would read as a hang; Nix garbage collection, for the same
+  reason; and `fstrim --verbose`, whose output *is* the result.
+- **Journal skips work it cannot do.** `--vacuum-size` bounds the archived
+  journals and `--disk-usage` reports archived + active, so a total already under
+  the limit proves there is nothing to vacuum. That case now says so in one line
+  instead of spawning a privileged subprocess and printing three
+  `freed 0B of archived journals from …` lines. The usage figure is parsed out of
+  journalctl's sentence rather than echoed whole; systemd translates that
+  sentence, so an unrecognised locale falls back to vacuuming unconditionally —
+  the old behaviour — rather than guessing.
+- **Flatpak reports what changed.** It counted on flatpak's English
+  "Nothing unused to uninstall" text; it now counts installed refs before and
+  after, which works in any locale and yields a better line
+  (`No unused runtimes` / `Removed 3 unused runtime(s)`).
+- **AUR helper caches are attributed to the AUR section.** `--all` runs
+  `--cache` first, and `~/.cache/paru` is under `~/.cache`, so the helper's cache
+  was deleted there and counted as user cache — leaving the AUR section to
+  measure an already-empty directory and always report `already clean`, on every
+  machine, no matter how large the cache was. A helper with its own clean command
+  is now left to the AUR section when that section is going to run; when it is
+  not (`--cache` alone, or `--all --skip aur`) it is cleaned in place as before,
+  so deferring never means nobody cleans it.
+
+  A helper that we prune by hand instead (aura) is held back **unconditionally**,
+  because its cache directory also holds state — see below.
+
+### Added
+- **`--verbose` / `-v`.** Restores the raw helper output that is now captured by
+  default — the escape hatch for debugging a package manager that is
+  misbehaving. Ignored with `--json`, which must own stdout.
+
+### Fixed
+- **Every installed AUR helper is cleaned, not just one.** Helper detection took
+  the first match from a hard-coded list, so the *array order* silently decided
+  the winner: with both paru and yay installed, paru won for no reason beyond
+  being written first, and yay's cache was never touched on any machine. Having
+  two helpers installed and using one is common, and the unused one keeps
+  accumulating clone and build caches. All of them are cleaned now, one result
+  line each, so a helper that stops working is visible next to one that works.
+- **trizen no longer wipes the whole pacman cache on a normal run.** Its `-Sc`
+  cleans trizen's cache *and* pacman's, via `pacman -Scc` — which removes every
+  cached package including currently-installed ones. That is the aggressive
+  behaviour `--deep` exists to gate, and it was also redundant with the
+  `pacman -Sc` run moments earlier. It now uses `-Sca`, which scopes the clean to
+  trizen's own AUR cache.
+- **aura's cache is actually cleaned, and its restore points are protected.**
+  The previous `-Sc` was passed straight through to pacman (aura is a pacman
+  superset), so it re-cleaned the pacman cache and never touched aura's own. Its
+  `-C` family is the *downgrade* namespace and its `-Cc` takes a mandatory
+  version count while still operating on the pacman cache, so no aura command
+  does this job — the directories are pruned directly instead: `builds/` on a
+  normal run, `cache/` (built tarballs) and `packages/` (AUR git clones) behind
+  `--deep`, since those cost a rebuild or a re-clone.
+
+  Two siblings are never touched, in any mode: `snapshots/` holds the package
+  restore points `aura -B` restores from, and `hashes/` is the bookkeeping that
+  records when each AUR package was last built. Both are state, not cache. Since
+  `~/.cache/aura` mixes cache and state like this, the whole directory is also
+  held back from the blanket `--cache` sweep even when the AUR section is not
+  running — `--cache` alone now says `⊘ AUR helper cache skipped — clean it with
+  --aur` rather than quietly cleaning less than you asked. Cleaning less is the
+  right trade against deleting someone's restore points.
+- **`--aur` acquires privileges up front.** It was missing from the set of
+  operations that request root at startup, even though an AUR helper's `-Sc`
+  clears the shared pacman cache and invokes `sudo` itself, and the partial-
+  download sweep needs root too. The password prompt therefore arrived partway
+  through the run instead of at the beginning.
+- **`~/.cache` is no longer walked twice.** `user_cache` summed every entry's
+  size and then re-measured each one inside the delete loop, so the most
+  expensive step in a run — a recursive walk of the deepest tree we touch — cost
+  exactly double. Noticeable on a spinning disk.
+- **AUR cache paths honour `XDG_CACHE_HOME`.** The helper cache directory was
+  built as `~/.cache/<helper>` by hand, so a relocated cache was measured at the
+  wrong path and every run reported 0 B freed.
+
 ## [1.6.2] - 2026-07-17
 
 ### Fixed

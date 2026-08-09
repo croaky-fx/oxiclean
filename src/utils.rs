@@ -21,6 +21,74 @@ pub fn run(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Run a command without letting its own chatter into our report.
+///
+/// The helpers we drive (`pacman -Sc`, `paru -Sc`, `flatpak uninstall`,
+/// `journalctl --vacuum-size`) each print several lines of their own — on a
+/// full `--all` run that was more foreign output than ours, which buried the
+/// section results the user actually came for.
+///
+/// So we capture instead of inherit. On success nothing is printed: the
+/// caller's own `✔` line is the report. On **failure** the captured stderr is
+/// replayed under the caller's `✘` line, which is strictly better than before —
+/// the error used to scroll past inside 30 lines of unrelated success chatter.
+///
+/// `--verbose` opts back into the raw firehose by delegating to [`run`].
+///
+/// `output()` gives the child a null stdin, which is the behaviour we want: a
+/// helper that unexpectedly wants input fails fast with a captured message we
+/// replay, instead of blocking forever. Inheriting stdin would be worse than it
+/// sounds — the prompt itself goes to stderr, so we'd capture the question and
+/// leave the terminal silently waiting for an answer nobody was asked for.
+/// Privileged calls work because `main()` caches credentials up front via
+/// `acquire_sudo`, which does inherit the terminal.
+pub fn run_quiet(cmd: &str, args: &[&str]) -> bool {
+    if is_verbose() {
+        return run(cmd, args);
+    }
+    match Command::new(cmd).args(args).output() {
+        Ok(out) => {
+            if !out.status.success() {
+                replay_stderr(&out.stderr);
+            }
+            out.status.success()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Print a failed command's captured stderr, indented and dimmed to read as
+/// context under the caller's error line rather than as report content.
+/// Capped at 5 lines — a broken command can emit hundreds, and re-flooding the
+/// report is the exact thing [`run_quiet`] exists to prevent.
+fn replay_stderr(stderr: &[u8]) {
+    if silent() {
+        return;
+    }
+    let text = String::from_utf8_lossy(stderr);
+    for line in text.lines().filter(|l| !l.trim().is_empty()).take(5) {
+        println!("      {}", line.dimmed());
+    }
+}
+
+/// [`run_quiet`] with privilege escalation. Mirrors [`elevate`]'s dispatch.
+pub fn elevate_quiet(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
+    match privilege {
+        Privilege::Root => run_quiet(cmd, args),
+        Privilege::Sudo | Privilege::Doas => {
+            let mut a = vec![cmd];
+            a.extend_from_slice(args);
+            run_quiet(privilege.name(), &a)
+        }
+        Privilege::None => false,
+    }
+}
+
+/// Quiet counterpart to [`sudo`], using the helper detected at startup.
+pub fn sudo_quiet(cmd: &str, args: &[&str]) -> bool {
+    elevate_quiet(current_privilege(), cmd, args)
+}
+
 // ══════════════════════════════════════════════════
 //  Privilege Escalation
 // ══════════════════════════════════════════════════
@@ -46,6 +114,12 @@ static QUIET: OnceLock<bool> = OnceLock::new();
 /// forces [`confirm`] to decline, so a stray prompt can never block a
 /// non-interactive run.
 static JSON: OnceLock<bool> = OnceLock::new();
+
+/// Verbose flag set by `--verbose` / `-v`. When true, [`run_quiet`] stops
+/// capturing and inherits stdio again, so every helper's raw output is visible.
+/// This is the escape hatch for debugging a misbehaving package manager: the
+/// clean report is the default, the firehose is one flag away.
+static VERBOSE: OnceLock<bool> = OnceLock::new();
 
 /// Record the detected privilege helper. Called once from `main()`.
 /// Subsequent calls are silently ignored — `OnceLock` semantics.
@@ -81,6 +155,18 @@ pub fn is_json() -> bool {
 /// True when no human-facing chatter should be printed at all (JSON mode).
 fn silent() -> bool {
     is_json()
+}
+
+/// Enable verbose mode. Called once from `main()` when `--verbose` is passed.
+/// JSON mode wins: a machine consumer must never get helper output on stdout,
+/// so `main()` never enables verbose alongside `--json`.
+pub fn set_verbose(v: bool) {
+    let _ = VERBOSE.set(v);
+}
+
+/// Returns true if `--verbose` was passed at startup.
+pub fn is_verbose() -> bool {
+    *VERBOSE.get().unwrap_or(&false)
 }
 
 /// Current privilege helper, or `Privilege::Sudo` if `main()` never set one
