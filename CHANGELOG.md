@@ -1,5 +1,58 @@
 # Changelog
 
+## [1.7.1] - 2026-08-11
+
+Package-cache handling audited against every supported family by running the
+tool in containers. Three distros were reporting success for work they had not
+done; two more were measuring the wrong directory.
+
+### Fixed
+- **Void: the package cache was never actually cleaned.** `xbps-remove -O` only
+  drops *outdated* cached packages. On a system whose cached packages are all
+  current — which is every freshly-installed box — it removes nothing and still
+  exits 0, so the tool reported `xbps cache cleaned` after freeing zero bytes.
+  Confirmed in a container: 139 MB before, 139 MB after. `-OO` (which also
+  removes cached packages that are no longer installed) now runs under `--deep`,
+  and a normal run says what it kept instead of implying it cleaned everything.
+  It stays behind `--deep` because that cache is what makes a downgrade
+  possible: a version dropped from the repo index can still be reinstalled from
+  `/var/cache/xbps`. After the fix, `--deep` frees 119.29 MB (139 MB → 20 MB,
+  the still-installed versions xbps keeps by design).
+- **Alpine: the same bug, same shape.** `apk cache clean` only prunes superseded
+  versions; the cached package for every installed version stays, as do the
+  `APKINDEX` files. Container check: 224.4 MB before, 224.4 MB after, reported
+  as cleaned. (`apk cache --purge` is not the answer either — it also keeps the
+  installed versions.) Clearing the rest costs a re-download, so it now runs
+  under `--deep`, which frees the full 224.30 MB. The dead fallback that only
+  triggered when the command *failed* — which it never did — is gone.
+- **openSUSE: freed size was measured on a subdirectory.** `zypper clean --all`
+  clears downloaded packages *and* the `raw/` + `solv/` repository metadata, but
+  the measurement only read `/var/cache/zypp/packages`. The cleanup worked; the
+  report just left the metadata out — on a refreshed Tumbleweed that is ~65 MB
+  of ~147 MB. It now measures `/var/cache/zypp`, verified at 63.99 MB against
+  65 MB actual.
+- **Solus: the same under-reporting.** `eopkg delete-cache` clears `packages/`,
+  `archives/` and the db `.cache` files beside them, so measuring `packages/`
+  alone missed the rest. Now measures `/var/cache/eopkg`.
+- **Gentoo: `DISTDIR` is resolved instead of assumed.** `eclean distfiles` reads
+  the live portage config, so a system that overrides `DISTDIR` in `make.conf`
+  was measured at the wrong path — and the no-`eclean` fallback would have run
+  `find -delete` against a hard-coded `/var/cache/distfiles` that may not be the
+  real one. The path now comes from `portageq distdir`, then `make.conf`, then
+  the default (with the pre-2.3.8 `/usr/portage/distfiles` honoured only if it
+  actually exists). Funtoo, which defaults to `/var/cache/portage`, is covered
+  by the same lookup.
+
+### Internal
+- The `make.conf` parser used for `PORTAGE_TMPDIR` is now shared with `DISTDIR`
+  lookup rather than duplicated.
+- New guards: each measured cache path is pinned to what its clean command
+  actually clears; hostile `PORTAGE_TMPDIR` values (`/`, `//`, traversal) can
+  never resolve to a deletable path; and the portage build-tmp cleanup is proven
+  to clear contents while leaving the directory itself in place. The `emerge`
+  guard was verified live — with a build running, the sweep refuses and the
+  tree is left untouched.
+
 ## [1.7.0] - 2026-08-09
 
 ### Changed

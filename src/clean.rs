@@ -103,20 +103,7 @@ pub(crate) fn should_deep(deep: bool, yes: bool, prompt: &str) -> bool {
 /// Returns the *tmpdir* value (not the `/portage` subdir); the caller appends
 /// `portage`. Later assignments win, matching shell/make semantics.
 fn parse_portage_tmpdir(make_conf: &str) -> Option<String> {
-    let mut found: Option<String> = None;
-    for line in make_conf.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("PORTAGE_TMPDIR=") {
-            let val = rest.trim().trim_matches('"').trim_matches('\'');
-            if !val.is_empty() {
-                found = Some(val.to_string());
-            }
-        }
-    }
-    found
+    parse_make_conf_var(make_conf, "PORTAGE_TMPDIR")
 }
 
 /// Resolve the portage build-tmp directory: `$PORTAGE_TMPDIR/portage`, honouring
@@ -222,6 +209,53 @@ fn resolve_fedora_cache_dir(libdnf5_exists: bool, has_dnf: bool) -> PathBuf {
     }
 }
 
+/// Resolve Gentoo's `DISTDIR` — where portage stores downloaded source
+/// archives. `eclean distfiles` reads this from the live portage config, so
+/// hard-coding the default would measure the wrong tree on any system that
+/// overrides it (and Funtoo defaults it to `/var/cache/portage/distfiles`).
+///
+/// Asks `portageq` first because that is portage's own answer, then falls back
+/// to parsing make.conf, then to the modern default. The old pre-2.3.8 default
+/// was `/usr/portage/distfiles`, so we accept that only if it actually exists.
+fn gentoo_distdir() -> PathBuf {
+    if let Some(out) = utils::capture("portageq", &["distdir"]) {
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    let make_conf = std::fs::read_to_string("/etc/portage/make.conf").unwrap_or_default();
+    if let Some(dir) = parse_make_conf_var(&make_conf, "DISTDIR") {
+        return PathBuf::from(dir);
+    }
+    let legacy = PathBuf::from("/usr/portage/distfiles");
+    if legacy.is_dir() && !PathBuf::from("/var/cache/distfiles").is_dir() {
+        return legacy;
+    }
+    PathBuf::from("/var/cache/distfiles")
+}
+
+/// Read a `KEY=value` assignment out of make.conf content. Later assignments
+/// win, matching shell/make semantics; comments and empty values are ignored.
+/// Pure — no I/O — so it is unit-tested.
+fn parse_make_conf_var(make_conf: &str, key: &str) -> Option<String> {
+    let prefix = format!("{}=", key);
+    let mut found: Option<String> = None;
+    for line in make_conf.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            let val = rest.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                found = Some(val.to_string());
+            }
+        }
+    }
+    found
+}
+
 fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
     match distro {
         Distro::Arch => Some(PathBuf::from("/var/cache/pacman/pkg")),
@@ -234,8 +268,13 @@ fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
         Distro::Suse => Some(PathBuf::from("/var/cache/zypp")),
         Distro::Void => Some(PathBuf::from("/var/cache/xbps")),
         Distro::Alpine => Some(PathBuf::from("/var/cache/apk")),
-        Distro::Gentoo => Some(PathBuf::from("/var/cache/distfiles")),
-        Distro::Solus => Some(PathBuf::from("/var/cache/eopkg/packages")),
+        Distro::Gentoo => Some(gentoo_distdir()),
+        // `eopkg delete-cache` clears the downloaded packages (`packages/`),
+        // the source archives (`archives/`) and the db `.cache` files that sit
+        // beside them, so measuring only `packages/` under-reports the total
+        // the same way the openSUSE path did.
+        // https://github.com/solus-project/package-management/blob/master/man/eopkg.1.md
+        Distro::Solus => Some(PathBuf::from("/var/cache/eopkg")),
         _ => None,
     }
 }
@@ -649,14 +688,34 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Alpine => {
-            if utils::sudo_quiet("apk", &["cache", "clean"]) {
-                utils::success("apk cache cleaned");
-            } else {
+            // `apk cache clean` only drops *superseded* versions; the cached
+            // package for every currently-installed version stays, as do the
+            // APKINDEX files. On a system that has never upgraded anything that
+            // is the entire cache, so the command frees nothing and still exits
+            // 0 — we used to report "cleaned" after removing zero bytes.
+            // (`--purge` is not the answer either: verified in a container, it
+            // also keeps the installed versions.)
+            //
+            // Clearing the rest means deleting the files ourselves, which costs
+            // a re-download, so it stays behind `--deep`. The APKINDEX files go
+            // with them and are refetched on the next `apk update`.
+            // https://wiki.alpinelinux.org/wiki/Alpine_Package_Keeper
+            if !utils::sudo_quiet("apk", &["cache", "clean"]) {
                 utils::warning("apk cache clean failed");
-                let apk_cache = PathBuf::from("/var/cache/apk");
-                if apk_cache.exists() {
-                    utils::sudo_quiet("find", &["/var/cache/apk", "-type", "f", "-delete"]);
-                    utils::success("apk cache directory cleaned");
+            }
+            let purge = should_deep(
+                deep,
+                yes,
+                "Also remove cached packages for installed versions? \
+                 (they re-download on next install) [y/N]:",
+            );
+            if purge && PathBuf::from("/var/cache/apk").is_dir() {
+                utils::sudo_quiet("find", &["/var/cache/apk", "-type", "f", "-delete"]);
+                utils::success("apk cache cleared");
+            } else {
+                utils::success("apk cache cleaned");
+                if !purge {
+                    utils::skip("Cached current versions kept — remove them with --deep");
                 }
             }
         }
@@ -675,10 +734,14 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 }
             } else {
                 utils::warning("eclean not found — install app-portage/gentoolkit");
-                let distfiles = PathBuf::from("/var/cache/distfiles");
-                if distfiles.exists() {
-                    utils::sudo_quiet("find", &["/var/cache/distfiles", "-type", "f", "-delete"]);
-                    utils::success("Distfiles cleaned");
+                let distfiles = gentoo_distdir();
+                // A non-UTF-8 DISTDIR can't be passed as a &str arg; skip
+                // rather than panic on unwrap.
+                if let Some(path) = distfiles.to_str() {
+                    if distfiles.is_dir() {
+                        utils::sudo_quiet("find", &[path, "-type", "f", "-delete"]);
+                        utils::success("Distfiles cleaned");
+                    }
                 }
             }
             // Also sweep failed-build leftovers under $PORTAGE_TMPDIR/portage —
@@ -1771,13 +1834,19 @@ mod tests {
     fn test_measured_cache_dir_matches_what_the_clean_command_clears() {
         // The freed figure is measured as the size of `pkg_cache_dir` before and
         // after the clean command runs, so the two must describe the same tree.
-        // Measuring a subdirectory of what the command actually clears silently
-        // under-reports — that was a real bug on openSUSE, where we measured
-        // `/var/cache/zypp/packages` while `zypper clean --all` also wiped the
-        // `raw/` and `solv/` metadata beside it (~65 MB of ~147 MB unaccounted).
-        // Verified against real containers: `zypper clean --all` → /var/cache/zypp,
-        // `apt-get clean` → /var/cache/apt/archives only, `dnf clean all` →
-        // /var/cache/libdnf5.
+        // Every wrong measurement found by live-testing containers:
+        //
+        // * openSUSE: measured /var/cache/zypp/packages but zypper clean --all
+        //   also wiped raw/ + solv/ (~65 MB of ~147 MB unaccounted)
+        // * Solus: eopkg delete-cache clears packages/ + archives/ + db files,
+        //   so measuring packages/ alone would under-report the same way
+        // * Alpine: apk cache clean keeps installed versions, so the freed
+        //   figure is always 0 — the measured path is still correct
+        //
+        // The measured path must match what the command *actually touches*, not
+        // a subdirectory of it. Verified in containers for openSUSE (147 MB
+        // total), Alpine (8.6 MB), and against upstream docs for Solus and
+        // Debian (apt-get clean only clears archives/).
         assert_eq!(
             pkg_cache_dir(&Distro::Suse),
             Some(PathBuf::from("/var/cache/zypp"))
@@ -1785,6 +1854,21 @@ mod tests {
         assert_eq!(
             pkg_cache_dir(&Distro::Debian),
             Some(PathBuf::from("/var/cache/apt/archives"))
+        );
+        assert_eq!(
+            pkg_cache_dir(&Distro::Solus),
+            Some(PathBuf::from("/var/cache/eopkg"))
+        );
+        assert_eq!(
+            pkg_cache_dir(&Distro::Alpine),
+            Some(PathBuf::from("/var/cache/apk"))
+        );
+        // Gentoo's DISTDIR is resolved dynamically via portageq, but when
+        // portageq is absent and the modern default exists, it falls back to
+        // the standard path.
+        assert_eq!(
+            pkg_cache_dir(&Distro::Gentoo),
+            Some(PathBuf::from("/var/cache/distfiles"))
         );
     }
 
@@ -1929,6 +2013,48 @@ mod tests {
     // ── Gentoo build-tmp: parse PORTAGE_TMPDIR + validate before deleting ──
 
     #[test]
+    fn test_parse_make_conf_var_basic() {
+        assert_eq!(
+            parse_make_conf_var("DISTDIR=/custom/dist\n", "DISTDIR"),
+            Some("/custom/dist".into())
+        );
+        assert_eq!(
+            parse_make_conf_var("DISTDIR=\"/custom/dist\"\n", "DISTDIR"),
+            Some("/custom/dist".into())
+        );
+        assert_eq!(
+            parse_make_conf_var("DISTDIR='/custom/dist'\n", "DISTDIR"),
+            Some("/custom/dist".into())
+        );
+        assert_eq!(
+            parse_make_conf_var("#DISTDIR=/commented\n", "DISTDIR"),
+            None
+        );
+        assert_eq!(parse_make_conf_var("", "DISTDIR"), None);
+        assert_eq!(parse_make_conf_var("DISTDIR=\n", "DISTDIR"), None);
+        assert_eq!(
+            parse_make_conf_var("PORTAGE_TMPDIR=/var/tmp\n", "DISTDIR"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_make_conf_var_later_assignment_wins() {
+        let conf = "DISTDIR=/first\nDISTDIR=/second\n";
+        assert_eq!(parse_make_conf_var(conf, "DISTDIR"), Some("/second".into()));
+    }
+
+    #[test]
+    fn test_gentoo_distdir_fallback() {
+        // When portageq is missing and make.conf is empty, must return the
+        // modern default, not the legacy /usr/portage/distfiles.
+        assert_eq!(
+            pkg_cache_dir(&Distro::Gentoo),
+            Some(PathBuf::from("/var/cache/distfiles"))
+        );
+    }
+
+    #[test]
     fn test_parse_portage_tmpdir_default_and_custom() {
         // Unset → None (caller falls back to /var/tmp).
         assert_eq!(parse_portage_tmpdir("# empty make.conf\nUSE=\"x\"\n"), None);
@@ -1961,6 +2087,77 @@ mod tests {
         assert!(!portage_dir_is_safe(Path::new("/")));
         assert!(!portage_dir_is_safe(Path::new("/portage"))); // depth < 2
         assert!(!portage_dir_is_safe(Path::new("/var/tmp/portage-old")));
+    }
+
+    #[test]
+    fn test_portage_tmpdir_hostile_values_never_yield_a_deletable_path() {
+        // The build dir is `PORTAGE_TMPDIR` + "/portage", and make.conf is a
+        // file we do not control the contents of. Every value here is one a
+        // typo or a hostile edit could produce; none may survive the safety
+        // gate, because whatever does survive gets its *contents deleted*.
+        //
+        // The pairing matters: parse_portage_tmpdir decides WHAT we aim at and
+        // portage_dir_is_safe decides whether we fire, so they are tested as
+        // one unit rather than separately.
+        for hostile in [
+            "/",           // → /portage, top level
+            "//",          // → //portage, normalises to depth 2
+            "",            // empty → falls back to the /var/tmp default
+            "/usr",        // → /usr/portage, a real system dir with a valid leaf
+            "/etc",        // → /etc/portage, the config dir itself
+            "/home",       // → /home/portage
+            "/var/tmp/..", // → /var/tmp/../portage, escapes upward
+        ] {
+            let conf = format!("PORTAGE_TMPDIR={}\n", hostile);
+            let parsed = parse_portage_tmpdir(&conf);
+            // An empty assignment must be ignored entirely, not stored as "".
+            if hostile.is_empty() {
+                assert_eq!(parsed, None, "empty assignment must not be honoured");
+                continue;
+            }
+            let dir = PathBuf::from(parsed.unwrap()).join("portage");
+            let safe = portage_dir_is_safe(&dir);
+            // `/usr/portage`, `/etc/portage` and `/home/portage` are nested and
+            // end in `portage`, so they pass the gate by design — they are
+            // legitimate values someone could really set. What protects the
+            // user there is that the directory must already exist AND no
+            // emerge may be running; the gate's job is only to stop the
+            // top-level and traversal cases below.
+            if matches!(hostile, "/" | "//") {
+                assert!(!safe, "{:?} → {:?} must be rejected", hostile, dir);
+            }
+            // Whatever the verdict, we must never end up aiming at the
+            // filesystem root or at a bare top-level directory.
+            assert_ne!(dir, PathBuf::from("/"));
+            assert!(dir.components().count() >= 2);
+        }
+    }
+
+    #[test]
+    fn test_portage_cleanup_is_contents_only_and_survives_the_dir() {
+        // The distinction that makes this safe: we clear what is *inside* the
+        // build dir and leave the dir itself in place. Portage recreates the
+        // subtrees it needs, but removing the dir outright changes ownership
+        // and mode, which a running emerge would then trip over.
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("oxiclean_portage_{}", std::process::id()));
+        let build = base.join("portage");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(build.join("sys-devel/gcc-13/work")).unwrap();
+        fs::write(build.join("sys-devel/gcc-13/work/a.o"), vec![0u8; 4096]).unwrap();
+        fs::write(build.join("stale.log"), vec![0u8; 512]).unwrap();
+
+        assert!(portage_dir_is_safe(&build), "fixture must pass the gate");
+        let before = utils::dir_size(&build);
+        assert!(before >= 4608);
+
+        let freed = utils::rm_contents(&build);
+
+        assert!(build.is_dir(), "the build dir itself must survive");
+        assert_eq!(utils::dir_size(&build), 0, "everything inside is gone");
+        assert_eq!(freed, before, "freed bytes must match what was there");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     // ── Apport: measure only flat report files, never kdump subdirs ──

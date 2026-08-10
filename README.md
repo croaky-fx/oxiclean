@@ -21,7 +21,7 @@ So I wrote OxiClean. It figures out what distro you're on and does the right thi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.7.0
+    ⚡ Oxi Clean  v1.7.1
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -408,7 +408,11 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-There are 108 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; trizen's clean staying scoped to the AUR cache so a plain run can't wipe every cached pacman package; aura's prune lists never naming `snapshots/` (saved restore points) or `hashes/` (build bookkeeping), and its cache dir never being wiped wholesale in either mode; deferring an AUR helper's cache to the AUR section never stranding it when that section isn't running; the Gentoo build-tmp cleanup refusing any path that isn't a nested `…/portage`; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
+There are 114 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; trizen's clean staying scoped to the AUR cache so a plain run can't wipe every cached pacman package; aura's prune lists never naming `snapshots/` (saved restore points) or `hashes/` (build bookkeeping), and its cache dir never being wiped wholesale in either mode; deferring an AUR helper's cache to the AUR section never stranding it when that section isn't running; each measured cache path matching what its clean command actually clears (a mismatch silently under-reports); hostile `PORTAGE_TMPDIR` values never resolving to a deletable path, and the Gentoo build-tmp cleanup clearing contents while leaving the directory itself; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
+
+The package-cache path for every family has been checked by running the tool in
+a container for that distro, not just read off documentation — that is how the
+Void, Alpine and openSUSE bugs in 1.7.1 were found.
 
 ---
 
