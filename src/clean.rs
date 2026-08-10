@@ -227,7 +227,11 @@ fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
         Distro::Arch => Some(PathBuf::from("/var/cache/pacman/pkg")),
         Distro::Debian => Some(PathBuf::from("/var/cache/apt/archives")),
         Distro::Fedora => Some(fedora_cache_dir()),
-        Distro::Suse => Some(PathBuf::from("/var/cache/zypp/packages")),
+        // `zypper clean --all` clears the whole cache — downloaded packages
+        // (`packages/`) *and* repository metadata (`raw/`, `solv/`). Measuring
+        // only `packages/` under-reported the freed total by whatever the
+        // metadata weighed, which on a refreshed Tumbleweed is ~65 MB of ~147 MB.
+        Distro::Suse => Some(PathBuf::from("/var/cache/zypp")),
         Distro::Void => Some(PathBuf::from("/var/cache/xbps")),
         Distro::Alpine => Some(PathBuf::from("/var/cache/apk")),
         Distro::Gentoo => Some(PathBuf::from("/var/cache/distfiles")),
@@ -1741,6 +1745,27 @@ mod tests {
     }
 
     // ── Fedora cache-dir selection: dnf5 vs dnf4 vs yum ──
+
+    #[test]
+    fn test_measured_cache_dir_matches_what_the_clean_command_clears() {
+        // The freed figure is measured as the size of `pkg_cache_dir` before and
+        // after the clean command runs, so the two must describe the same tree.
+        // Measuring a subdirectory of what the command actually clears silently
+        // under-reports — that was a real bug on openSUSE, where we measured
+        // `/var/cache/zypp/packages` while `zypper clean --all` also wiped the
+        // `raw/` and `solv/` metadata beside it (~65 MB of ~147 MB unaccounted).
+        // Verified against real containers: `zypper clean --all` → /var/cache/zypp,
+        // `apt-get clean` → /var/cache/apt/archives only, `dnf clean all` →
+        // /var/cache/libdnf5.
+        assert_eq!(
+            pkg_cache_dir(&Distro::Suse),
+            Some(PathBuf::from("/var/cache/zypp"))
+        );
+        assert_eq!(
+            pkg_cache_dir(&Distro::Debian),
+            Some(PathBuf::from("/var/cache/apt/archives"))
+        );
+    }
 
     #[test]
     fn test_resolve_fedora_cache_dir_prefers_libdnf5() {
