@@ -620,10 +620,31 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Void => {
-            if utils::sudo_quiet("xbps-remove", &["-O", "-y"]) {
+            // `-O` only drops *outdated* cached packages; the current version of
+            // every installed package stays. On a freshly-installed system that
+            // is the whole cache, so `-O` frees nothing and still exits 0 — we
+            // used to report "cleaned" after removing zero bytes. `-OO` also
+            // removes cached packages that are no longer installed.
+            //
+            // Doubling the flag stays behind `--deep` because the xbps cache is
+            // what makes a downgrade possible: a version pulled from the repo
+            // index can still be reinstalled from /var/cache/xbps. Emptying it
+            // removes those rollback targets, so the user opts in.
+            // https://docs.voidlinux.org/xbps/index.html
+            let clean_all = should_deep(
+                deep,
+                yes,
+                "Also remove cached packages that are no longer installed? \
+                 (removes downgrade targets) [y/N]:",
+            );
+            let flag = if clean_all { "-OO" } else { "-O" };
+            if utils::sudo_quiet("xbps-remove", &[flag, "-y"]) {
                 utils::success("xbps cache cleaned");
+                if !clean_all {
+                    utils::skip("Cached current versions kept — remove them with --deep");
+                }
             } else {
-                utils::error("xbps-remove -O failed");
+                utils::error(&format!("xbps-remove {} failed", flag));
             }
         }
 
