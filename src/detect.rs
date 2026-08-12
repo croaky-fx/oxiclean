@@ -63,11 +63,18 @@ pub fn distro_from_str(content: &str) -> Distro {
     let mut id = String::new();
     let mut id_like = String::new();
 
+    // The os-release spec allows values to be enclosed in EITHER double or
+    // single quotes (see freedesktop.org's os-release(5)). Stripping only `"`
+    // was a real bug: Gentoo — and Funtoo, some ARM images, and hand-edited
+    // files on other distros — write `ID='gentoo'`, so `id` stayed `'gentoo'`
+    // with the single quotes attached, matched nothing in the table below, and
+    // silently fell through to `Distro::Unknown`. Trim both quote kinds.
+    let unquote = |c: char| c == '"' || c == '\'';
     for line in content.lines() {
         if let Some(v) = line.strip_prefix("ID=") {
-            id = v.trim_matches('"').to_lowercase();
+            id = v.trim_matches(unquote).to_lowercase();
         } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
-            id_like = v.trim_matches('"').to_lowercase();
+            id_like = v.trim_matches(unquote).to_lowercase();
         }
     }
 
@@ -188,9 +195,11 @@ pub fn pretty_name() -> String {
         .ok()
         .and_then(|c| {
             c.lines().find(|l| l.starts_with("PRETTY_NAME=")).map(|l| {
+                // Same quoting caveat as distro_from_str: PRETTY_NAME may be
+                // wrapped in either `"..."` or `'...'` per the os-release spec.
                 l.strip_prefix("PRETTY_NAME=")
                     .unwrap_or("")
-                    .trim_matches('"')
+                    .trim_matches(|c: char| c == '"' || c == '\'')
                     .to_string()
             })
         })
@@ -702,6 +711,39 @@ mod tests {
     fn test_detect_empty_os_release() {
         let content = "";
         assert_eq!(distro_from_str(content), Distro::Unknown);
+    }
+
+    #[test]
+    fn test_detect_single_quoted_id() {
+        // Regression guard: Gentoo ships `ID='gentoo'` (single quotes), and the
+        // os-release spec explicitly permits either quote style. Trimming only
+        // `"` left the single quotes attached and dropped the distro into
+        // `Unknown`. This test locks in the fix.
+        let content = "ID='gentoo'\nID_LIKE=''\n";
+        assert_eq!(distro_from_str(content), Distro::Gentoo);
+    }
+
+    #[test]
+    fn test_detect_double_quoted_id_still_works() {
+        // The original quote style must keep working after the fix.
+        let content = "ID=\"gentoo\"\n";
+        assert_eq!(distro_from_str(content), Distro::Gentoo);
+    }
+
+    #[test]
+    fn test_detect_single_quoted_id_like_fallback() {
+        // Derivatives that only match through ID_LIKE must also survive single
+        // quotes — a hand-edited `ID_LIKE='ubuntu debian'` used to fall through.
+        let content = "ID=somenewthing\nID_LIKE='ubuntu debian'\n";
+        assert_eq!(distro_from_str(content), Distro::Debian);
+    }
+
+    #[test]
+    fn test_detect_unquoted_id_still_works() {
+        // Unquoted values (the common Arch/Fedora style) must be unaffected —
+        // trim_matches is a no-op when the delimiter isn't present.
+        let content = "ID=funtoo\n";
+        assert_eq!(distro_from_str(content), Distro::Gentoo);
     }
 
     // ── smoke tests for live detection (no panic) ──
