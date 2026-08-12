@@ -122,8 +122,7 @@ cd oxiclean
 cargo build --release
 sudo install -Dm755 target/release/oxiclean /usr/local/bin/oxiclean
 ```
-
-**Cargo:**
+or
 ```bash
 cargo install --git https://github.com/croaky-fx/oxiclean.git
 ```
