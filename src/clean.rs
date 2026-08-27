@@ -411,14 +411,16 @@ fn partition_cache_entries(cache_dir: &Path, protected: &[String]) -> (Vec<PathB
 /// `utils::rm_contents` so the "freed" tally matches what's actually removed.
 /// Size of a cache entry: follows the same symlink/dir/file rules as
 /// `utils::rm_contents` so the "freed" tally matches what's actually removed.
-
+///
+/// One `symlink_metadata` call answers all three questions (symlink? dir? size?).
+/// The `is_symlink()`/`is_dir()`/`metadata()` chain it replaced re-resolved the
+/// path three times per entry.
 fn entry_size(p: &Path) -> u64 {
-    if p.is_symlink() {
-        p.symlink_metadata().map(|m| m.len()).unwrap_or(0)
-    } else if p.is_dir() {
-        utils::dir_size(p)
-    } else {
-        p.metadata().map(|m| m.len()).unwrap_or(0)
+    match std::fs::symlink_metadata(p) {
+        Ok(md) if md.is_symlink() => md.len(),
+        Ok(md) if md.is_dir() => utils::dir_size(p),
+        Ok(md) => md.len(),
+        Err(_) => 0,
     }
 }
 
@@ -482,18 +484,28 @@ pub fn user_cache(dry_run: bool, helpers: &[AurHelper], aur_running: bool) -> u6
         utils::skip("AUR helper cache skipped — clean it with --aur");
     }
 
-    // Size every entry ONCE and carry the number forward. `entry_size` walks the
-    // tree, and `~/.cache` is usually the deepest one we touch, so measuring the
-    // total and then re-measuring each entry doubled the most expensive step.
-    let sized: Vec<(PathBuf, u64)> = to_clean
+    // Size every entry ONCE and carry the number forward, along with whether it
+    // is a directory — the delete below needs that, and asking again would be
+    // two more syscalls per entry. `entry_size` walks the tree, and `~/.cache`
+    // is usually the deepest one we touch (browser caches run to hundreds of
+    // thousands of small files), so walking it to total up and then re-walking
+    // each entry to attribute freed bytes made the most expensive step in the
+    // run cost exactly double — very noticeable on a spinning disk.
+    let sized: Vec<(PathBuf, u64, bool)> = to_clean
         .into_iter()
         .map(|p| {
+            let md = std::fs::symlink_metadata(&p).ok();
+            // A symlink is unlinked, never descended into — matching entry_size.
+            let is_real_dir = md
+                .as_ref()
+                .map(|m| m.is_dir() && !m.is_symlink())
+                .unwrap_or(false);
             let size = entry_size(&p);
-            (p, size)
+            (p, size, is_real_dir)
         })
         .collect();
 
-    let clean_size: u64 = sized.iter().map(|(_, size)| size).sum();
+    let clean_size: u64 = sized.iter().map(|(_, size, _)| size).sum();
     if clean_size == 0 {
         utils::success("Already clean");
         return 0;
@@ -508,8 +520,8 @@ pub fn user_cache(dry_run: bool, helpers: &[AurHelper], aur_running: bool) -> u6
     }
 
     let mut freed = 0u64;
-    for (path, size) in &sized {
-        let ok = if path.is_dir() && !path.is_symlink() {
+    for (path, size, is_dir) in &sized {
+        let ok = if *is_dir {
             std::fs::remove_dir_all(path).is_ok()
         } else {
             std::fs::remove_file(path).is_ok()
