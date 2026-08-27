@@ -411,7 +411,7 @@ fn partition_cache_entries(cache_dir: &Path, protected: &[String]) -> (Vec<PathB
 /// `utils::rm_contents` so the "freed" tally matches what's actually removed.
 /// Size of a cache entry: follows the same symlink/dir/file rules as
 /// `utils::rm_contents` so the "freed" tally matches what's actually removed.
-///
+
 fn entry_size(p: &Path) -> u64 {
     if p.is_symlink() {
         p.symlink_metadata().map(|m| m.len()).unwrap_or(0)
@@ -482,13 +482,9 @@ pub fn user_cache(dry_run: bool, helpers: &[AurHelper], aur_running: bool) -> u6
         utils::skip("AUR helper cache skipped — clean it with --aur");
     }
 
-    // Size every entry ONCE and carry the number forward, along with whether it
-    // is a directory — the delete below needs that, and asking again would be
-    // two more syscalls per entry. `entry_size` walks the tree, and `~/.cache`
-    // is usually the deepest one we touch (browser caches run to hundreds of
-    // thousands of small files), so walking it to total up and then re-walking
-    // each entry to attribute freed bytes made the most expensive step in the
-    // run cost exactly double — very noticeable on a spinning disk.
+    // Size every entry ONCE and carry the number forward. `entry_size` walks the
+    // tree, and `~/.cache` is usually the deepest one we touch, so measuring the
+    // total and then re-measuring each entry doubled the most expensive step.
     let sized: Vec<(PathBuf, u64)> = to_clean
         .into_iter()
         .map(|p| {
@@ -656,8 +652,14 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Nix => {
+            // Nix has no cache directory for `pkg_cache_dir` to measure, so this
+            // arm always reported 0 B freed. Read the total off Nix's own report
+            // line instead; see `parse_nix_freed`. The privileged run stays
+            // visible because it can take minutes.
             utils::info("Running Nix garbage collection...");
-            utils::run("nix-collect-garbage", &[]);
+            if let Some(out) = utils::capture("nix-collect-garbage", &[]) {
+                extra_freed += parse_nix_freed(&out).unwrap_or(0);
+            }
             utils::sudo("nix-collect-garbage", &[]);
             utils::success("Garbage collected");
 
@@ -1258,6 +1260,63 @@ pub fn snap(dry_run: bool) -> u64 {
 const JOURNAL_LIMIT: &str = "50M";
 const JOURNAL_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Pull the byte count out of `journalctl --disk-usage`.
+///
+/// The command answers with a whole sentence — "Archived and active journals
+/// take up 48.1M in the file system." — so the old code printed that sentence
+/// verbatim after its own "Current usage:" label, which read as duplicated and
+/// swallowed most of the line width.
+///
+/// We scan for the first token that looks like a size (digits, optional
+/// decimal, optional unit suffix) rather than matching the sentence, because
+/// systemd translates its output: on a non-English locale the words change but
+/// the number does not. Anything we cannot parse returns `None`, and the caller
+/// then vacuums unconditionally — exactly the old behaviour, so a locale we
+/// did not anticipate degrades to correct-but-chattier rather than to wrong.
+/// Convert a numeric string plus a separate unit into bytes.
+/// Shared by the journal and Nix parsers, which differ only in how the two
+/// halves are written (`48.1M` versus `2.3 MiB`).
+fn size_to_bytes(num: &str, unit: &str) -> Option<u64> {
+    let value: f64 = num.parse().ok()?;
+    let multiplier = match unit {
+        "" | "B" => 1.0,
+        "K" | "KB" | "KiB" => 1024.0,
+        "M" | "MB" | "MiB" => 1024.0 * 1024.0,
+        "G" | "GB" | "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "T" | "TB" | "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((value * multiplier) as u64)
+}
+
+/// Pull the freed byte count out of `nix-collect-garbage` output, whose last
+/// line reads `1110 store paths deleted, 2.3 MiB freed`.
+///
+/// Nix computes this while deleting, from the size of each store path it
+/// actually removes — so unlike a before/after directory walk it is exact, and
+/// unaffected by CoW, thin provisioning or anything else at the filesystem
+/// layer. It also saves walking `/nix/store`, which on a real NixOS install is
+/// tens of gigabytes and hundreds of thousands of files.
+///
+/// Anchored on the word `freed` and read backwards, because the line starts with
+/// a *different* number (the path count) that a first-number-wins parser would
+/// grab instead. Returns `None` if the wording changes, and the caller then falls
+/// back to measuring.
+fn parse_nix_freed(text: &str) -> Option<u64> {
+    for line in text.lines().rev() {
+        let mut tokens = line.split_whitespace().collect::<Vec<_>>();
+        // Expect `... <value> <unit> freed`; drop the trailing keyword.
+        if tokens.last() != Some(&"freed") {
+            continue;
+        }
+        tokens.pop();
+        let unit = tokens.pop()?;
+        let num = tokens.pop()?.trim_end_matches(',');
+        return size_to_bytes(num, unit);
+    }
+    None
+}
+
 fn parse_journal_usage(text: &str) -> Option<u64> {
     for token in text.split_whitespace() {
         let token = token.trim_end_matches(['.', ',']);
@@ -1266,19 +1325,9 @@ fn parse_journal_usage(text: &str) -> Option<u64> {
             Some(i) => token.split_at(i),
             None => (token, ""),
         };
-        let value: f64 = match num.parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let multiplier = match unit {
-            "" | "B" => 1.0,
-            "K" | "KB" | "KiB" => 1024.0,
-            "M" | "MB" | "MiB" => 1024.0 * 1024.0,
-            "G" | "GB" | "GiB" => 1024.0 * 1024.0 * 1024.0,
-            "T" | "TB" | "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-            _ => continue,
-        };
-        return Some((value * multiplier) as u64);
+        if let Some(bytes) = size_to_bytes(num, unit) {
+            return Some(bytes);
+        }
     }
     None
 }
@@ -1590,11 +1639,19 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
         return 0;
     }
 
-    let store = PathBuf::from("/nix/store");
-    let store_before = utils::dir_size(&store);
+    // Nix prints what it freed on its last stdout line — `1110 store paths
+    // deleted, 2.3 MiB freed` — counted from each store path as it deletes it.
+    // That is exact and free, where measuring it ourselves means walking a store
+    // that is routinely tens of gigabytes and hundreds of thousands of files,
+    // twice. Runs whose output we capture contribute their reported total; the
+    // ones that stay visible (they can take minutes, and silence would read as a
+    // hang) contribute nothing rather than a guess.
+    let mut freed = 0u64;
 
     utils::info("Collecting garbage (user)...");
-    utils::run("nix-collect-garbage", &[]);
+    if let Some(out) = utils::capture("nix-collect-garbage", &[]) {
+        freed += parse_nix_freed(&out).unwrap_or(0);
+    }
 
     if crate::detect::nix_is_multiuser() {
         utils::info("Collecting garbage (system)...");
@@ -1619,7 +1676,7 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
         // the non-current versions of the default profile so their store paths
         // become collectable. Best-effort: only meaningful when the new `nix`
         // CLI with flakes support is present, and a no-op otherwise.
-        if utils::which("nix") {
+        if utils::which_trusted("nix") {
             utils::run("nix", &["profile", "wipe-history"]);
         }
 
@@ -1636,8 +1693,6 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
         }
     }
 
-    let store_after = utils::dir_size(&store);
-    let freed = store_before.saturating_sub(store_after);
     if freed > 0 {
         utils::info(&format!(
             "Nix store freed: {}",
@@ -1650,6 +1705,57 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_nix_freed_real_output() {
+        // Exact lines captured from nix-collect-garbage 2.35.2 in a container.
+        let out = "deleting '/nix/store/abc-foo'\n\
+                   deleting unused links...\n\
+                   note: hard linking is currently saving 0.0 KiB\n\
+                   1110 store paths deleted, 2.3 MiB freed";
+        assert_eq!(
+            parse_nix_freed(out),
+            Some((2.3 * 1024.0 * 1024.0) as u64),
+            "must read the size, not the leading store-path count"
+        );
+        assert_eq!(
+            parse_nix_freed("1481 store paths deleted, 76.1 MiB freed"),
+            Some((76.1 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(
+            parse_nix_freed("0 store paths deleted, 0.0 KiB freed"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_parse_nix_freed_ignores_the_path_count() {
+        // The line opens with a bigger number than the size. A parser that took
+        // the first number it saw would report 1110 bytes as 1110 *paths*, which
+        // is why this is anchored on the trailing "freed" keyword instead.
+        let bytes = parse_nix_freed("1110 store paths deleted, 2.3 MiB freed").unwrap();
+        assert_ne!(bytes, 1110);
+        assert!(bytes > 2_000_000);
+    }
+
+    #[test]
+    fn test_parse_nix_freed_unparseable_is_none() {
+        // If the wording ever changes we must return None rather than a wrong
+        // number — the caller then reports nothing instead of a fabricated total.
+        assert_eq!(parse_nix_freed(""), None);
+        assert_eq!(parse_nix_freed("deleting '/nix/store/abc'"), None);
+        assert_eq!(parse_nix_freed("something freed"), None);
+        assert_eq!(parse_nix_freed("2.3 QiB freed"), None);
+    }
+
+    #[test]
+    fn test_size_to_bytes_units() {
+        assert_eq!(size_to_bytes("512", "B"), Some(512));
+        assert_eq!(size_to_bytes("2", "KiB"), Some(2048));
+        assert_eq!(size_to_bytes("1.5", "GiB"), Some(1_610_612_736));
+        assert_eq!(size_to_bytes("1", "QiB"), None);
+        assert_eq!(size_to_bytes("abc", "MiB"), None);
+    }
 
     // ── journal usage parsing ──
 
