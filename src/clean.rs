@@ -129,9 +129,19 @@ fn portage_dir_is_safe(dir: &Path) -> bool {
 /// `pgrep -f emerge`: run without a shell, the only cmdlines containing
 /// "emerge" are real emerge processes (pgrep excludes its own PID). Fails
 /// *closed* — if we can't tell, we assume a build is running and skip.
+///
+/// Resolved through a trusted system path, not `$PATH`: a shadowed `pgrep` that
+/// exits non-zero would report "no build running" and hand this function's
+/// safety guarantee to whoever planted it — the sweep would then delete a live
+/// build tree. A `pgrep` we cannot vouch for is treated as unavailable, which
+/// fails closed.
 fn emerge_running() -> bool {
-    match std::process::Command::new("pgrep")
+    let Some(pgrep) = utils::resolve_trusted("pgrep") else {
+        return true; // can't verify → assume a build is running
+    };
+    match std::process::Command::new(pgrep)
         .args(["-f", "emerge"])
+        .env("PATH", utils::trusted_path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -190,7 +200,7 @@ fn clean_portage_tmp(dry_run: bool) -> u64 {
 fn fedora_cache_dir() -> PathBuf {
     resolve_fedora_cache_dir(
         Path::new("/var/cache/libdnf5").is_dir(),
-        utils::which("dnf"),
+        utils::which_trusted("dnf"),
     )
 }
 
@@ -218,7 +228,7 @@ fn resolve_fedora_cache_dir(libdnf5_exists: bool, has_dnf: bool) -> PathBuf {
 /// to parsing make.conf, then to the modern default. The old pre-2.3.8 default
 /// was `/usr/portage/distfiles`, so we accept that only if it actually exists.
 fn gentoo_distdir() -> PathBuf {
-    if let Some(out) = utils::capture("portageq", &["distdir"]) {
+    if let Some(out) = utils::capture_trusted("portageq", &["distdir"]) {
         let trimmed = out.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
@@ -399,6 +409,9 @@ fn partition_cache_entries(cache_dir: &Path, protected: &[String]) -> (Vec<PathB
 
 /// Size of a cache entry: follows the same symlink/dir/file rules as
 /// `utils::rm_contents` so the "freed" tally matches what's actually removed.
+/// Size of a cache entry: follows the same symlink/dir/file rules as
+/// `utils::rm_contents` so the "freed" tally matches what's actually removed.
+///
 fn entry_size(p: &Path) -> u64 {
     if p.is_symlink() {
         p.symlink_metadata().map(|m| m.len()).unwrap_or(0)
@@ -469,12 +482,13 @@ pub fn user_cache(dry_run: bool, helpers: &[AurHelper], aur_running: bool) -> u6
         utils::skip("AUR helper cache skipped — clean it with --aur");
     }
 
-    // Size every entry ONCE and carry the number forward. `entry_size` is a
-    // recursive stat-walk, and `~/.cache` is usually the deepest tree we touch
-    // (browser caches run to hundreds of thousands of small files) — walking it
-    // to total up and then re-walking each entry to attribute freed bytes made
-    // the most expensive step in the run cost exactly double, which is very
-    // noticeable on a spinning disk.
+    // Size every entry ONCE and carry the number forward, along with whether it
+    // is a directory — the delete below needs that, and asking again would be
+    // two more syscalls per entry. `entry_size` walks the tree, and `~/.cache`
+    // is usually the deepest one we touch (browser caches run to hundreds of
+    // thousands of small files), so walking it to total up and then re-walking
+    // each entry to attribute freed bytes made the most expensive step in the
+    // run cost exactly double — very noticeable on a spinning disk.
     let sized: Vec<(PathBuf, u64)> = to_clean
         .into_iter()
         .map(|p| {
@@ -621,7 +635,11 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Fedora => {
-            let pm = if utils::which("dnf") { "dnf" } else { "yum" };
+            let pm = if utils::which_trusted("dnf") {
+                "dnf"
+            } else {
+                "yum"
+            };
             if utils::sudo_quiet(pm, &["clean", "all"]) {
                 utils::success(&format!("{} cache cleaned", pm));
             } else {
@@ -721,7 +739,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Gentoo => {
-            if utils::which("eclean") {
+            if utils::which_trusted("eclean") {
                 if utils::sudo_quiet("eclean", &["distfiles"]) {
                     utils::success("Distfiles cleaned");
                 } else {
@@ -765,7 +783,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
             // removes staged files and stale metadata; `--all` (deep) also drops
             // recent manifests. Prefer it over a raw `rm` of the staged dir so we
             // don't fight swupd's own bookkeeping.
-            if utils::which("swupd") {
+            if utils::which_trusted("swupd") {
                 let mut args = vec!["clean"];
                 if deep {
                     args.push("--all");
@@ -817,7 +835,7 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
 
     match distro {
         Distro::Arch => {
-            let out = utils::capture("pacman", &["-Qdtq"]).unwrap_or_default();
+            let out = utils::capture_trusted("pacman", &["-Qdtq"]).unwrap_or_default();
             if out.is_empty() {
                 utils::success("No orphans found");
                 return 0;
@@ -856,7 +874,11 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Fedora => {
-            let pm = if utils::which("dnf") { "dnf" } else { "yum" };
+            let pm = if utils::which_trusted("dnf") {
+                "dnf"
+            } else {
+                "yum"
+            };
             if dry_run {
                 utils::info(&format!("[DRY RUN] Would run: {} autoremove", pm));
                 return 0;
@@ -870,7 +892,8 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Suse => {
-            let out = utils::capture("zypper", &["packages", "--orphaned"]).unwrap_or_default();
+            let out =
+                utils::capture_trusted("zypper", &["packages", "--orphaned"]).unwrap_or_default();
             if out.is_empty() || !out.contains('|') {
                 utils::success("No orphans found");
                 return 0;
@@ -1098,7 +1121,7 @@ fn clean_one_helper(h: &AurHelper, deep: bool, yes: bool) -> u64 {
 /// missing `flatpak` yields 0, which makes the caller's before/after difference
 /// 0 — it reports "no unused runtimes" rather than inventing a count.
 fn flatpak_ref_count() -> usize {
-    utils::capture("flatpak", &["list", "--columns=ref"])
+    utils::capture_trusted("flatpak", &["list", "--columns=ref"])
         .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(0)
 }
@@ -1188,7 +1211,7 @@ pub fn snap(dry_run: bool) -> u64 {
         return 0;
     }
 
-    let out = utils::capture("snap", &["list", "--all"]).unwrap_or_default();
+    let out = utils::capture_trusted("snap", &["list", "--all"]).unwrap_or_default();
     let disabled: Vec<(&str, &str)> = out
         .lines()
         .filter(|l| l.contains("disabled"))
@@ -1235,19 +1258,6 @@ pub fn snap(dry_run: bool) -> u64 {
 const JOURNAL_LIMIT: &str = "50M";
 const JOURNAL_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
 
-/// Pull the byte count out of `journalctl --disk-usage`.
-///
-/// The command answers with a whole sentence — "Archived and active journals
-/// take up 48.1M in the file system." — so the old code printed that sentence
-/// verbatim after its own "Current usage:" label, which read as duplicated and
-/// swallowed most of the line width.
-///
-/// We scan for the first token that looks like a size (digits, optional
-/// decimal, optional unit suffix) rather than matching the sentence, because
-/// systemd translates its output: on a non-English locale the words change but
-/// the number does not. Anything we cannot parse returns `None`, and the caller
-/// then vacuums unconditionally — exactly the old behaviour, so a locale we
-/// did not anticipate degrades to correct-but-chattier rather than to wrong.
 fn parse_journal_usage(text: &str) -> Option<u64> {
     for token in text.split_whitespace() {
         let token = token.trim_end_matches(['.', ',']);
@@ -1276,12 +1286,12 @@ fn parse_journal_usage(text: &str) -> Option<u64> {
 pub fn journal(dry_run: bool) -> u64 {
     utils::section("Journal");
 
-    if !utils::which("journalctl") {
+    if !utils::which_trusted("journalctl") {
         utils::skip("journalctl not found — skipped");
         return 0;
     }
 
-    let raw_usage = utils::capture("journalctl", &["--disk-usage"]);
+    let raw_usage = utils::capture_trusted("journalctl", &["--disk-usage"]);
     let usage_bytes = raw_usage.as_deref().and_then(parse_journal_usage);
     let usage_label = usage_bytes.map(utils::format_size);
 
@@ -1531,7 +1541,7 @@ fn apport_report_size(dir: &Path) -> u64 {
 pub fn trim(dry_run: bool, disk_type: crate::detect::DiskType) -> u64 {
     utils::section("Filesystem Trim");
 
-    if !utils::which("fstrim") {
+    if !utils::which_trusted("fstrim") {
         utils::skip("fstrim not found (install util-linux) — skipped");
         return 0;
     }

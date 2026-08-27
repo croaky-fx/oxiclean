@@ -410,10 +410,14 @@ pub fn find_privilege() -> Privilege {
     if crate::utils::is_root() {
         return Privilege::Root;
     }
-    if crate::utils::which("doas") {
+    // Trusted lookup, matching what `elevate` will actually execute. Detecting a
+    // `doas` from the user's `$PATH` that `elevate` then refuses to run would
+    // report "privileges available" and fail on every privileged step; worse, it
+    // is exactly the binary an attacker would plant to harvest a password.
+    if crate::utils::which_trusted("doas") {
         return Privilege::Doas;
     }
-    if crate::utils::which("sudo") {
+    if crate::utils::which_trusted("sudo") {
         return Privilege::Sudo;
     }
     Privilege::None

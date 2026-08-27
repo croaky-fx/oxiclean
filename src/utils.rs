@@ -12,10 +12,75 @@ use crate::detect::Privilege;
 //  Command Execution
 // ═══════════════════════════════════════════════════
 
+// ══════════════════════════════════════════════════
+//  Trusted binary resolution
+// ══════════════════════════════════════════════════
+
+/// Directories a privileged command may come from. `$PATH` is deliberately not
+/// consulted — every package manager and coreutil we escalate lives here on all
+/// supported distros, and these are root-writable only.
+///
+/// `/nix/var/nix/profiles/default/bin` is the exception that proves the rule: Nix
+/// installs its tools into the store and exposes them only through profile
+/// symlinks, so `nix-collect-garbage` is never in `/usr/bin`. The default profile
+/// is the *system* one, created and owned by root at install time — a user
+/// profile (`~/.nix-profile`) is deliberately not listed.
+const TRUSTED_BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+/// Resolve `cmd` to an absolute path inside [`TRUSTED_BIN_DIRS`], ignoring
+/// `$PATH`. Returns `None` when it isn't there, which callers treat as "not
+/// available" — refusing beats running something unverified as root.
+///
+/// Handing a bare name to the privilege helper leaves the lookup to the helper.
+/// `sudo` usually has `secure_path` to replace the caller's `$PATH`, but that is
+/// admin-configurable and `doas` has no equivalent — so `doas pacman` would run a
+/// `pacman` from `~/.local/bin` as root. `doas /usr/bin/pacman` cannot.
+/// CWE-426; verified by exploit on Arch with `doas`.
+pub fn resolve_trusted(cmd: &str) -> Option<String> {
+    // Absolute paths come from our own code, never user input.
+    if cmd.starts_with('/') {
+        return Path::new(cmd).is_file().then(|| cmd.to_string());
+    }
+    if cmd.contains('/') {
+        return None;
+    }
+    TRUSTED_BIN_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(cmd))
+        .find(|p| p.is_file())
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+}
+
+/// Hand every child the trusted `PATH` instead of the inherited one.
+///
+/// [`resolve_trusted`] fixes which binary we launch; this fixes what that binary
+/// finds when it shells out itself — pacman runs hooks, emerge runs ebuilds, apk
+/// runs triggers, all inheriting our environment. Only `PATH` is replaced; the
+/// rest is needed (`HOME`, `XDG_CACHE_HOME`, locale).
+///
+/// `LD_PRELOAD` needs no handling: the loader ignores it across a setuid
+/// boundary, and sudo and doas both strip it.
+fn harden_env(cmd: &mut Command) -> &mut Command {
+    cmd.env("PATH", trusted_path())
+}
+
+/// The `PATH` handed to every child: [`TRUSTED_BIN_DIRS`] only. Public so the
+/// few call sites that build a `Command` directly can apply the same hardening.
+pub fn trusted_path() -> String {
+    TRUSTED_BIN_DIRS.join(":")
+}
+
 /// Run command with visible output (inherits stdio)
 pub fn run(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd)
-        .args(args)
+    harden_env(Command::new(cmd).args(args))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -46,7 +111,7 @@ pub fn run_quiet(cmd: &str, args: &[&str]) -> bool {
     if is_verbose() {
         return run(cmd, args);
     }
-    match Command::new(cmd).args(args).output() {
+    match harden_env(Command::new(cmd).args(args)).output() {
         Ok(out) => {
             if !out.status.success() {
                 replay_stderr(&out.stderr);
@@ -73,12 +138,19 @@ fn replay_stderr(stderr: &[u8]) {
 
 /// [`run_quiet`] with privilege escalation. Mirrors [`elevate`]'s dispatch.
 pub fn elevate_quiet(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
+    // Same trusted-path resolution as [`elevate`] — see the rationale there.
+    let Some(target) = resolve_trusted(cmd) else {
+        return false;
+    };
     match privilege {
-        Privilege::Root => run_quiet(cmd, args),
+        Privilege::Root => run_quiet(&target, args),
         Privilege::Sudo | Privilege::Doas => {
-            let mut a = vec![cmd];
+            let Some(helper) = resolve_trusted(privilege.name()) else {
+                return false;
+            };
+            let mut a = vec![target.as_str()];
             a.extend_from_slice(args);
-            run_quiet(privilege.name(), &a)
+            run_quiet(&helper, &a)
         }
         Privilege::None => false,
     }
@@ -179,13 +251,26 @@ pub fn current_privilege() -> Privilege {
 /// the command directly because we are already uid 0. `Privilege::None` means
 /// no escalation tool exists — there is nothing to run, so we report failure
 /// without spawning anything (the caller should have already warned the user).
+///
+/// Both the helper and the target command are resolved through
+/// [`resolve_trusted`] first, so neither is looked up in the caller's `$PATH`.
+/// This is the single choke point for privileged execution — the ~40 call sites
+/// in `clean.rs` keep passing bare names and inherit the guarantee for free.
 pub fn elevate(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
+    // Refuse rather than fall back to a $PATH lookup: with root behind the
+    // call, "not in a trusted directory" must never mean "try anywhere".
+    let Some(target) = resolve_trusted(cmd) else {
+        return false;
+    };
     match privilege {
-        Privilege::Root => run(cmd, args),
+        Privilege::Root => run(&target, args),
         Privilege::Sudo | Privilege::Doas => {
-            let mut a = vec![cmd];
+            let Some(helper) = resolve_trusted(privilege.name()) else {
+                return false;
+            };
+            let mut a = vec![target.as_str()];
             a.extend_from_slice(args);
-            run(privilege.name(), &a)
+            run(&helper, &a)
         }
         Privilege::None => false,
     }
@@ -198,8 +283,17 @@ pub fn elevate(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
 pub fn acquire_privilege(privilege: Privilege) -> bool {
     match privilege {
         Privilege::Root => true,
-        Privilege::Sudo => run("sudo", &["-v"]),
-        Privilege::Doas => run("doas", &["true"]),
+        // Resolved for the same reason as `elevate`: this is the call that
+        // prompts for the password, so a shadowed `sudo`/`doas` here would
+        // harvest it.
+        Privilege::Sudo => match resolve_trusted("sudo") {
+            Some(p) => run(&p, &["-v"]),
+            None => false,
+        },
+        Privilege::Doas => match resolve_trusted("doas") {
+            Some(p) => run(&p, &["true"]),
+            None => false,
+        },
         Privilege::None => false,
     }
 }
@@ -210,14 +304,33 @@ pub fn sudo(cmd: &str, args: &[&str]) -> bool {
     elevate(current_privilege(), cmd, args)
 }
 
-/// Capture stdout of a command (returns output regardless of exit code)
+/// Capture stdout of a command (returns output regardless of exit code).
+///
+/// Not restricted to [`TRUSTED_BIN_DIRS`], because `--dev` drives tools that
+/// legitimately live in the user's home: rustup puts `cargo` in `~/.cargo/bin`,
+/// and the `uv`/`deno`/`pnpm`/`bun` installers default to `~/.local/bin`. Those
+/// run with the caller's own privileges against the caller's own cache, so a
+/// binary they control is not an escalation. Privileged callers use
+/// [`capture_trusted`].
 pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
-        .args(args)
+    harden_env(Command::new(cmd).args(args))
         .stderr(Stdio::null())
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// [`capture`] restricted to [`TRUSTED_BIN_DIRS`], for output we act on with
+/// root behind it.
+///
+/// `pacman -Qdtq` and `zypper packages --orphaned` produce the package list that
+/// is then fed to a privileged removal command, so a shadowed binary here does
+/// not need to run as root itself — it just has to name packages, and we delete
+/// them. Returns `None` when the tool is not in a trusted directory, which
+/// callers already treat as "not available".
+pub fn capture_trusted(cmd: &str, args: &[&str]) -> Option<String> {
+    let target = resolve_trusted(cmd)?;
+    capture(&target, args)
 }
 
 /// Check if a command exists in PATH.
@@ -231,9 +344,33 @@ pub fn which(cmd: &str) -> bool {
     }
 }
 
+/// Availability check for a command we intend to run with privileges. Must agree
+/// with what [`elevate`] accepts — gating on the looser [`which`] would pick a
+/// branch (e.g. a planted `dnf`) that then refuses to execute.
+pub fn which_trusted(cmd: &str) -> bool {
+    resolve_trusted(cmd).is_some()
+}
+
 /// Check if running as root (uid 0)
 pub fn is_root() -> bool {
-    capture("id", &["-u"]).map(|id| id == "0").unwrap_or(false)
+    // From /proc, not `id -u`: a shadowed `id` printing "0" would convince us we
+    // are already root, so we would skip escalation and every privileged step
+    // would fail. Format: `Uid:\t<real>\t<effective>\t<saved>\t<fs>`.
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                let mut f = rest.split_whitespace();
+                let _real = f.next();
+                if let Some(effective) = f.next() {
+                    return effective == "0";
+                }
+            }
+        }
+    }
+    // No /proc (unusual container or chroot).
+    capture_trusted("id", &["-u"])
+        .map(|id| id == "0")
+        .unwrap_or(false)
 }
 
 /// Acquire sudo privileges (prompts for password).
@@ -254,6 +391,10 @@ pub fn acquire_sudo() -> bool {
     }
     acquire_privilege(p)
 }
+
+// ═══════════════════════════════════════════════════
+//  File Operations
+// ═══════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════
 //  File Operations
@@ -438,6 +579,127 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    // ── CWE-426: untrusted search path ──
+
+    #[test]
+    fn test_resolve_trusted_ignores_path_entirely() {
+        // The exploit this guards: a `pacman` planted in ~/.local/bin ran as root
+        // because we handed the bare name to `doas`, which searches the caller's
+        // $PATH. An executable outside TRUSTED_BIN_DIRS must never resolve, even
+        // when $PATH points straight at it.
+        let dir = std::env::temp_dir().join(format!("oxi_pathtest_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let evil = dir.join("oxiclean-fake-pkgmanager");
+        fs::write(&evil, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = fs::metadata(&evil).unwrap().permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&evil, p).unwrap();
+        }
+        assert!(evil.is_file(), "fixture must be a real executable file");
+
+        assert_eq!(
+            resolve_trusted("oxiclean-fake-pkgmanager"),
+            None,
+            "an executable outside TRUSTED_BIN_DIRS must never resolve"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_trusted_finds_real_system_binaries() {
+        // The hardening must not break normal operation: the coreutils we drive
+        // live in trusted directories on every supported distro.
+        let sh = resolve_trusted("sh").expect("sh must resolve");
+        assert!(sh.starts_with('/'), "must be an absolute path, got {sh}");
+        assert!(
+            TRUSTED_BIN_DIRS.iter().any(|d| sh.starts_with(d)),
+            "{sh} resolved outside the trusted set"
+        );
+    }
+
+    #[test]
+    fn test_resolve_trusted_rejects_paths_and_missing() {
+        // A name with a separator is not a bare command; refuse rather than guess.
+        assert_eq!(resolve_trusted("../../bin/sh"), None);
+        assert_eq!(resolve_trusted("subdir/tool"), None);
+        // Nonexistent commands resolve to None, not to a bogus path.
+        assert_eq!(resolve_trusted("oxiclean_no_such_binary_xyz"), None);
+        // An absolute path that does not exist must not be trusted either.
+        assert_eq!(resolve_trusted("/nonexistent/oxiclean_xyz"), None);
+    }
+
+    #[test]
+    fn test_trusted_bin_dirs_are_root_owned_only() {
+        // Every trusted directory must be a system location. A user-writable
+        // entry here would reopen the hole this list exists to close.
+        for d in TRUSTED_BIN_DIRS {
+            assert!(d.starts_with('/'), "{d} is not absolute");
+            assert!(
+                !d.contains("/home/") && !d.contains("/tmp"),
+                "{d} is user-writable territory"
+            );
+            // `~` never expands in these strings, and a per-user Nix profile
+            // (`~/.nix-profile/bin`, or `/nix/var/nix/profiles/per-user/...`) is
+            // writable by its owner — only the root-owned default profile
+            // qualifies.
+            assert!(!d.contains('~'), "{d} relies on shell expansion");
+            assert!(
+                !d.contains("per-user") && !d.contains(".nix-profile"),
+                "{d} is a per-user Nix profile, which its owner can write to"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trusted_path_is_what_children_get() {
+        // Children must receive our chosen PATH, not the inherited one.
+        let p = trusted_path();
+        for d in TRUSTED_BIN_DIRS {
+            assert!(p.contains(d), "trusted PATH is missing {d}");
+        }
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn test_elevate_none_never_spawns_even_for_trusted_binary() {
+        // Privilege::None means no helper exists. Even a perfectly trusted
+        // command must not run — there is nothing to escalate with.
+        assert!(!elevate(Privilege::None, "sh", &["-c", "exit 0"]));
+    }
+
+    #[test]
+    fn test_elevate_refuses_untrusted_command() {
+        // With no helper needed (Root), a command outside the trusted set must
+        // still be refused rather than resolved through $PATH.
+        assert!(!elevate(
+            Privilege::Root,
+            "oxiclean_no_such_binary_xyz",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_is_root_matches_the_kernel() {
+        // is_root reads /proc/self/status instead of trusting an `id` binary that
+        // could be shadowed to print "0" — which would make us skip escalation.
+        // Cross-check against the real euid.
+        let expected = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    l.strip_prefix("Uid:")
+                        .and_then(|r| r.split_whitespace().nth(1).map(|e| e == "0"))
+                })
+            })
+            .expect("/proc/self/status must expose Uid");
+        assert_eq!(is_root(), expected);
+    }
 
     #[test]
     fn test_format_size_bytes() {

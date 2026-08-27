@@ -114,13 +114,20 @@ enum Ownership {
 /// both exit 0 when owned and exit 1 when they cleanly don't own the path.
 /// An installed tool exiting some other way is `Errored` (fail closed); a tool
 /// that isn't installed is `Absent` (it can't be managing this binary).
+///
+/// Resolved through a trusted system path rather than `$PATH`. This query is a
+/// safety gate — a shadowed `pacman` that simply exits 1 would report
+/// `NotOwned`, and we would then overwrite a package-manager-owned binary and
+/// corrupt its database. A tool we cannot resolve to a trusted location is
+/// `Absent`, matching "not installed".
 fn query_owner(tool: &str, args: &[&str], exe: &Path) -> Ownership {
-    if !utils::which(tool) {
+    let Some(tool_path) = utils::resolve_trusted(tool) else {
         return Ownership::Absent;
-    }
-    match Command::new(tool)
+    };
+    match Command::new(&tool_path)
         .args(args)
         .arg(exe)
+        .env("PATH", utils::trusted_path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
