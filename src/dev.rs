@@ -49,7 +49,18 @@ fn home_join(suffix: &str) -> Option<PathBuf> {
 
 /// Resolve `pnpm store path` at runtime. Falls back to `~/.local/share/pnpm/store`
 /// only if pnpm isn't on PATH.
+///
+/// The default location is checked first because asking pnpm costs ~280 ms — it
+/// is a Node program, so the answer arrives after a full interpreter startup.
+/// When the store is where pnpm puts it by default, that subprocess tells us
+/// nothing we did not already know. A relocated store (`store-dir` in
+/// `.npmrc`, or a pnpm-managed Node install) still falls through to asking.
 fn pnpm_store_path() -> Option<PathBuf> {
+    if let Some(default) = home_join(".local/share/pnpm/store") {
+        if default.is_dir() {
+            return Some(default);
+        }
+    }
     if utils::which("pnpm") {
         if let Some(out) = utils::capture("pnpm", &["store", "path"]) {
             if !out.is_empty() {
@@ -61,7 +72,27 @@ fn pnpm_store_path() -> Option<PathBuf> {
 }
 
 /// Resolve `go env GOMODCACHE`. Falls back to `$GOPATH/pkg/mod` then `~/go/pkg/mod`.
+///
+/// `GOMODCACHE` and `GOPATH` are read from the environment first: when either is
+/// set we already have the answer, and `go env` would only echo it back. Same
+/// default-first shortcut as pnpm, though `go env` is cheap by comparison.
 fn go_modcache_path() -> Option<PathBuf> {
+    for var in ["GOMODCACHE", "GOPATH"] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                return Some(if var == "GOMODCACHE" {
+                    PathBuf::from(val)
+                } else {
+                    PathBuf::from(val).join("pkg/mod")
+                });
+            }
+        }
+    }
+    if let Some(default) = home_join("go/pkg/mod") {
+        if default.is_dir() {
+            return Some(default);
+        }
+    }
     if utils::which("go") {
         if let Some(out) = utils::capture("go", &["env", "GOMODCACHE"]) {
             if !out.is_empty() {
@@ -72,8 +103,23 @@ fn go_modcache_path() -> Option<PathBuf> {
     home_join("go/pkg/mod")
 }
 
-/// Resolve `uv cache dir`. Falls back to `~/.cache/uv`.
+/// Resolve `uv cache dir`. Falls back to `~/.cache/uv`, honouring
+/// `UV_CACHE_DIR` and `XDG_CACHE_HOME` before spawning uv.
 fn uv_cache_path() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("UV_CACHE_DIR") {
+        if !val.is_empty() {
+            return Some(PathBuf::from(val));
+        }
+    }
+    let default = match std::env::var("XDG_CACHE_HOME") {
+        Ok(x) if !x.is_empty() => Some(PathBuf::from(x).join("uv")),
+        _ => home_join(".cache/uv"),
+    };
+    if let Some(d) = &default {
+        if d.is_dir() {
+            return Some(d.clone());
+        }
+    }
     if utils::which("uv") {
         if let Some(out) = utils::capture("uv", &["cache", "dir"]) {
             if !out.is_empty() {
@@ -81,7 +127,7 @@ fn uv_cache_path() -> Option<PathBuf> {
             }
         }
     }
-    home_join(".cache/uv")
+    default
 }
 
 /// Resolve `deno info` cache root. Falls back to `~/.cache/deno`.
@@ -477,8 +523,12 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             .unwrap_or(0),
 
         // pnpm: hard-linked store \u2014 NEVER touch directly.
+        //
+        // Every command-driven cleaner below takes its "before" size from
+        // `c.size`, which scan_all already measured. Re-walking here doubled the
+        // cost of the largest trees for a number we were holding.
         "pnpm" => {
-            let before = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let before = c.size;
             utils::run("pnpm", &["store", "prune"]);
             let after = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
@@ -488,7 +538,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             // Prefer the official command when available; otherwise fall
             // back to wiping DENO_DIR.
             if utils::which("deno") {
-                let before = deno_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+                let before = c.size;
                 utils::run("deno", &["clean"]);
                 let after = deno_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
                 before.saturating_sub(after)
@@ -503,9 +553,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // ── Python ──
         "pip" => {
             if utils::which("pip") {
-                let before = home_join(".cache/pip")
-                    .map(|p| utils::dir_size(&p))
-                    .unwrap_or(0);
+                let before = c.size;
                 utils::run("pip", &["cache", "purge"]);
                 let after = home_join(".cache/pip")
                     .map(|p| utils::dir_size(&p))
@@ -520,7 +568,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         }
         "uv" => {
             if utils::which("uv") {
-                let before = uv_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+                let before = c.size;
                 utils::run("uv", &["cache", "clean"]);
                 let after = uv_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
                 before.saturating_sub(after)
@@ -566,7 +614,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // Use the official command here because the module cache often
         // contains read-only files; direct deletion is less reliable.
         "go modules" if utils::which("go") => {
-            let before = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let before = c.size;
             utils::run("go", &["clean", "-modcache"]);
             let after = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
@@ -585,9 +633,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // Prefer Composer's own cache command when it exists instead of
         // blindly deleting the directory.
         "composer" if utils::which("composer") => {
-            let before = home_join(".cache/composer")
-                .map(|p| utils::dir_size(&p))
-                .unwrap_or(0);
+            let before = c.size;
             utils::run("composer", &["clear-cache", "--no-interaction"]);
             let after = home_join(".cache/composer")
                 .map(|p| utils::dir_size(&p))
@@ -597,7 +643,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "composer" => 0,
 
         "conda" if utils::which("conda") => {
-            let before = conda_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let before = c.size;
             utils::run("conda", &["clean", "--all", "--yes"]);
             let after = conda_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
@@ -606,7 +652,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
 
         // ── C/C++ ──
         "ccache" if utils::which("ccache") => {
-            let before = ccache_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let before = c.size;
             utils::run("ccache", &["-C"]);
             let after = ccache_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
@@ -615,7 +661,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
 
         // ── .NET ──
         "nuget" if utils::which("dotnet") => {
-            let before = nuget_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let before = c.size;
             utils::run("dotnet", &["nuget", "locals", "all", "--clear"]);
             let after = nuget_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
