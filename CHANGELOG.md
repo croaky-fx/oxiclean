@@ -1,5 +1,103 @@
 # Changelog
 
+## [1.8.0] - 2026-08-27
+
+### Security
+- **Privileged commands are no longer looked up in `$PATH`.** Every command run
+  with elevated privileges is now resolved to an absolute path inside a fixed
+  allowlist (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`,
+  `/usr/local/sbin`).
+
+  Handing a bare name to the privilege helper — `doas pacman -Sc` — leaves the
+  lookup to the helper. `sudo` is usually protected by a default `secure_path` in
+  `/etc/sudoers`, but that is administrator-configurable (clearing `env_reset`,
+  adding `env_keep += "PATH"`, or a build without `SECURE_PATH` all pass the
+  caller's `PATH` through) and **`doas` has no equivalent at all**. So a binary
+  named `pacman` in a directory preceding `/usr/bin` — and `~/.local/bin` is put
+  on `PATH` by pip, cargo and several shells — was executed **as root**. Void and
+  Alpine, where `doas` is the norm, were the most exposed. CWE-426.
+
+  Confirmed by exploit rather than inspection: on 1.7.2 a planted `pacman` ran
+  with `uid=0`; on 1.8.0 the same attack, with `pacman`, `id`, `pgrep`, `find`
+  and `rm` all planted, executes nothing.
+
+  The same resolution now covers every gate a shadowed binary could subvert, not
+  just execution: the package lists we feed to a privileged removal
+  (`pacman -Qdtq`, `zypper packages --orphaned`), the availability checks that
+  pick a privileged branch, the `pgrep` behind the "is an emerge running" guard
+  (a false negative there would delete a live build tree), and the
+  package-ownership query that decides whether self-update may proceed (a false
+  "not owned" would overwrite a package-managed binary and corrupt its database).
+  `is_root()` now reads `/proc/self/status` instead of trusting an `id` binary
+  that could print `0`.
+- **Child processes are handed a trusted `PATH`.** Package managers shell out
+  themselves — pacman runs hooks, emerge runs ebuilds, apk runs triggers — and
+  inherit our environment, so a poisoned `PATH` could still reach a root-running
+  hook. Only `PATH` is replaced; the rest of the environment is left intact
+  because the cleanup commands need it. `LD_PRELOAD` requires no handling: the
+  dynamic loader ignores it across a setuid boundary and both helpers strip it
+  (verified in a container).
+
+### Changed
+- A command that cannot be resolved to a trusted system directory is now treated
+  as unavailable, and its step is skipped rather than run. On a normal system
+  nothing changes — every package manager and coreutil we drive already lives
+  there — but a tool installed *only* somewhere like `~/bin` will no longer be
+  used for privileged work.
+- `--dev` deliberately keeps the unrestricted lookup. rustup installs `cargo` to
+  `~/.cargo/bin`, and the `uv`/`deno`/`pnpm`/`bun` installers default to
+  `~/.local/bin`; those commands run with your own privileges against your own
+  cache, so restricting them would break `--dev` for those users and prevent
+  nothing.
+
+### Fixed
+- **Nix reported `0 B` freed, always.** The freed figure came from walking
+  `/nix/store` before and after, but the store is root-owned and the walk runs
+  unprivileged, so it measured 0 both times. `nix-collect-garbage` prints the
+  real number itself — `1576 store paths deleted, 454.8 MiB freed` — computed
+  from each store path as it deletes, which is exact rather than inferred from
+  the filesystem. That line is now parsed instead. Verified against a real Nix
+  container: oxiclean reports 454.80 MB where Nix reports 454.8 MiB.
+- **Nix tooling is reachable again after the hardening above.** Nix installs its
+  binaries into the store and exposes them only through profile symlinks, so
+  `nix-collect-garbage` is never in `/usr/bin` — the trusted-path change would
+  have disabled Nix cleanup entirely. The root-owned system profile
+  (`/nix/var/nix/profiles/default/bin`) is now part of the trusted set; per-user
+  profiles are deliberately excluded, and a test rejects any path containing
+  `per-user` or `.nix-profile`.
+
+### Performance
+- **`~/.cache` scanning is 2.4× faster** — 88 ms → 36 ms on a 40 000-file tree,
+  which is what `du` costs for the same walk. `dir_size` asked
+  `is_symlink()`, then `is_dir()`, then `metadata()` for every entry, and each of
+  those re-resolves the path: three syscalls per file. Type and size now come
+  from the directory read that already happened. It is also iterative now, so a
+  deep tree cannot overflow the stack.
+- **Deletion stopped re-measuring what it had just measured.** `rm_contents` made
+  five path resolutions per entry — three to size it, two more to choose between
+  `remove_dir_all` and `remove_file`. One `lstat` answers all of it.
+- **`--dev` scanning is 4.1× faster** — 442 ms → 108 ms, and no longer spawns any
+  subprocess. It asked `pnpm store path` before looking at the default location,
+  and pnpm is a Node program: 280 ms of the 442 was interpreter startup for a path
+  we could have found ourselves. The default is checked first now, with the tool
+  asked only when the cache has been relocated; `uv` and `go` likewise read
+  `UV_CACHE_DIR`, `GOMODCACHE` and `GOPATH` from the environment first.
+- **`--dev` cleanup reuses the sizes from its own scan.** Nine cleaners re-walked
+  their cache directory to establish a "before" size that `scan_all` had measured
+  moments earlier — including `~/.npm/_cacache`, which is routinely hundreds of
+  megabytes.
+
+## [1.7.2] - 2026-08-13
+
+### Fixed
+- **Distro detection handled only double-quoted `os-release` values.** The spec
+  permits either quote style, and Gentoo ships `ID='gentoo'` — the single quotes
+  stayed attached, matched nothing in the detection table, and the distro
+  silently fell through to `Unknown`, so Gentoo and Funtoo systems got universal
+  cleaning only instead of portage handling. `PRETTY_NAME` had the same gap, and
+  so did `ID_LIKE`, which affects hand-edited derivative entries. Reported by a
+  user. Regression tests cover single-quoted, double-quoted and unquoted values.
+
 ## [1.7.1] - 2026-08-11
 
 Package-cache handling audited against every supported family by running the

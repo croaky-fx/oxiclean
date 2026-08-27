@@ -14,14 +14,12 @@
 
 ---
 
-I hop between Linux distros a lot. Arch one month, Fedora the next, maybe Void when I'm feeling adventurous. And every single time I'd forget: *what's the command to clean orphaned packages here again? where does this distro put its package cache?*
-
-So I wrote OxiClean. It figures out what distro you're on and does the right thing. That's basically it.
+OxiClean figures out what distro you're on and does the right thing. That's basically it.
 
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.7.2
+    ⚡ Oxi Clean  v1.8.0
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 
@@ -238,19 +236,18 @@ It looks like this:
     ✔ Freed 1.02 GB
 ```
 
-A few things it explicitly *won't* do (these are the ones that bite people):
-- `~/.cargo/bin` is never touched (it has your installed binaries like `cargo-watch`, `rustfmt`)
-- pnpm uses hardlinks to its store — wiping the directory breaks every `node_modules` on the system, so it runs `pnpm store prune` instead
-- Poetry's `virtualenvs/` directory is preserved — only the package download `cache/` is cleaned
-- Gradle's `wrapper/` (which holds the actual Gradle distributions) stays — only `caches/` goes
-- npm globals (`~/.npm/lib/node_modules`) stay — only `_cacache/` goes
-- aura's `~/.cache/aura/snapshots/` stays — those are saved restore points you
-  feed back to `aura -B`, not cache. Only `builds/` is pruned on a normal run
-  (tarball cache and git clones need `--deep`)
+A few things it explicitly *won't* do — the ones that bite people:
+- `~/.cargo/bin` is never touched (your installed binaries, not a cache)
+- pnpm's store is hardlinked into every `node_modules` on the disk, so wiping it
+  breaks every project — it runs `pnpm store prune` instead
+- poetry's `virtualenvs/`, gradle's `wrapper/`, npm globals and aura's restore
+  points are all preserved
+
+Each of those is enforced by a test. [Full list and rationale →](DETAILS.md#what-it-spares-and-why)
 
 `--all` does *not* include `--dev` on purpose. Dev caches have very different
-tradeoffs (some trigger gigabyte-scale re-downloads) and they should be an
-explicit choice.
+tradeoffs (some trigger gigabyte-scale re-downloads) and should be an explicit
+choice.
 
 ### All flags
 
@@ -283,22 +280,13 @@ Options:
 
 ### Shell completions
 
-If you want tab completion, OxiClean can print the script for your shell and you
-just redirect it where your distro expects it:
-
 ```bash
-# bash
 oxiclean --generate-completion bash > ~/.local/share/bash-completion/completions/oxiclean
-
-# zsh
-mkdir -p ~/.local/share/zsh/site-functions
-oxiclean --generate-completion zsh > ~/.local/share/zsh/site-functions/_oxiclean
-
-# fish
+oxiclean --generate-completion zsh  > ~/.local/share/zsh/site-functions/_oxiclean
 oxiclean --generate-completion fish > ~/.config/fish/completions/oxiclean.fish
 ```
 
-Not glamorous, but it works fine and keeps the binary simple.
+Also supports `elvish` and `powershell`.
 
 ---
 
@@ -326,125 +314,37 @@ image swaps, not the package manager — while user-level cleanup still runs.
 
 ---
 
-## A few things worth knowing
+## Good to know
 
-**It won't touch your personal files.** No documents, no downloads, no running app data, no boot files. Only caches, package leftovers, and logs. If you're still nervous, `--dry-run` exists for a reason.
+**It won't touch your personal files.** No documents, no downloads, no running app data, no boot files — only caches, package leftovers, and logs. `--dry-run` exists if you'd rather see first.
 
-**Results vary a lot.** Whether you free 5MB or 2GB depends on how long since you last cleaned, your distro, and your disk. The tool's value isn't in big numbers — it's in not having to remember 10 different commands for 10 different distros.
+**Results vary a lot.** Whether you free 5 MB or 2 GB depends on how long since you last cleaned, your distro, and your disk. The value isn't the number — it's not having to remember ten commands for ten distros.
 
-**`--deep` is a bit more aggressive.** Things like `pacman -Scc` (removes *all* cached packages, not just old ones), `flatpak repair`, or the cargo/go caches that'll re-download. Useful for squeezing out more space, but worth knowing what you're getting into. Run `--dry-run --deep` first if unsure.
+**`--deep` is more aggressive.** `pacman -Scc`, `flatpak repair`, cached packages that'll re-download. Run `--dry-run --deep` first if unsure.
 
-**The helpers' own output is captured, not lost.** pacman, the AUR helpers,
-flatpak and journalctl each print several lines of their own, which used to be
-most of what a `--all` run showed. They're captured now so the report reads as a
-report. Nothing is hidden that you'd need: a command that **fails** replays its
-stderr under the error line, and `--verbose` gives you the raw output back.
-Package removal, Nix GC and `fstrim` still print live — they're slow enough that
-silence would look like a hang, and `fstrim`'s output is the result itself.
+**It needs sudo or doas for some things** — package cache, orphan removal, journal. Detected at startup; on Alpine and Void where `doas` is the default, no configuration needed. User-level operations (`--cache`, `--trash`, `--dev`) never ask.
 
-**It needs sudo or doas for some things** — package cache, orphan removal, journal. Detected automatically at startup; on Alpine and Void where `doas` is the default, no configuration needed. For user-level stuff (your `~/.cache`, trash, dev caches) it won't ask.
+**Privileged commands are resolved to absolute system paths**, never through `$PATH` — a binary you didn't install can't be run as root through this tool. See [DETAILS.md](DETAILS.md#security).
 
-**HDD warning.** If your root filesystem lives on a spinning disk, you'll see a heads-up at startup that cleanup may take a while. Reading directory sizes on an HDD with millions of small files (looking at you, `~/.cargo/registry`) is genuinely slow. Not a bug, just physics.
+**HDD warning.** On a spinning root disk you'll get a heads-up that cleanup may take a while. Reading directory sizes across millions of small files (looking at you, `~/.cargo/registry`) is genuinely slow. Not a bug, just physics.
 
 **Cron-friendly:**
 ```
 0 3 * * 0 /usr/local/bin/oxiclean --all --yes --quiet
 ```
-Avoid `--deep` in automated runs. And if you want dev caches included, add `--dev`.
+Avoid `--deep` in automated runs. Add `--dev` if you want dev caches included.
 
 ---
 
-## How it works under the hood
+## More documentation
 
-It reads `/etc/os-release` to figure out your distro, then checks `$PATH` for which tools are available. Detection chain looks roughly like:
+**[DETAILS.md](DETAILS.md)** covers the longer story:
 
-```
-/etc/os-release
-  ID=arch          → pacman
-  ID=ubuntu        → apt
-  ID=fedora        → dnf
-  ID=opensuse-...  → zypper
-  ID_LIKE=arch     → pacman  (for derivatives)
-  (unknown)        → universal cleaning only
-```
-
-Freed space is measured by checking directory sizes before and after — not estimated. The one exception is orphan removal, since those files are scattered across the system.
-
-The binary is a single self-contained file (~2 MB). It uses `clap` for CLI
-parsing, `colored` for terminal colors, `clap_complete` for shell completions,
-and `ureq` + `rustls` for the built-in `--update` command — the TLS stack is
-what takes most of the size, but it means self-update needs no external `curl`
-or `wget`. The `musl` build has no runtime dependencies at all (fully static).
-
----
-
-## Project structure
-
-```
-oxiclean/
-├── Cargo.toml
-├── PKGBUILD
-├── install.sh      # Prebuilt-binary installer (curl | sh)
-├── tests/
-│   └── cli_test.rs
-└── src/
-    ├── main.rs     # CLI parsing, orchestration, summary
-    ├── detect.rs   # Distro detection, privilege/disk detection
-    ├── clean.rs    # System cleaning operations
-    ├── dev.rs      # Dev-tool cache cleanup (npm, cargo, pip, ...)
-    ├── update.rs   # Self-update (--update): GitHub check, verify, swap
-    └── utils.rs    # Command execution, file ops, helpers
-```
-
----
-
-## Testing
-
-```bash
-cargo test
-cargo test -- --nocapture  # with output
-cargo clippy -- -D warnings
-cargo fmt -- --check
-```
-
-There are 118 unit tests and 17 integration tests. The interesting ones aren't the trivial "does this format correctly" checks — they're the regression guards: the dev cleaner never targeting `~/.cargo/bin`, `~/.cache/pypoetry/virtualenvs`, or `~/.gradle/wrapper`; `--cache` never selecting a HuggingFace/torch model cache for deletion, and never claiming a model can be cleaned with `--dev` (it can't); `--all` never enabling `--dev`/`--trim`; trizen's clean staying scoped to the AUR cache so a plain run can't wipe every cached pacman package; aura's prune lists never naming `snapshots/` (saved restore points) or `hashes/` (build bookkeeping), and its cache dir never being wiped wholesale in either mode; deferring an AUR helper's cache to the AUR section never stranding it when that section isn't running; each measured cache path matching what its clean command actually clears (a mismatch silently under-reports); hostile `PORTAGE_TMPDIR` values never resolving to a deletable path, and the Gentoo build-tmp cleanup clearing contents while leaving the directory itself; `--json` output parsing as valid JSON; read-only-rootfs detection matching only the exact `ro` mount flag; and self-update refusing to overwrite a package-manager-owned binary. Those are the ones that would actually ruin someone's day.
-
-The package-cache path for every family has been checked by running the tool in
-a container for that distro, not just read off documentation — that is how the
-Void, Alpine and openSUSE bugs in 1.7.1 were found.
-
----
-
-## Contributing
-
-```bash
-git clone https://github.com/croaky-fx/oxiclean.git
-cd oxiclean
-cargo build && cargo test
-```
-
-**Adding a new distro** — the process is pretty mechanical:
-1. Add a variant to the `Distro` enum in `detect.rs`
-2. Add its ID to the detection arrays
-3. Add cache cleaning in `clean.rs → pkg_cache()`
-4. Add orphan removal in `clean.rs → orphans()` (skip if the distro is atomic/immutable — it has no orphans)
-5. Update the README table
-6. Test it (a VM or container works fine)
-
-**Things I'd love help with:**
-- Testing on immutable systems (Silverblue, Kinoite, Bazzite, SteamOS, MicroOS) — the atomic/read-only paths are the newest and least battle-tested
-- **Testing on a real `aura` install.** aura has no command that cleans its own
-  cache (`-Sc` passes through to pacman; `-Cc` is the downgrade namespace, takes a
-  mandatory version count, and also targets the pacman cache), so oxiclean clears
-  `~/.cache/aura/builds` directly, with built tarballs and AUR git clones behind
-  `--deep`, and `snapshots/` (restore points) plus `hashes/` (build bookkeeping)
-  never touched. That logic is covered by unit tests but has only been exercised
-  against a stubbed binary and a hand-made directory tree — a check against a
-  real aura install, especially that the directory names still match, would be
-  genuinely useful.
-- More dev tools in `--dev` (mix, rebar, sbt...)
-- Better distro-specific docs for Alpine / Void / Nix edge cases
-- A couple more real-world smoke tests on HDD systems
+- [Everything it deliberately spares, and why](DETAILS.md#what-it-spares-and-why) — model weights, pnpm's store, aura's restore points, immutable systems
+- [Security design](DETAILS.md#security) — trusted binary resolution (CWE-426), child environment hardening, self-update guards, the portage build-tmp guards
+- [How it works under the hood](DETAILS.md#how-it-works-under-the-hood) — detection, how freed space is measured, why captured output
+- [Testing](DETAILS.md#testing) — the 132 unit + 17 integration tests, and which ones matter
+- [Contributing](DETAILS.md#contributing) — adding a distro, and what I'd love help with
 
 ---
 
@@ -453,33 +353,39 @@ cargo build && cargo test
 <details>
 <summary>Is <code>--all --yes --deep</code> safe to run?</summary>
 
-It removes cached packages (not installed ones), orphaned packages, old Nix generations, and vacuums journal logs. Your actual software and personal files are never touched. If you're unsure, run `--dry-run` first — that's what it's there for.
+It removes cached packages (not installed ones), orphaned packages, old Nix generations, and vacuums journal logs. Your software and personal files are never touched. If unsure, run `--dry-run` first.
 </details>
 
 <details>
 <summary>Does it work on my distro?</summary>
 
-If your distro is based on any of the supported families (Arch, Debian, Fedora, etc.) — yes. Unknown distros get universal cleaning (cache, trash, journal, Flatpak, Snap) which is still useful.
+If it's based on any supported family (Arch, Debian, Fedora, openSUSE, Void, Alpine, Gentoo, Solus, Clear, NixOS) — yes. Unknown distros still get universal cleaning: cache, trash, journal, Flatpak, Snap.
 </details>
 
 <details>
 <summary>Will <code>--dev</code> break my Rust/Node/Python projects?</summary>
 
-No. Without `--deep` it only removes things that get rebuilt locally with no network (cargo's extracted sources, pip wheel cache, npm download cache, etc.). With `--deep` it also clears caches that *will* re-download next time you build, so don't run that on a metered connection.
+No. Without `--deep` it only removes things rebuilt locally with no network (cargo's extracted sources, pip's wheel cache, npm's download cache). With `--deep` it also clears caches that *will* re-download, so don't run that on a metered connection.
 
-The one thing it explicitly *cannot* break is your installed binaries — `~/.cargo/bin`, npm globals, poetry virtualenvs, and gradle's wrapper are all preserved by design, with unit tests that fail loudly if anyone tries to change that.
+What it explicitly *cannot* break is your installed binaries — `~/.cargo/bin`, npm globals, poetry virtualenvs and gradle's wrapper are preserved by design, with tests that fail loudly if anyone changes that.
 </details>
 
 <details>
 <summary>How is this different from BleachBit?</summary>
 
-BleachBit is GUI-based, Python-dependent, and focuses on cleaning inside specific applications. OxiClean is a single CLI binary focused on system-level cleanup that works the same way regardless of what distro you're on. Different tools for different needs — they don't really overlap much.
+BleachBit is GUI-based, Python-dependent, and focuses on cleaning inside specific applications. OxiClean is a single CLI binary for system-level cleanup that works the same way whatever distro you're on. Different tools for different jobs.
 </details>
 
 <details>
 <summary>Why Rust?</summary>
 
 Honestly, I wanted to learn it. Also: single static binary, no interpreter to install, fast, and the type system catches a lot of bugs before they ship.
+</details>
+
+<details>
+<summary>Did you use AI?</summary>
+
+Yes — this project is AI-assisted, alongside my own work, across docs, code, and test-writing.
 </details>
 
 ---
