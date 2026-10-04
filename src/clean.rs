@@ -857,7 +857,7 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
             let pkgs: Vec<&str> = out.lines().collect();
             utils::info(&format!("Found {} orphan(s):", pkgs.len()));
             for p in &pkgs {
-                println!("      {} {}", "\u{2022}".dimmed(), p);
+                utils::plain(&format!("      {} {}", "\u{2022}".dimmed(), p));
             }
             if dry_run {
                 utils::info("[DRY RUN] Would remove above packages");

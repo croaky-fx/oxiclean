@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 use crate::detect::Privilege;
@@ -93,10 +93,22 @@ pub fn trusted_path() -> String {
 /// them, so the call returns `false` and nothing says why. Those go through
 /// [`run_user`].
 pub fn run(cmd: &str, args: &[&str]) -> bool {
-    harden_env(Command::new(cmd).args(args))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let mut command = Command::new(cmd);
+    command.args(args);
+    harden_env(&mut command);
+    keep_json_stdout_clean(&mut command);
+    command.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// `--json` promises exactly one document on stdout, and a child that inherits
+/// stdout is free to add lines of its own (`apt-get autoremove` certainly
+/// does). So in JSON mode a visible command's stdout goes nowhere. Its stderr
+/// is left alone: that is how a failure still reaches a person watching the
+/// terminal, and no consumer parses it.
+fn keep_json_stdout_clean(command: &mut Command) {
+    if silent() {
+        command.stdout(Stdio::null());
+    }
 }
 
 /// Run a tool that belongs to the *user*, with visible output (inherits stdio).
@@ -110,7 +122,9 @@ pub fn run(cmd: &str, args: &[&str]) -> bool {
 /// The child keeps the caller's environment, `PATH` included. A shim or a
 /// wrapper script finds the interpreter it needs only through the `PATH` it
 /// was started with, and narrowing it is what made `--dev` lose track of
-/// user-installed tools in 1.8.0.
+/// user-installed tools in 1.8.0. The one addition is [`TOOL_ENV_DEFAULTS`]:
+/// switches that keep a tool's one-time setup out of a cleanup run, never
+/// overriding a choice the caller has already made.
 ///
 /// This is not an escalation: the tool runs with the caller's rights against
 /// the caller's caches, so a binary the caller controls gains nothing. It must
@@ -122,13 +136,111 @@ pub fn run_user(cmd: &str, args: &[&str]) -> bool {
 /// [`run_user`] with the search path passed in, so tests can aim it at a
 /// scratch directory without touching the process environment.
 fn run_user_in(paths: &OsStr, cmd: &str, args: &[&str]) -> bool {
-    match which_path_in(cmd, paths) {
-        Some(program) => Command::new(program)
-            .args(args)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
-        None => false,
+    let Some(program) = which_path_in(cmd, paths) else {
+        return false;
+    };
+    let mut command = user_command(&program, args);
+    keep_json_stdout_clean(&mut command);
+    command.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// [`run_user`] without letting the tool's own chatter into our report: the
+/// user-tier counterpart of [`run_quiet`], on the same terms. Nothing is
+/// printed on success, a failure replays what the tool said, `--verbose` opts
+/// back into the raw output, and the tool gets a null stdin.
+///
+/// `--dev` needs this more than the package managers do. The tools it drives
+/// print whatever they like: `pnpm` a prune report, `uv` a summary and, on the
+/// first run after an SDK install or upgrade, `dotnet` a welcome banner with
+/// documentation links and a telemetry notice. None of it is ours, and it all
+/// lands in the middle of our report.
+pub fn run_user_quiet(cmd: &str, args: &[&str]) -> bool {
+    if is_verbose() {
+        return run_user(cmd, args);
+    }
+    run_user_quiet_in(&env::var_os("PATH").unwrap_or_default(), cmd, args)
+}
+
+/// [`run_user_quiet`] over an explicit search path (see [`run_user_in`]).
+fn run_user_quiet_in(paths: &OsStr, cmd: &str, args: &[&str]) -> bool {
+    let Some(program) = which_path_in(cmd, paths) else {
+        return false;
+    };
+    match user_command(&program, args).output() {
+        Ok(out) => {
+            if !out.status.success() {
+                replay_failure(&out);
+            }
+            out.status.success()
+        }
+        Err(_) => false,
+    }
+}
+
+/// The command for a user-tier tool: the program at its resolved path, the
+/// caller's environment, and the defaults from [`TOOL_ENV_DEFAULTS`].
+fn user_command(program: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    command.args(args);
+    apply_tool_env(&mut command, program);
+    command
+}
+
+/// Environment a user-tier tool starts with unless the caller has already
+/// chosen, keyed by the program's file name.
+///
+/// `dotnet` is the reason this exists. The first command after an SDK install
+/// or upgrade runs one-time setup that nothing about clearing a cache asked
+/// for, as a side effect of whatever command happened to come first:
+///
+/// * a welcome banner, with documentation links and a telemetry notice, on stdout;
+/// * generating an ASP.NET Core HTTPS development certificate;
+/// * adding the global-tools directory to the `PATH`;
+/// * a workload integrity check, which may repair workloads over the network.
+///
+/// Each has its own switch, and `DOTNET_NOLOGO` covers only the first, which is
+/// the cosmetic part. Hiding the banner while still generating a certificate
+/// would be tidier, not better, so every switch is set. The telemetry opt-out
+/// is here for the same reason: a cache cleaner should not report anything on
+/// the user's behalf.
+///
+/// `DOTNET_SKIP_FIRST_TIME_EXPERIENCE` is the legacy first-run switch. Current
+/// SDKs ignore it and older ones honoured it, so setting it costs nothing.
+const TOOL_ENV_DEFAULTS: &[(&str, &[(&str, &str)])] = &[(
+    "dotnet",
+    &[
+        ("DOTNET_NOLOGO", "1"),
+        ("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+        ("DOTNET_GENERATE_ASPNET_CERTIFICATE", "false"),
+        ("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", "false"),
+        ("DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK", "1"),
+        ("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1"),
+    ],
+)];
+
+/// The [`TOOL_ENV_DEFAULTS`] that apply to `program` (matched on its file name
+/// only, so a directory called `dotnet` does not make its contents dotnet),
+/// minus any variable `is_set` says the caller already has.
+fn tool_env_defaults(
+    program: &Path,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, &'static str)> {
+    let Some(name) = program.file_name().and_then(OsStr::to_str) else {
+        return Vec::new();
+    };
+    TOOL_ENV_DEFAULTS
+        .iter()
+        .filter(|(tool, _)| *tool == name)
+        .flat_map(|(_, vars)| vars.iter().copied())
+        .filter(|(key, _)| !is_set(key))
+        .collect()
+}
+
+/// Give `command` the defaults for `program`, leaving alone every variable the
+/// caller's own environment already sets.
+fn apply_tool_env(command: &mut Command, program: &Path) {
+    for (key, value) in tool_env_defaults(program, |key| env::var_os(key).is_some()) {
+        command.env(key, value);
     }
 }
 
@@ -180,6 +292,21 @@ fn replay_stderr(stderr: &[u8]) {
     for line in text.lines().filter(|l| !l.trim().is_empty()).take(5) {
         println!("      {}", line.dimmed());
     }
+}
+
+/// What to show for a captured command that failed. Most tools complain on
+/// stderr, but some (MSBuild-based ones among them) report errors on stdout, so
+/// when stderr has nothing to say the explanation is looked for there.
+fn failure_detail(out: &Output) -> &[u8] {
+    if out.stderr.iter().all(u8::is_ascii_whitespace) {
+        &out.stdout
+    } else {
+        &out.stderr
+    }
+}
+
+fn replay_failure(out: &Output) {
+    replay_stderr(failure_detail(out));
 }
 
 /// [`run_quiet`] with privilege escalation. Mirrors [`elevate`]'s dispatch.
@@ -378,6 +505,8 @@ fn capture_program(program: &Path, args: &[&str], harden: bool) -> Option<String
     command.args(args);
     if harden {
         harden_env(&mut command);
+    } else {
+        apply_tool_env(&mut command, program);
     }
     command
         .stderr(Stdio::null())
@@ -691,6 +820,21 @@ pub fn skip(msg: &str) {
         return;
     }
     println!("    {} {}", "⊘".dimmed(), msg.dimmed());
+}
+
+/// A line of report content with no marker of its own: a table row, a package
+/// in a list. Silent in JSON mode like every other helper here. `--quiet` keeps
+/// it, because unlike [`info`] it is the content the user asked for rather than
+/// commentary on it.
+///
+/// Anything a report prints goes through one of these helpers, never straight
+/// to `println!`: one stray line is enough to corrupt a `--json` consumer's
+/// input, and nothing else would notice.
+pub fn plain(msg: &str) {
+    if silent() {
+        return;
+    }
+    println!("{msg}");
 }
 
 #[cfg(test)]
@@ -1264,5 +1408,211 @@ mod tests {
             .status();
         assert!(nowhere.is_err(), "...and only through the child's PATH");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Per-tool environment ──
+
+    #[test]
+    fn test_tool_env_defaults_for_dotnet_switch_off_every_first_run_side_effect() {
+        let defaults = tool_env_defaults(Path::new("dotnet"), |_| false);
+        for pair in [
+            ("DOTNET_NOLOGO", "1"),
+            ("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+            ("DOTNET_GENERATE_ASPNET_CERTIFICATE", "false"),
+            ("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", "false"),
+            ("DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK", "1"),
+        ] {
+            assert!(
+                defaults.contains(&pair),
+                "{pair:?} missing from {defaults:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_env_defaults_match_the_tool_by_file_name_only() {
+        let has_defaults = |p: &str| !tool_env_defaults(Path::new(p), |_| false).is_empty();
+        assert!(has_defaults("dotnet"));
+        assert!(has_defaults("/usr/share/dotnet/dotnet"));
+        assert!(!has_defaults("uv"));
+        assert!(!has_defaults("dotnetx"));
+        assert!(!has_defaults("not-dotnet"));
+        // A directory called `dotnet` does not make everything inside it dotnet.
+        assert!(!has_defaults("/home/u/dotnet/uv"));
+    }
+
+    #[test]
+    fn test_tool_env_defaults_never_override_what_the_caller_set() {
+        let defaults = tool_env_defaults(Path::new("dotnet"), |key| {
+            key == "DOTNET_CLI_TELEMETRY_OPTOUT"
+        });
+        assert!(defaults
+            .iter()
+            .all(|(k, _)| *k != "DOTNET_CLI_TELEMETRY_OPTOUT"));
+        assert!(
+            defaults.iter().any(|(k, _)| *k == "DOTNET_NOLOGO"),
+            "the choices the caller did not make still apply"
+        );
+    }
+
+    #[test]
+    fn test_user_tier_child_gets_the_tool_defaults_and_other_tools_none() {
+        // Through a real child, so the whole chain from lookup to environment
+        // is covered. The host may have chosen already (a .NET developer often
+        // has), and then its choice is what the child must see.
+        let dir = scratch("tool_env");
+        sh_as(&dir, "dotnet");
+        sh_as(&dir, "uv");
+        let show = ["-c", "printf %s \"$DOTNET_GENERATE_ASPNET_CERTIFICATE\""];
+        let host = env::var("DOTNET_GENERATE_ASPNET_CERTIFICATE");
+
+        let dotnet = capture_in(dir.as_os_str(), "dotnet", &show).unwrap();
+        assert_eq!(dotnet, host.clone().unwrap_or_else(|_| "false".into()));
+        let uv = capture_in(dir.as_os_str(), "uv", &show).unwrap();
+        assert_eq!(uv, host.unwrap_or_default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_user_quiet_reports_the_tools_status() {
+        let dir = scratch("quiet_status");
+        sh_as(&dir, "sh");
+
+        assert!(run_user_quiet_in(dir.as_os_str(), "sh", &["-c", "exit 0"]));
+        assert!(!run_user_quiet_in(dir.as_os_str(), "sh", &["-c", "exit 3"]));
+        assert!(!run_user_quiet_in(
+            dir.as_os_str(),
+            "oxiclean-no-such-tool",
+            &[]
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_failure_detail_prefers_stderr_and_falls_back_to_stdout() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = |stdout: &str, stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        let both = failed("on stdout", "on stderr");
+        assert_eq!(failure_detail(&both), b"on stderr");
+        // Some tools report errors on stdout and leave stderr empty or blank.
+        let only_stdout = failed("error: on stdout", " \n");
+        assert_eq!(failure_detail(&only_stdout), b"error: on stdout");
+    }
+
+    // ── Output discipline ──
+    //
+    // Whether a tool's chatter reaches stdout, and whether JSON mode silences
+    // the helpers, are properties of the whole process: JSON mode is a switch
+    // that can be set once. So these tests run themselves again as a child
+    // process (`OXI_CHILD` set), where they may flip it, and inspect what the
+    // child printed.
+
+    const CHILD_ENV: &str = "OXI_CHILD";
+
+    /// Re-run the one test `name` of this binary in a child process.
+    fn run_as_child(name: &str) -> Output {
+        Command::new(env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap()
+    }
+
+    /// What the child printed, after checking that it ran and passed.
+    fn child_stdout(name: &str) -> String {
+        let out = run_as_child(name);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+        assert!(stdout.contains("CHILD-RAN"), "child never ran:\n{stdout}");
+        stdout
+    }
+
+    #[test]
+    fn test_quiet_run_keeps_the_tools_chatter_off_stdout() {
+        const ME: &str = "utils::tests::test_quiet_run_keeps_the_tools_chatter_off_stdout";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                !stdout.contains("TOOL-CHATTER"),
+                "chatter leaked:\n{stdout}"
+            );
+            assert!(
+                stdout.contains("TOOL-COMPLAINT"),
+                "a failing tool's complaint must be replayed:\n{stdout}"
+            );
+            return;
+        }
+        let dir = scratch("quiet_chatter");
+        sh_as(&dir, "sh");
+        let noisy = "echo TOOL-CHATTER; echo TOOL-CHATTER >&2";
+        assert!(run_user_quiet_in(dir.as_os_str(), "sh", &["-c", noisy]));
+        let failing = "echo TOOL-COMPLAINT >&2; exit 1";
+        assert!(!run_user_quiet_in(dir.as_os_str(), "sh", &["-c", failing]));
+        println!("CHILD-RAN");
+    }
+
+    #[test]
+    fn test_json_mode_children_cannot_write_to_stdout() {
+        const ME: &str = "utils::tests::test_json_mode_children_cannot_write_to_stdout";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            for leak in ["TOOL-CHATTER", "HELPER-LINE"] {
+                assert!(
+                    !stdout.contains(leak),
+                    "{leak} leaked into JSON mode:\n{stdout}"
+                );
+            }
+            return;
+        }
+        set_json(true);
+        let dir = scratch("json_chatter");
+        sh_as(&dir, "sh");
+        // Both tiers, visible runs: the tool inherits stdout unless we stop it.
+        assert!(run_user_in(
+            dir.as_os_str(),
+            "sh",
+            &["-c", "echo TOOL-CHATTER"]
+        ));
+        assert!(run("sh", &["-c", "echo TOOL-CHATTER"]));
+        // And every human-facing helper goes quiet.
+        plain("HELPER-LINE plain");
+        success("HELPER-LINE success");
+        info("HELPER-LINE info");
+        println!("CHILD-RAN");
+    }
+
+    #[test]
+    fn test_report_modules_print_only_through_the_output_helpers() {
+        // `--json` promises exactly one document on stdout, so every
+        // human-facing line has to go through the helpers that go quiet in JSON
+        // mode. A direct `println!` in a report module is invisible until a
+        // machine consumer chokes on it (clean.rs once listed orphaned packages
+        // that way). main.rs is exempt: it owns the banner and the final
+        // report, and branches on `--json` itself.
+        let modules = [
+            ("clean.rs", include_str!("clean.rs")),
+            ("dev.rs", include_str!("dev.rs")),
+            ("detect.rs", include_str!("detect.rs")),
+        ];
+        for (name, source) in modules {
+            for (number, line) in source.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let code = code.replace("eprintln!(", "").replace("eprint!(", "");
+                assert!(
+                    !code.contains("println!(") && !code.contains("print!("),
+                    "{name}:{} prints straight to stdout, use the helpers in utils: {code}",
+                    number + 1
+                );
+            }
+        }
     }
 }

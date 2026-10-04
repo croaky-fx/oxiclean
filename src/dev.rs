@@ -416,30 +416,31 @@ pub fn print_summary(caches: &[DevCache], deep: bool) {
         } else {
             utils::format_size(c.size)
         };
-        println!(
+        utils::plain(&format!(
             "      \u{2022} {:width$}  {:>10}   {} {}",
             c.name,
             size_str,
             marker,
             c.note.dimmed(),
             width = name_width
-        );
+        ));
     }
 
     let total = total_size(caches);
     let to_clean = cleanable_size(caches, deep);
-    println!(
+    utils::plain(&format!(
         "      {} Total: {}   |   Will clean now: {}",
         "\u{2500}".dimmed(),
         utils::format_size(total).cyan().bold(),
         utils::format_size(to_clean).green().bold()
-    );
-    if !deep && total > to_clean {
-        println!(
+    ));
+    // Advice rather than content: `--quiet` drops it like every `info` line.
+    if !deep && total > to_clean && !utils::is_quiet() {
+        utils::plain(&format!(
             "      {} {}",
             "\u{2139}".blue(),
             "Pass --deep to also clean caches that trigger re-downloads".dimmed()
-        );
+        ));
     }
 }
 
@@ -495,6 +496,39 @@ fn clean_dir_contents_except(path: &Path, keep: &[&str]) -> u64 {
     freed
 }
 
+/// Run the tool's own cleanup command for `c`, with its chatter captured.
+///
+/// One line says what is running, because these can take a while and the
+/// tool's own output no longer shows progress. A failure is reported under the
+/// cache's name: `run_user_quiet` has replayed the tool's complaint by then,
+/// and before output was captured that complaint was the only trace of a failed
+/// cleanup, so swallowing it now would be a regression.
+fn run_tool(c: &DevCache, cmd: &str, args: &[&str]) -> bool {
+    let command = std::iter::once(cmd)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    utils::info(&format!("Cleaning {}: {command}", c.name));
+    let ok = utils::run_user_quiet(cmd, args);
+    if !ok {
+        utils::error(&format!("{}: `{command}` failed", c.name));
+    }
+    ok
+}
+
+/// One result line per cleaned cache. The tools' own output is captured now, so
+/// without this the only trace of a cleanup would be the grand total.
+fn report_cleaned(c: &DevCache, deep: bool, freed: u64) {
+    if c.needs_redownload && !deep {
+        return; // skipped on purpose, and already flagged in the summary
+    }
+    if freed > 0 {
+        utils::success(&format!("{}: {}", c.name, utils::format_size(freed)));
+    } else if c.size > 0 {
+        utils::info(&format!("{}: nothing freed", c.name));
+    }
+}
+
 fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
     if c.needs_redownload && !deep {
         return 0; // skipped \u2014 already reported in summary
@@ -529,7 +563,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // cost of the largest trees for a number we were holding.
         "pnpm" => {
             let before = c.size;
-            utils::run_user("pnpm", &["store", "prune"]);
+            run_tool(c, "pnpm", &["store", "prune"]);
             let after = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -539,7 +573,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             // back to wiping DENO_DIR.
             if utils::which("deno") {
                 let before = c.size;
-                utils::run_user("deno", &["clean"]);
+                run_tool(c, "deno", &["clean"]);
                 let after = deno_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
                 before.saturating_sub(after)
             } else {
@@ -554,7 +588,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "pip" => {
             if utils::which("pip") {
                 let before = c.size;
-                utils::run_user("pip", &["cache", "purge"]);
+                run_tool(c, "pip", &["cache", "purge"]);
                 let after = home_join(".cache/pip")
                     .map(|p| utils::dir_size(&p))
                     .unwrap_or(0);
@@ -569,7 +603,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "uv" => {
             if utils::which("uv") {
                 let before = c.size;
-                utils::run_user("uv", &["cache", "clean"]);
+                run_tool(c, "uv", &["cache", "clean"]);
                 let after = uv_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
                 before.saturating_sub(after)
             } else {
@@ -615,7 +649,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // contains read-only files; direct deletion is less reliable.
         "go modules" if utils::which("go") => {
             let before = c.size;
-            utils::run_user("go", &["clean", "-modcache"]);
+            run_tool(c, "go", &["clean", "-modcache"]);
             let after = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -625,7 +659,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "ruby gems (old versions)" => {
             // `gem cleanup` removes old versions only \u2014 it never touches
             // currently required gems. Safe by design.
-            utils::run_user("gem", &["cleanup"]);
+            run_tool(c, "gem", &["cleanup"]);
             0 // gem cleanup doesn't report freed bytes in a parseable way
         }
 
@@ -634,7 +668,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // blindly deleting the directory.
         "composer" if utils::which("composer") => {
             let before = c.size;
-            utils::run_user("composer", &["clear-cache", "--no-interaction"]);
+            run_tool(c, "composer", &["clear-cache", "--no-interaction"]);
             let after = home_join(".cache/composer")
                 .map(|p| utils::dir_size(&p))
                 .unwrap_or(0);
@@ -644,7 +678,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
 
         "conda" if utils::which("conda") => {
             let before = c.size;
-            utils::run_user("conda", &["clean", "--all", "--yes"]);
+            run_tool(c, "conda", &["clean", "--all", "--yes"]);
             let after = conda_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -653,7 +687,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // ── C/C++ ──
         "ccache" if utils::which("ccache") => {
             let before = c.size;
-            utils::run_user("ccache", &["-C"]);
+            run_tool(c, "ccache", &["-C"]);
             let after = ccache_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -662,7 +696,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // ── .NET ──
         "nuget" if utils::which("dotnet") => {
             let before = c.size;
-            utils::run_user("dotnet", &["nuget", "locals", "all", "--clear"]);
+            run_tool(c, "dotnet", &["nuget", "locals", "all", "--clear"]);
             let after = nuget_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -728,7 +762,9 @@ pub fn run(deep: bool, dry_run: bool, yes: bool) -> u64 {
 
     let mut freed = 0u64;
     for c in &caches {
-        freed += clean_one(c, deep, dry_run);
+        let f = clean_one(c, deep, dry_run);
+        freed += f;
+        report_cleaned(c, deep, f);
     }
     utils::success(&format!("Freed {}", utils::format_size(freed).green()));
     freed
