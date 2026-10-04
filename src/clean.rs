@@ -680,7 +680,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 yes,
                 "Delete ALL old generations? (nix-collect-garbage -d) [y/N]:",
             ) {
-                utils::run("nix-collect-garbage", &["-d"]);
+                utils::run_user("nix-collect-garbage", &["-d"]);
                 utils::sudo("nix-collect-garbage", &["-d"]);
                 utils::success("Old generations deleted");
 
@@ -1676,7 +1676,7 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
         "Delete old Nix generations? (removes all but current) [y/N]:",
     ) {
         utils::info("Removing old generations...");
-        utils::run("nix-collect-garbage", &["-d"]);
+        utils::run_user("nix-collect-garbage", &["-d"]);
         if crate::detect::nix_is_multiuser() {
             utils::sudo("nix-collect-garbage", &["-d"]);
         }
@@ -1688,8 +1688,12 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
         // the non-current versions of the default profile so their store paths
         // become collectable. Best-effort: only meaningful when the new `nix`
         // CLI with flakes support is present, and a no-op otherwise.
-        if utils::which_trusted("nix") {
-            utils::run("nix", &["profile", "wipe-history"]);
+        //
+        // This is the user's own profile history, so it runs as the user and
+        // finds `nix` through the user's `$PATH`: a single-user install keeps it
+        // in `~/.nix-profile/bin`, which the trusted lookup cannot see.
+        if utils::which("nix") {
+            utils::run_user("nix", &["profile", "wipe-history"]);
         }
 
         // `nix store --optimise` walks the entire store and hard-links

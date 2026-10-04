@@ -529,7 +529,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // cost of the largest trees for a number we were holding.
         "pnpm" => {
             let before = c.size;
-            utils::run("pnpm", &["store", "prune"]);
+            utils::run_user("pnpm", &["store", "prune"]);
             let after = pnpm_store_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -539,7 +539,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             // back to wiping DENO_DIR.
             if utils::which("deno") {
                 let before = c.size;
-                utils::run("deno", &["clean"]);
+                utils::run_user("deno", &["clean"]);
                 let after = deno_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
                 before.saturating_sub(after)
             } else {
@@ -554,7 +554,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "pip" => {
             if utils::which("pip") {
                 let before = c.size;
-                utils::run("pip", &["cache", "purge"]);
+                utils::run_user("pip", &["cache", "purge"]);
                 let after = home_join(".cache/pip")
                     .map(|p| utils::dir_size(&p))
                     .unwrap_or(0);
@@ -569,7 +569,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "uv" => {
             if utils::which("uv") {
                 let before = c.size;
-                utils::run("uv", &["cache", "clean"]);
+                utils::run_user("uv", &["cache", "clean"]);
                 let after = uv_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
                 before.saturating_sub(after)
             } else {
@@ -615,7 +615,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // contains read-only files; direct deletion is less reliable.
         "go modules" if utils::which("go") => {
             let before = c.size;
-            utils::run("go", &["clean", "-modcache"]);
+            utils::run_user("go", &["clean", "-modcache"]);
             let after = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -625,7 +625,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "ruby gems (old versions)" => {
             // `gem cleanup` removes old versions only \u2014 it never touches
             // currently required gems. Safe by design.
-            utils::run("gem", &["cleanup"]);
+            utils::run_user("gem", &["cleanup"]);
             0 // gem cleanup doesn't report freed bytes in a parseable way
         }
 
@@ -634,7 +634,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // blindly deleting the directory.
         "composer" if utils::which("composer") => {
             let before = c.size;
-            utils::run("composer", &["clear-cache", "--no-interaction"]);
+            utils::run_user("composer", &["clear-cache", "--no-interaction"]);
             let after = home_join(".cache/composer")
                 .map(|p| utils::dir_size(&p))
                 .unwrap_or(0);
@@ -644,7 +644,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
 
         "conda" if utils::which("conda") => {
             let before = c.size;
-            utils::run("conda", &["clean", "--all", "--yes"]);
+            utils::run_user("conda", &["clean", "--all", "--yes"]);
             let after = conda_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -653,7 +653,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // ── C/C++ ──
         "ccache" if utils::which("ccache") => {
             let before = c.size;
-            utils::run("ccache", &["-C"]);
+            utils::run_user("ccache", &["-C"]);
             let after = ccache_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
@@ -662,7 +662,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // ── .NET ──
         "nuget" if utils::which("dotnet") => {
             let before = c.size;
-            utils::run("dotnet", &["nuget", "locals", "all", "--clear"]);
+            utils::run_user("dotnet", &["nuget", "locals", "all", "--clear"]);
             let after = nuget_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }

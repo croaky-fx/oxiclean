@@ -1,8 +1,10 @@
 use colored::Colorize;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
@@ -78,12 +80,56 @@ pub fn trusted_path() -> String {
     TRUSTED_BIN_DIRS.join(":")
 }
 
-/// Run command with visible output (inherits stdio)
+/// Run a system tool with visible output (inherits stdio).
+///
+/// **System tier.** A bare `cmd` is looked up in the trusted directories only:
+/// [`harden_env`] replaces the child's `PATH`, and that same `PATH` is where
+/// `Command` searches for the program. So the name can resolve to a root-owned
+/// directory and nowhere else. This is the tier for package managers,
+/// `journalctl`, `flatpak` and the like.
+///
+/// It is the wrong tier for anything installed in the user's home (`uv` in
+/// `~/.local/bin`, `cargo` in `~/.cargo/bin`): the trusted lookup cannot see
+/// them, so the call returns `false` and nothing says why. Those go through
+/// [`run_user`].
 pub fn run(cmd: &str, args: &[&str]) -> bool {
     harden_env(Command::new(cmd).args(args))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Run a tool that belongs to the *user*, with visible output (inherits stdio).
+///
+/// **User tier**, the counterpart of [`run`]. `--dev` drives tools that their
+/// installers put in the user's home (`~/.cargo/bin`, `~/.local/bin`, a version
+/// manager's shims), so the trusted directories are the wrong place to look.
+/// The name is resolved once, through the caller's own `$PATH`, to an absolute
+/// path ([`which_path`]), and that path is what gets spawned.
+///
+/// The child keeps the caller's environment, `PATH` included. A shim or a
+/// wrapper script finds the interpreter it needs only through the `PATH` it
+/// was started with, and narrowing it is what made `--dev` lose track of
+/// user-installed tools in 1.8.0.
+///
+/// This is not an escalation: the tool runs with the caller's rights against
+/// the caller's caches, so a binary the caller controls gains nothing. It must
+/// never be paired with [`elevate`], which has its own trusted lookup.
+pub fn run_user(cmd: &str, args: &[&str]) -> bool {
+    run_user_in(&env::var_os("PATH").unwrap_or_default(), cmd, args)
+}
+
+/// [`run_user`] with the search path passed in, so tests can aim it at a
+/// scratch directory without touching the process environment.
+fn run_user_in(paths: &OsStr, cmd: &str, args: &[&str]) -> bool {
+    match which_path_in(cmd, paths) {
+        Some(program) => Command::new(program)
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 /// Run a command without letting its own chatter into our report.
@@ -304,16 +350,36 @@ pub fn sudo(cmd: &str, args: &[&str]) -> bool {
     elevate(current_privilege(), cmd, args)
 }
 
-/// Capture stdout of a command (returns output regardless of exit code).
+/// Capture stdout of a user-level tool (returns output regardless of exit code).
 ///
-/// Not restricted to [`TRUSTED_BIN_DIRS`], because `--dev` drives tools that
-/// legitimately live in the user's home: rustup puts `cargo` in `~/.cargo/bin`,
-/// and the `uv`/`deno`/`pnpm`/`bun` installers default to `~/.local/bin`. Those
-/// run with the caller's own privileges against the caller's own cache, so a
-/// binary they control is not an escalation. Privileged callers use
-/// [`capture_trusted`].
+/// **User tier**, on the same terms as [`run_user`]. Not restricted to
+/// [`TRUSTED_BIN_DIRS`], because `--dev` drives tools that legitimately live in
+/// the user's home: rustup puts `cargo` in `~/.cargo/bin`, and the
+/// `uv`/`deno`/`pnpm`/`bun` installers default to `~/.local/bin`. Those run with
+/// the caller's own privileges against the caller's own cache, so a binary they
+/// control is not an escalation. The name is resolved through the caller's
+/// `$PATH` ([`which_path`]) and the child keeps the caller's environment.
+/// Privileged callers use [`capture_trusted`].
 pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
-    harden_env(Command::new(cmd).args(args))
+    capture_in(&env::var_os("PATH").unwrap_or_default(), cmd, args)
+}
+
+/// [`capture`] over an explicit search path (see [`run_user_in`]).
+fn capture_in(paths: &OsStr, cmd: &str, args: &[&str]) -> Option<String> {
+    let program = which_path_in(cmd, paths)?;
+    capture_program(&program, args, false)
+}
+
+/// Run `program` and return its trimmed stdout. `harden` picks the
+/// environment the child gets: the trusted `PATH` (see [`harden_env`]) or the
+/// caller's own.
+fn capture_program(program: &Path, args: &[&str], harden: bool) -> Option<String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if harden {
+        harden_env(&mut command);
+    }
+    command
         .stderr(Stdio::null())
         .output()
         .ok()
@@ -330,18 +396,62 @@ pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
 /// callers already treat as "not available".
 pub fn capture_trusted(cmd: &str, args: &[&str]) -> Option<String> {
     let target = resolve_trusted(cmd)?;
-    capture(&target, args)
+    capture_program(Path::new(&target), args, true)
 }
 
-/// Check if a command exists in PATH.
+/// Check if a command exists in PATH, as something [`run_user`] could start.
+///
+/// Same lookup as [`which_path`]: an executable file in an absolute `$PATH`
+/// entry, not merely any file of that name.
+///
 /// Walks $PATH directly instead of spawning a `which` subprocess —
 /// faster, more reliable, and works on systems where `which` itself
 /// is not installed (e.g. minimal Alpine containers).
 pub fn which(cmd: &str) -> bool {
-    match env::var_os("PATH") {
-        Some(paths) => env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()),
-        None => false,
+    which_path(cmd).is_some()
+}
+
+/// Find `cmd` the way a shell would, but safely: the first *executable file*
+/// reachable through an *absolute* `$PATH` entry.
+///
+/// This is how the user tier ([`run_user`], [`capture`]) turns a bare name into
+/// the program to spawn. Resolving it here, once, instead of leaving it to
+/// `Command` keeps the answer independent of whatever environment the child is
+/// later given, and makes [`which`] and the launch agree on what "installed"
+/// means.
+///
+/// * Relative and empty entries are skipped. To a shell an empty entry means
+///   "the current directory", so `PATH=:/usr/bin` would let a file dropped into
+///   whatever directory we happen to run from be started: the planted-binary
+///   problem [`resolve_trusted`] closes for privileged commands.
+/// * A name containing `/` is not searched for. It is accepted only as an
+///   absolute path to an executable file.
+/// * Directories and files without an execute bit are skipped, so a data file
+///   called `go` early on the path does not shadow the real tool behind it.
+pub fn which_path(cmd: &str) -> Option<PathBuf> {
+    which_path_in(cmd, &env::var_os("PATH").unwrap_or_default())
+}
+
+/// [`which_path`] over an explicit search path (see [`run_user_in`]).
+fn which_path_in(cmd: &str, paths: &OsStr) -> Option<PathBuf> {
+    if cmd.is_empty() {
+        return None;
     }
+    if cmd.contains('/') {
+        let path = Path::new(cmd);
+        return (path.is_absolute() && is_executable_file(path)).then(|| path.to_path_buf());
+    }
+    env::split_paths(paths)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(cmd))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// A regular file (symlinks followed) with at least one execute bit set.
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Availability check for a command we intend to run with privileges. Must agree
@@ -916,5 +1026,243 @@ mod tests {
         // panic.
         let p = current_privilege();
         let _ = p.name();
+    }
+
+    // ── Two tiers of trust: system tools vs. the user's own ──
+    //
+    // 1.8.0 narrowed the child's PATH for *every* command, which also narrowed
+    // where `Command` looks for the program: `--dev` quietly stopped finding
+    // `uv`, `pnpm` and `deno` in the user's home. These tests pin the contract
+    // of each tier so that cannot come back unnoticed.
+    //
+    // The tools they start are symlinks to `/bin/sh`, never scripts written on
+    // the spot: executing a file this thread has only just written races with
+    // every other test thread that forks ("Text file busy"), and a test that
+    // flakes one run in fifteen is worse than no test.
+
+    /// A fresh, empty directory unique to this test (and to this process).
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxi_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Put a tool called `name` in `dir`: a symlink that behaves like `sh`.
+    fn sh_as(dir: &Path, name: &str) -> PathBuf {
+        let link = dir.join(name);
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        link
+    }
+
+    /// `dir` spelled relative to the current directory, so a test can build
+    /// relative paths that really do lead somewhere.
+    fn relative_to_cwd(dir: &Path) -> PathBuf {
+        let cwd = env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        Path::new(&up).join(dir.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    fn test_which_path_finds_tools_the_trusted_resolver_refuses() {
+        // The 1.8.0 regression in two lines: a tool installed under the user's
+        // home is invisible to the trusted resolver by design, yet `--dev` has
+        // to be able to reach it.
+        let dir = scratch("which_user_tool");
+        let tool = sh_as(&dir, "oxiclean-user-tool");
+
+        assert_eq!(resolve_trusted("oxiclean-user-tool"), None);
+        assert_eq!(
+            which_path_in("oxiclean-user-tool", dir.as_os_str()),
+            Some(tool)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_which_path_skips_non_executables_and_directories() {
+        // Only something we could actually start counts, and the first runnable
+        // match wins: `a` holds a data file of that name, `b` a directory, `c`
+        // the real tool.
+        let root = scratch("which_skips");
+        let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+        for dir in [&a, &b, &c] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(a.join("tool"), "not a program").unwrap();
+        fs::create_dir(b.join("tool")).unwrap();
+        sh_as(&c, "tool");
+
+        let all = env::join_paths([&a, &b, &c]).unwrap();
+        assert_eq!(which_path_in("tool", &all), Some(c.join("tool")));
+        let without_the_tool = env::join_paths([&a, &b]).unwrap();
+        assert_eq!(which_path_in("tool", &without_the_tool), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_which_path_ignores_relative_and_empty_path_entries() {
+        // To a shell an empty `$PATH` entry means "the current directory", and a
+        // relative one is whatever the cwd makes it. Starting a tool found that
+        // way runs a file the caller never chose (CWE-426, the same hole
+        // TRUSTED_BIN_DIRS closes for privileged commands), so neither counts.
+        let dir = scratch("which_relative");
+        sh_as(&dir, "oxiclean-rel-tool");
+
+        // The very same directory, spelled relative to wherever the tests run.
+        let relative = relative_to_cwd(&dir);
+        assert!(
+            is_executable_file(&relative.join("oxiclean-rel-tool")),
+            "fixture: the relative spelling must lead to the tool"
+        );
+
+        let paths = env::join_paths([PathBuf::new(), relative, PathBuf::from(".")]).unwrap();
+        assert_eq!(which_path_in("oxiclean-rel-tool", &paths), None);
+        // The absolute spelling of that same directory is found.
+        assert!(which_path_in("oxiclean-rel-tool", dir.as_os_str()).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_which_path_with_a_slash_accepts_only_absolute_executables() {
+        let dir = scratch("which_slash");
+        let tool = sh_as(&dir, "tool");
+        let data = dir.join("data");
+        fs::write(&data, "x").unwrap();
+        let no_path = OsStr::new("");
+
+        // Absolute: used as given, `$PATH` is irrelevant.
+        assert_eq!(
+            which_path_in(tool.to_str().unwrap(), no_path),
+            Some(tool.clone())
+        );
+        assert_eq!(which_path_in(data.to_str().unwrap(), no_path), None);
+        // Relative with a separator: its meaning depends on the cwd, so it is
+        // refused rather than guessed at, even when it really does lead to the
+        // tool and even when `$PATH` could resolve it.
+        let relative_tool = relative_to_cwd(&dir).join("tool");
+        assert!(
+            is_executable_file(&relative_tool),
+            "fixture: the relative spelling must lead to the tool"
+        );
+        assert_eq!(
+            which_path_in(relative_tool.to_str().unwrap(), no_path),
+            None
+        );
+        assert_eq!(which_path_in("./tool", dir.as_os_str()), None);
+        assert_eq!(which_path_in("sub/tool", dir.as_os_str()), None);
+        // Degenerate names never match.
+        assert_eq!(which_path_in("", dir.as_os_str()), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_user_starts_the_tool_which_found() {
+        // `run_user_in` searches only the directory it is given, so the marker
+        // can only appear if the `sh` in `dir` was the one started.
+        let dir = scratch("run_user_ok");
+        sh_as(&dir, "sh");
+        let marker = dir.join("ran");
+
+        assert!(run_user_in(
+            dir.as_os_str(),
+            "sh",
+            &["-c", ": > \"$1\"", "sh", marker.to_str().unwrap()]
+        ));
+        assert!(marker.exists(), "the tool was found but never ran");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_user_child_inherits_the_callers_path() {
+        // The user tier hands the child the environment it was started with: a
+        // version manager's shim or a wrapper script finds the interpreter it
+        // needs through that very `$PATH`.
+        let dir = scratch("run_user_path");
+        sh_as(&dir, "sh");
+        let seen = dir.join("seen");
+
+        assert!(run_user_in(
+            dir.as_os_str(),
+            "sh",
+            &[
+                "-c",
+                "printf %s \"$PATH\" > \"$1\"",
+                "sh",
+                seen.to_str().unwrap()
+            ]
+        ));
+        assert_eq!(
+            fs::read_to_string(&seen).unwrap(),
+            env::var("PATH").unwrap()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_user_reports_failure_honestly() {
+        let dir = scratch("run_user_fail");
+        sh_as(&dir, "sh");
+
+        assert!(!run_user_in(dir.as_os_str(), "sh", &["-c", "exit 3"]));
+        // Not found at all is `false` too: no panic, and no second attempt
+        // through some other, wider lookup.
+        assert!(!run_user_in(dir.as_os_str(), "oxiclean-no-such-tool", &[]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_capture_hands_the_child_the_callers_path() {
+        // User tier: found through the search path it is given, run with the
+        // caller's own environment untouched.
+        let dir = scratch("capture_user");
+        sh_as(&dir, "sh");
+
+        let seen = capture_in(dir.as_os_str(), "sh", &["-c", "printf %s \"$PATH\""]);
+        assert_eq!(seen.unwrap(), env::var("PATH").unwrap());
+        // A tool that is not on the search path is "not available", not an error.
+        assert_eq!(
+            capture_in(dir.as_os_str(), "oxiclean-no-such-tool", &[]),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_capture_trusted_hands_the_child_only_the_trusted_path() {
+        // System tier: resolved in the trusted directories, and the child gets
+        // those directories as its whole PATH.
+        let seen = capture_trusted("sh", &["-c", "printf %s \"$PATH\""]);
+        assert_eq!(seen.unwrap(), trusted_path());
+        assert_eq!(capture_trusted("oxiclean-no-such-tool", &[]), None);
+    }
+
+    #[test]
+    fn test_command_resolves_bare_names_through_the_childs_own_path() {
+        // The assumption behind the 1.8.0 regression, pinned so a change in std
+        // cannot hide it again: when `PATH` is set on a `Command`, a bare program
+        // name is looked up in *that* value, not in ours. `harden_env` therefore
+        // narrows the lookup as well as the environment, which is exactly what the
+        // system tier wants and exactly what the user tier must avoid.
+        let dir = scratch("child_path_lookup");
+        sh_as(&dir, "sh");
+
+        let through_the_childs_path = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .env("PATH", &dir)
+            .status();
+        assert!(
+            through_the_childs_path
+                .map(|s| s.success())
+                .unwrap_or(false),
+            "a bare name must resolve through the child's PATH"
+        );
+        // `sh` is on *our* PATH. Had the lookup used ours, this would succeed.
+        let nowhere = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .env("PATH", "/nonexistent")
+            .status();
+        assert!(nowhere.is_err(), "...and only through the child's PATH");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
