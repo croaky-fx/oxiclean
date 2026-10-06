@@ -1,6 +1,7 @@
 mod clean;
 mod detect;
 mod dev;
+mod roots;
 mod update;
 mod utils;
 
@@ -452,7 +453,7 @@ fn main() {
         // without ever leaving the dir uncleaned. A hand-pruned helper's dir is
         // held back either way — it stores state (aura's snapshots) that a
         // wholesale wipe would destroy.
-        let f = clean::user_cache(cli.dry_run, &sys.aur_helpers, ops.aur);
+        let f = clean::user_cache(cli.dry_run, cli.yes, &sys.aur_helpers, ops.aur);
         record("cache", f, &mut total_freed, &mut results);
     }
 

@@ -1,7 +1,9 @@
 use colored::Colorize;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::detect::{AurHelper, Distro};
+use crate::roots;
 use crate::utils;
 
 // Which helper commands are allowed to print their own output.
@@ -325,15 +327,90 @@ fn all_protected_dirs() -> Vec<&'static str> {
         .collect()
 }
 
+/// Where the user's cache lives, and whether it may be emptied.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheBase {
+    /// `~/.cache`, or an `XDG_CACHE_HOME` that names the same directory.
+    Standard(PathBuf),
+    /// A cache the user moved with `XDG_CACHE_HOME`.
+    Relocated(PathBuf),
+    /// Where the cache would be, but there is no such directory.
+    Absent(PathBuf),
+    /// Resolves somewhere that must not be emptied. Carries the whole reason,
+    /// starting with what was refused.
+    Refused(String),
+    /// Neither a usable `$HOME` nor an `XDG_CACHE_HOME`.
+    Unknown,
+}
+
 /// Resolve the user cache directory, honouring `XDG_CACHE_HOME` (the spec-
 /// correct override) and falling back to `~/.cache`.
-fn user_cache_base() -> Option<PathBuf> {
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
-        if !x.is_empty() {
-            return Some(PathBuf::from(x));
-        }
+///
+/// The directory is the one `user_cache` empties wholesale, so a wrong value
+/// here costs far more than a cache: `XDG_CACHE_HOME=$HOME` used to mean
+/// "delete everything in the home directory". Every answer goes through
+/// [`roots::check`] first.
+fn user_cache_base() -> CacheBase {
+    let home = utils::home_dir();
+    cache_base_from(
+        &roots::Context::from_env(),
+        home.as_deref().map(Path::new),
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+    )
+}
+
+/// [`user_cache_base`] with the environment passed in, so tests can supply
+/// theirs.
+fn cache_base_from(ctx: &roots::Context, home: Option<&Path>, xdg: Option<&OsStr>) -> CacheBase {
+    use roots::{Reject, Source};
+
+    let standard = home.map(|h| h.join(".cache"));
+    // The XDG spec: a relative path is invalid and must be ignored. Empty counts
+    // as unset. See `ignored_xdg` for the note the user gets about it.
+    let relocated = xdg
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+
+    if let Some(path) = relocated {
+        // Pointing the variable at the default place relocates nothing, and
+        // must not be held to the stricter rules for a root of unknown origin.
+        let default_real = standard
+            .as_deref()
+            .and_then(|s| std::fs::canonicalize(s).ok());
+        let is_default =
+            default_real.is_some() && default_real == std::fs::canonicalize(&path).ok();
+        let source = if is_default {
+            Source::Home
+        } else {
+            Source::Env
+        };
+        return match roots::check(ctx, &path, source) {
+            Ok(_) if is_default => CacheBase::Standard(path),
+            Ok(_) => CacheBase::Relocated(path),
+            Err(Reject::Missing) => CacheBase::Absent(path),
+            Err(Reject::Unsafe(why)) => {
+                CacheBase::Refused(format!("XDG_CACHE_HOME={} — {why}", path.display()))
+            }
+        };
     }
-    utils::home_dir().map(|h| PathBuf::from(h).join(".cache"))
+
+    match standard {
+        None => CacheBase::Unknown,
+        Some(path) => match roots::check(ctx, &path, Source::Home) {
+            Ok(_) => CacheBase::Standard(path),
+            Err(Reject::Missing) => CacheBase::Absent(path),
+            Err(Reject::Unsafe(why)) => CacheBase::Refused(format!("{} — {why}", path.display())),
+        },
+    }
+}
+
+/// The value of `XDG_CACHE_HOME` when it is set to something the spec says to
+/// ignore (a relative path), so the user is told rather than left wondering why
+/// their setting did nothing.
+fn ignored_xdg(xdg: Option<&OsStr>) -> Option<String> {
+    let value = xdg.filter(|v| !v.is_empty() && !Path::new(v).is_absolute())?;
+    Some(value.to_string_lossy().into_owned())
 }
 
 /// The set of top-level entry names to protect inside `cache_base`: the static
@@ -444,21 +521,58 @@ fn skipped_has_hand_pruned_helper(skipped: &[String], helpers: &[AurHelper]) -> 
     })
 }
 
-pub fn user_cache(dry_run: bool, helpers: &[AurHelper], aur_running: bool) -> u64 {
+/// A cache the user moved with `XDG_CACHE_HOME` is a directory we know nothing
+/// about except that the environment says to empty it. A wrong value there is
+/// the one way this operation destroys more than a cache, and no check can tell
+/// a mistaken `~/projects` from a deliberate `/data/cache`, so a real run over
+/// one asks first. `--yes` is the answer for unattended runs; `--json` has no
+/// one to ask, so it needs `--yes` too.
+fn relocated_cache_allowed(cache: &Path, yes: bool) -> bool {
+    if yes {
+        return true;
+    }
+    if utils::is_json() {
+        utils::error(&format!(
+            "XDG_CACHE_HOME points to {}; not cleaned without --yes",
+            cache.display()
+        ));
+        return false;
+    }
+    let ok = utils::confirm(&format!(
+        "XDG_CACHE_HOME points to {}. Clean what is inside it? [y/N]:",
+        cache.display()
+    ));
+    if !ok {
+        utils::skip("Left alone");
+    }
+    ok
+}
+
+pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: bool) -> u64 {
     utils::section("User Cache");
 
-    let cache = match user_cache_base() {
-        Some(c) => c,
-        None => {
+    if let Some(value) = ignored_xdg(std::env::var_os("XDG_CACHE_HOME").as_deref()) {
+        utils::warning(&format!(
+            "XDG_CACHE_HOME={value} is not an absolute path, so it is ignored"
+        ));
+    }
+
+    let (cache, relocated) = match user_cache_base() {
+        CacheBase::Standard(path) => (path, false),
+        CacheBase::Relocated(path) => (path, true),
+        CacheBase::Absent(_) => {
+            utils::info("No cache directory found");
+            return 0;
+        }
+        CacheBase::Refused(why) => {
+            utils::error(&format!("Refusing to clean {why}"));
+            return 0;
+        }
+        CacheBase::Unknown => {
             utils::error("Cannot determine cache directory");
             return 0;
         }
     };
-
-    if !cache.exists() {
-        utils::info("No cache directory found");
-        return 0;
-    }
 
     // Instead of wiping ~/.cache wholesale, spare the expensive/irreplaceable
     // caches: model weights that cost gigabytes to re-download (HuggingFace,
@@ -516,6 +630,16 @@ pub fn user_cache(dry_run: bool, helpers: &[AurHelper], aur_running: bool) -> u6
             "[DRY RUN] Would free {}",
             utils::format_size(clean_size)
         ));
+        if relocated {
+            utils::info(&format!(
+                "XDG_CACHE_HOME moves the cache to {}; a real run asks first (or needs --yes)",
+                cache.display()
+            ));
+        }
+        return 0;
+    }
+
+    if relocated && !relocated_cache_allowed(&cache, yes) {
         return 0;
     }
 
@@ -1054,8 +1178,21 @@ pub fn aur_cache(helpers: &[AurHelper], deep: bool, dry_run: bool, yes: bool) ->
 /// The helper's own cache directory. Goes through [`user_cache_base`] so
 /// `XDG_CACHE_HOME` is honoured — building `~/.cache` by hand here would miss a
 /// relocated cache and report 0 B freed on every run.
-fn helper_cache_dir(h: &AurHelper) -> Option<PathBuf> {
-    user_cache_base().map(|base| base.join(h.bin))
+///
+/// `Err` says why there is none, ready to follow the helper's name.
+fn helper_cache_dir(h: &AurHelper) -> Result<PathBuf, String> {
+    helper_dir_in(user_cache_base(), h)
+}
+
+fn helper_dir_in(base: CacheBase, h: &AurHelper) -> Result<PathBuf, String> {
+    match base {
+        // Absent still yields a path: there is simply nothing in it to prune.
+        CacheBase::Standard(base) | CacheBase::Relocated(base) | CacheBase::Absent(base) => {
+            Ok(base.join(h.bin))
+        }
+        CacheBase::Refused(why) => Err(format!("refusing to touch {why}")),
+        CacheBase::Unknown => Err("cannot determine cache directory".to_string()),
+    }
 }
 
 /// Subdirectories to clear for a helper we prune by hand. The re-download-
@@ -1072,7 +1209,16 @@ fn prune_targets(h: &AurHelper, deep: bool) -> Vec<&'static str> {
 /// Clean a single helper and report its result. Split out so the per-helper
 /// loop above stays readable.
 fn clean_one_helper(h: &AurHelper, deep: bool, yes: bool) -> u64 {
-    let cache_dir = helper_cache_dir(h);
+    clean_helper_at(helper_cache_dir(h), h, deep, yes)
+}
+
+/// [`clean_one_helper`] with the cache directory decided by the caller.
+fn clean_helper_at(
+    cache_dir: Result<PathBuf, String>,
+    h: &AurHelper,
+    deep: bool,
+    yes: bool,
+) -> u64 {
     let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
 
     match h.clean {
@@ -1102,9 +1248,12 @@ fn clean_one_helper(h: &AurHelper, deep: bool, yes: bool) -> u64 {
         // build/tarball subdirectories ourselves. Never the whole cache dir —
         // that would take `snapshots/` with it.
         None => {
-            let Some(base) = cache_dir.as_ref() else {
-                utils::error(&format!("{}: cannot determine cache directory", h.bin));
-                return 0;
+            let base = match cache_dir.as_ref() {
+                Ok(base) => base,
+                Err(why) => {
+                    utils::error(&format!("{}: {why}", h.bin));
+                    return 0;
+                }
             };
             for dir in prune_targets(h, deep) {
                 let target = base.join(dir);
@@ -2290,6 +2439,271 @@ mod tests {
         assert_eq!(freed, before, "freed bytes must match what was there");
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // ── Cache base: XDG_CACHE_HOME is checked before anything is emptied ──
+
+    fn cache_scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("oxiclean_cachebase_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    /// The user running the tests as `roots` sees them, on a machine with no
+    /// system directories, so the temp dir the fixtures live in is fair game.
+    fn cache_ctx(home: &Path) -> roots::Context {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(home).unwrap();
+        roots::Context {
+            home: Some(home.to_path_buf()),
+            ids: Some(roots::Ids {
+                uid: md.uid(),
+                gid: md.gid(),
+            }),
+            named: Vec::new(),
+            system_dirs: Vec::new(),
+            system_trees: Vec::new(),
+        }
+    }
+
+    fn os(s: &str) -> Option<&OsStr> {
+        Some(OsStr::new(s))
+    }
+
+    fn refusal(base: CacheBase) -> String {
+        match base {
+            CacheBase::Refused(why) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cache_base_is_dot_cache_unless_xdg_says_otherwise() {
+        let d = cache_scratch("default");
+        let home = d.join("home");
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        let ctx = cache_ctx(&home);
+        let standard = CacheBase::Standard(home.join(".cache"));
+        // Unset, empty, and a relative value (which the XDG spec says to ignore).
+        for xdg in [None, os(""), os("relative/dir"), os("./x")] {
+            assert_eq!(cache_base_from(&ctx, Some(&home), xdg), standard, "{xdg:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_missing_cache_dir_is_absent_not_refused() {
+        let d = cache_scratch("absent");
+        let home = d.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let ctx = cache_ctx(&home);
+        assert_eq!(
+            cache_base_from(&ctx, Some(&home), None),
+            CacheBase::Absent(home.join(".cache"))
+        );
+        let gone = d.join("gone");
+        assert_eq!(
+            cache_base_from(&ctx, Some(&home), Some(gone.as_os_str())),
+            CacheBase::Absent(gone)
+        );
+    }
+
+    #[test]
+    fn test_no_home_and_no_xdg_means_no_cache_base() {
+        let d = cache_scratch("nohome");
+        let mut ctx = cache_ctx(&d);
+        ctx.home = None;
+        assert_eq!(cache_base_from(&ctx, None, None), CacheBase::Unknown);
+        assert_eq!(
+            cache_base_from(&ctx, None, os("relative")),
+            CacheBase::Unknown
+        );
+        // XDG_CACHE_HOME alone is enough, as it always was.
+        let elsewhere = d.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(
+            cache_base_from(&ctx, None, Some(elsewhere.as_os_str())),
+            CacheBase::Relocated(elsewhere)
+        );
+    }
+
+    #[test]
+    fn test_a_moved_cache_is_reported_as_relocated() {
+        let d = cache_scratch("moved");
+        let home = d.join("home");
+        let moved = d.join("data/cache");
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        let ctx = cache_ctx(&home);
+        assert_eq!(
+            cache_base_from(&ctx, Some(&home), Some(moved.as_os_str())),
+            CacheBase::Relocated(moved)
+        );
+    }
+
+    #[test]
+    fn test_xdg_naming_the_default_place_relocates_nothing() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let d = cache_scratch("samething");
+        let home = d.join("home");
+        let default = home.join(".cache");
+        std::fs::create_dir_all(&default).unwrap();
+        // Writable by everyone: fine as the default, refused as a stranger's.
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o777)).unwrap();
+        symlink(&default, d.join("alias")).unwrap();
+        let ctx = cache_ctx(&home);
+        for xdg in [default.clone(), d.join("alias")] {
+            assert_eq!(
+                cache_base_from(&ctx, Some(&home), Some(xdg.as_os_str())),
+                CacheBase::Standard(xdg.clone()),
+                "{xdg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_xdg_pointing_at_home_or_above_is_refused() {
+        let d = cache_scratch("athome");
+        let home = d.join("home");
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        let ctx = cache_ctx(&home);
+
+        let why = refusal(cache_base_from(&ctx, Some(&home), Some(home.as_os_str())));
+        assert!(why.starts_with("XDG_CACHE_HOME="), "{why}");
+        assert!(why.contains("it is your home directory"), "{why}");
+
+        let why = refusal(cache_base_from(&ctx, Some(&home), Some(d.as_os_str())));
+        assert!(why.contains("contains your home directory"), "{why}");
+    }
+
+    #[test]
+    fn test_xdg_pointing_at_settings_or_documents_is_refused() {
+        let d = cache_scratch("reserved");
+        let home = d.join("home");
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        let ctx = cache_ctx(&home);
+        for name in [".config", ".local/share", "Documents", ".ssh"] {
+            let dir = home.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let why = refusal(cache_base_from(&ctx, Some(&home), Some(dir.as_os_str())));
+            assert!(why.starts_with("XDG_CACHE_HOME="), "{name}: {why}");
+        }
+    }
+
+    #[test]
+    fn test_xdg_must_be_the_users_own_and_not_writable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = cache_scratch("others");
+        let home = d.join("home");
+        let moved = d.join("cache");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let ctx = cache_ctx(&home);
+        let why = refusal(cache_base_from(&ctx, Some(&home), Some(moved.as_os_str())));
+        assert!(why.contains("anyone can write"), "{why}");
+
+        std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut stranger = cache_ctx(&home);
+        if let Some(ids) = stranger.ids.as_mut() {
+            ids.uid += 1;
+        }
+        stranger.home = None; // the owner of HOME would otherwise vouch for it
+        let why = refusal(cache_base_from(&stranger, None, Some(moved.as_os_str())));
+        assert!(why.contains("not to you"), "{why}");
+    }
+
+    #[test]
+    fn test_a_dot_cache_that_leads_to_documents_is_refused() {
+        use std::os::unix::fs::symlink;
+        let d = cache_scratch("sneaky");
+        let home = d.join("home");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        symlink(home.join("Documents"), home.join(".cache")).unwrap();
+        let ctx = cache_ctx(&home);
+        let why = refusal(cache_base_from(&ctx, Some(&home), None));
+        assert!(why.contains("Documents"), "{why}");
+    }
+
+    #[test]
+    fn test_only_a_relative_xdg_is_reported_as_ignored() {
+        assert_eq!(ignored_xdg(None), None);
+        assert_eq!(ignored_xdg(os("")), None);
+        assert_eq!(ignored_xdg(os("/abs/ok")), None);
+        assert_eq!(ignored_xdg(os("rel/dir")), Some("rel/dir".to_string()));
+        assert_eq!(ignored_xdg(os("./x")), Some("./x".to_string()));
+    }
+
+    #[test]
+    fn test_a_helper_cache_dir_follows_the_base() {
+        let aura = crate::detect::AurHelper {
+            bin: "aura",
+            clean: None,
+            deep_clean: None,
+            prune_dirs: &["builds"],
+            prune_dirs_deep: &[],
+        };
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            helper_dir_in(CacheBase::Standard(p("/h/.cache")), &aura),
+            Ok(p("/h/.cache/aura"))
+        );
+        assert_eq!(
+            helper_dir_in(CacheBase::Relocated(p("/data/c")), &aura),
+            Ok(p("/data/c/aura"))
+        );
+        // Nothing there to prune is not an error: the helper reports "clean".
+        assert_eq!(
+            helper_dir_in(CacheBase::Absent(p("/h/.cache")), &aura),
+            Ok(p("/h/.cache/aura"))
+        );
+        let err = helper_dir_in(
+            CacheBase::Refused("XDG_CACHE_HOME=/h — it is your home directory".into()),
+            &aura,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("refusing") && err.contains("home directory"),
+            "{err}"
+        );
+        assert!(helper_dir_in(CacheBase::Unknown, &aura).is_err());
+    }
+
+    #[test]
+    fn test_a_refused_base_leaves_a_hand_pruned_helper_alone() {
+        use std::fs;
+        let d = cache_scratch("aura");
+        let aura_dir = d.join("aura");
+        fs::create_dir_all(aura_dir.join("builds")).unwrap();
+        fs::write(aura_dir.join("builds/leftover"), vec![0u8; 2048]).unwrap();
+        fs::create_dir_all(aura_dir.join("snapshots")).unwrap();
+        fs::write(aura_dir.join("snapshots/restore.json"), vec![0u8; 512]).unwrap();
+        let aura = crate::detect::AurHelper {
+            bin: "aura",
+            clean: None,
+            deep_clean: None,
+            prune_dirs: &["builds"],
+            prune_dirs_deep: &[],
+        };
+
+        let refused =
+            Err("refusing to touch XDG_CACHE_HOME=/h — it is your home directory".to_string());
+        assert_eq!(clean_helper_at(refused, &aura, false, true), 0);
+        assert!(
+            aura_dir.join("builds/leftover").exists(),
+            "nothing may be pruned"
+        );
+
+        // The same helper, given a directory it may use, prunes builds only.
+        let freed = clean_helper_at(Ok(aura_dir.clone()), &aura, false, true);
+        assert!(freed >= 2048, "freed {freed}");
+        assert!(!aura_dir.join("builds/leftover").exists());
+        assert!(
+            aura_dir.join("snapshots/restore.json").exists(),
+            "restore points survive"
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     // ── Apport: measure only flat report files, never kdump subdirs ──

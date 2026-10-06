@@ -25,6 +25,7 @@
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 
+use crate::roots;
 use crate::utils;
 
 // ─── Display ─────────────────────────────────────────
@@ -45,6 +46,58 @@ pub struct DevCache {
 
 fn home_join(suffix: &str) -> Option<PathBuf> {
     utils::home_dir().map(|h| PathBuf::from(h).join(suffix))
+}
+
+/// A cache location that came from the environment (or from a tool reading it),
+/// after [`roots::check`].
+///
+/// `UV_CACHE_DIR=$HOME` is one typo away, and a directory named this way is
+/// emptied by `uv cache clean`, `go clean -modcache` or our own fallback without
+/// anyone asking what it is. Locations built from `$HOME` by us skip the check:
+/// they are fixed suffixes below a directory that is the user's by definition.
+#[derive(Debug, PartialEq, Eq)]
+enum Root {
+    /// Not set, or nothing there: nothing to scan and nothing to say.
+    Absent,
+    /// Present, and not safe to clean. Carries what was refused and why.
+    Refused(String),
+    /// Safe to use.
+    Dir(PathBuf),
+}
+
+impl Root {
+    /// The directory, or `None` for either way of having none. Silent: refusals
+    /// are reported once, by the scan (see [`reported`]).
+    fn dir(self) -> Option<PathBuf> {
+        match self {
+            Root::Dir(path) => Some(path),
+            Root::Absent | Root::Refused(_) => None,
+        }
+    }
+}
+
+/// Run a location the environment named through [`roots::check`]. `label` says
+/// where it came from, for the message (`UV_CACHE_DIR=/x`).
+fn env_root(label: &str, path: PathBuf) -> Root {
+    match roots::check(&roots::Context::from_env(), &path, roots::Source::Env) {
+        Ok(_) => Root::Dir(path),
+        Err(roots::Reject::Missing) => Root::Absent,
+        Err(roots::Reject::Unsafe(why)) => Root::Refused(format!("{label} — {why}")),
+    }
+}
+
+/// Unwrap a [`Root`] for the scan, saying so when it was refused. Only
+/// `scan_all` calls this, and it runs once per run, so a refusal is reported
+/// once; the cleaners resolve the same locations again and stay quiet.
+fn reported(root: Root) -> Option<PathBuf> {
+    match root {
+        Root::Dir(path) => Some(path),
+        Root::Absent => None,
+        Root::Refused(why) => {
+            utils::error(&format!("Not cleaning {why}"));
+            None
+        }
+    }
 }
 
 /// Resolve `pnpm store path` at runtime. Falls back to `~/.local/share/pnpm/store`
@@ -76,54 +129,66 @@ fn pnpm_store_path() -> Option<PathBuf> {
 /// `GOMODCACHE` and `GOPATH` are read from the environment first: when either is
 /// set we already have the answer, and `go env` would only echo it back. Same
 /// default-first shortcut as pnpm, though `go env` is cheap by comparison.
-fn go_modcache_path() -> Option<PathBuf> {
+fn go_modcache_path() -> Root {
     for var in ["GOMODCACHE", "GOPATH"] {
         if let Ok(val) = std::env::var(var) {
             if !val.is_empty() {
-                return Some(if var == "GOMODCACHE" {
-                    PathBuf::from(val)
+                // GOPATH is a list, and the module cache lives under its first
+                // entry. Joining the whole string made `/a:/b` into `/a:/b/pkg/mod`.
+                let path = if var == "GOMODCACHE" {
+                    PathBuf::from(&val)
                 } else {
-                    PathBuf::from(val).join("pkg/mod")
-                });
+                    std::env::split_paths(&val)
+                        .next()
+                        .unwrap_or_default()
+                        .join("pkg/mod")
+                };
+                return env_root(&format!("{var}={val}"), path);
             }
         }
     }
     if let Some(default) = home_join("go/pkg/mod") {
         if default.is_dir() {
-            return Some(default);
+            return Root::Dir(default);
         }
     }
     if utils::which("go") {
         if let Some(out) = utils::capture("go", &["env", "GOMODCACHE"]) {
             if !out.is_empty() {
-                return Some(PathBuf::from(out));
+                return env_root(
+                    &format!("`go env GOMODCACHE` says {out}"),
+                    PathBuf::from(out),
+                );
             }
         }
     }
-    home_join("go/pkg/mod")
+    home_join("go/pkg/mod").map_or(Root::Absent, Root::Dir)
 }
 
 /// Resolve `uv cache dir`. Falls back to `~/.cache/uv`, honouring
 /// `UV_CACHE_DIR` and `XDG_CACHE_HOME` before spawning uv.
-fn uv_cache_path() -> Option<PathBuf> {
+fn uv_cache_path() -> Root {
     if let Ok(val) = std::env::var("UV_CACHE_DIR") {
         if !val.is_empty() {
-            return Some(PathBuf::from(val));
+            return env_root(&format!("UV_CACHE_DIR={val}"), PathBuf::from(val));
         }
     }
-    let default = match std::env::var("XDG_CACHE_HOME") {
-        Ok(x) if !x.is_empty() => Some(PathBuf::from(x).join("uv")),
-        _ => home_join(".cache/uv"),
+    // uv's own default is `$XDG_CACHE_HOME/uv`. A relative XDG_CACHE_HOME is
+    // invalid per the spec and ignored, as everywhere else.
+    let default = match std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        Some(x) => env_root(&format!("XDG_CACHE_HOME={}", x.display()), x.join("uv")),
+        None => home_join(".cache/uv").map_or(Root::Absent, Root::Dir),
     };
-    if let Some(d) = &default {
-        if d.is_dir() {
-            return Some(d.clone());
-        }
+    if matches!(&default, Root::Dir(d) if d.is_dir()) {
+        return default;
     }
     if utils::which("uv") {
         if let Some(out) = utils::capture("uv", &["cache", "dir"]) {
             if !out.is_empty() {
-                return Some(PathBuf::from(out));
+                return env_root(&format!("`uv cache dir` says {out}"), PathBuf::from(out));
             }
         }
     }
@@ -131,13 +196,13 @@ fn uv_cache_path() -> Option<PathBuf> {
 }
 
 /// Resolve `deno info` cache root. Falls back to `~/.cache/deno`.
-fn deno_dir_path() -> Option<PathBuf> {
+fn deno_dir_path() -> Root {
     if let Ok(env) = std::env::var("DENO_DIR") {
         if !env.is_empty() {
-            return Some(PathBuf::from(env));
+            return env_root(&format!("DENO_DIR={env}"), PathBuf::from(env));
         }
     }
-    home_join(".cache/deno")
+    home_join(".cache/deno").map_or(Root::Absent, Root::Dir)
 }
 
 /// Resolve conda's package cache. Tries `conda info --json` and reads the
@@ -174,13 +239,13 @@ fn parse_conda_pkgs_dir(json: &str) -> Option<String> {
 }
 
 /// ccache cache directory. Reads `CCACHE_DIR` env var, falls back to `~/.cache/ccache`.
-fn ccache_dir_path() -> Option<PathBuf> {
+fn ccache_dir_path() -> Root {
     if let Ok(env) = std::env::var("CCACHE_DIR") {
         if !env.is_empty() {
-            return Some(PathBuf::from(env));
+            return env_root(&format!("CCACHE_DIR={env}"), PathBuf::from(env));
         }
     }
-    home_join(".cache/ccache")
+    home_join(".cache/ccache").map_or(Root::Absent, Root::Dir)
 }
 
 /// NuGet's global package cache (`~/.nuget/packages`). `dotnet nuget locals`
@@ -252,7 +317,7 @@ pub fn scan_all() -> Vec<DevCache> {
     if let Some(c) = scan_simple("pnpm", pnpm_store_path(), "store prune") {
         out.push(c);
     }
-    if let Some(c) = scan_simple("deno", deno_dir_path(), "safe") {
+    if let Some(c) = scan_simple("deno", reported(deno_dir_path()), "safe") {
         out.push(c);
     }
 
@@ -260,7 +325,7 @@ pub fn scan_all() -> Vec<DevCache> {
     if let Some(c) = scan_simple("pip", home_join(".cache/pip"), "safe") {
         out.push(c);
     }
-    if let Some(c) = scan_simple("uv", uv_cache_path(), "safe") {
+    if let Some(c) = scan_simple("uv", reported(uv_cache_path()), "safe") {
         out.push(c);
     }
     if let Some(c) = scan_simple("pipenv", home_join(".cache/pipenv"), "safe") {
@@ -279,7 +344,7 @@ pub fn scan_all() -> Vec<DevCache> {
     }
 
     // ── C/C++ ──
-    if let Some(c) = scan_simple("ccache", ccache_dir_path(), "safe") {
+    if let Some(c) = scan_simple("ccache", reported(ccache_dir_path()), "safe") {
         out.push(c);
     }
 
@@ -321,7 +386,7 @@ pub fn scan_all() -> Vec<DevCache> {
     // ── Go ──
     if let Some(c) = scan_redownload(
         "go modules",
-        go_modcache_path(),
+        reported(go_modcache_path()),
         "re-download on next build",
     ) {
         out.push(c);
@@ -574,10 +639,14 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             if utils::which("deno") {
                 let before = c.size;
                 run_tool(c, "deno", &["clean"]);
-                let after = deno_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+                let after = deno_dir_path()
+                    .dir()
+                    .map(|p| utils::dir_size(&p))
+                    .unwrap_or(0);
                 before.saturating_sub(after)
             } else {
                 deno_dir_path()
+                    .dir()
                     .as_deref()
                     .map(clean_dir_contents)
                     .unwrap_or(0)
@@ -604,10 +673,14 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             if utils::which("uv") {
                 let before = c.size;
                 run_tool(c, "uv", &["cache", "clean"]);
-                let after = uv_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+                let after = uv_cache_path()
+                    .dir()
+                    .map(|p| utils::dir_size(&p))
+                    .unwrap_or(0);
                 before.saturating_sub(after)
             } else {
                 uv_cache_path()
+                    .dir()
                     .as_deref()
                     .map(clean_dir_contents)
                     .unwrap_or(0)
@@ -650,7 +723,10 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "go modules" if utils::which("go") => {
             let before = c.size;
             run_tool(c, "go", &["clean", "-modcache"]);
-            let after = go_modcache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let after = go_modcache_path()
+                .dir()
+                .map(|p| utils::dir_size(&p))
+                .unwrap_or(0);
             before.saturating_sub(after)
         }
         "go modules" => 0,
@@ -688,7 +764,10 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "ccache" if utils::which("ccache") => {
             let before = c.size;
             run_tool(c, "ccache", &["-C"]);
-            let after = ccache_dir_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let after = ccache_dir_path()
+                .dir()
+                .map(|p| utils::dir_size(&p))
+                .unwrap_or(0);
             before.saturating_sub(after)
         }
         "ccache" => 0,
@@ -966,7 +1045,7 @@ mod tests {
     /// the resolved path is the ccache dir and not something unrelated.
     #[test]
     fn test_ccache_path_shape() {
-        if let Some(p) = ccache_dir_path() {
+        if let Some(p) = ccache_dir_path().dir() {
             let s = p.to_string_lossy().to_string();
             assert!(s.contains("ccache"), "ccache path must mention ccache: {s}");
         }

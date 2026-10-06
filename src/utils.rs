@@ -725,9 +725,19 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Get user home directory from $HOME
+/// The user's home directory, from `$HOME`.
+///
+/// Only a usable value counts: absolute and non-empty. An empty `$HOME` would
+/// turn `~/.cache` into `.cache` in whatever directory the tool happened to be
+/// started from, and a relative one does the same; both are treated as unset,
+/// so the callers' "cannot determine HOME" paths run instead of a cleanup of the
+/// wrong place.
 pub fn home_dir() -> Option<String> {
-    env::var("HOME").ok()
+    usable_home(env::var("HOME").ok())
+}
+
+fn usable_home(home: Option<String>) -> Option<String> {
+    home.filter(|h| Path::new(h).is_absolute())
 }
 
 /// Ask user for yes/no confirmation. In JSON mode there is no interactive
@@ -1009,6 +1019,17 @@ mod tests {
     #[test]
     fn test_which_not_exists() {
         assert!(!which("nonexistent_command_xyz_12345"));
+    }
+
+    #[test]
+    fn test_only_an_absolute_home_is_usable() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(usable_home(some("/home/u")), some("/home/u"));
+        assert_eq!(usable_home(some("/")), some("/"), "root in a container");
+        assert_eq!(usable_home(some("")), None, "empty would mean the cwd");
+        assert_eq!(usable_home(some("home/u")), None, "relative would too");
+        assert_eq!(usable_home(some(".")), None);
+        assert_eq!(usable_home(None), None);
     }
 
     #[test]
@@ -1599,6 +1620,7 @@ mod tests {
             ("clean.rs", include_str!("clean.rs")),
             ("dev.rs", include_str!("dev.rs")),
             ("detect.rs", include_str!("detect.rs")),
+            ("roots.rs", include_str!("roots.rs")),
         ];
         for (name, source) in modules {
             for (number, line) in source.lines().enumerate() {

@@ -435,3 +435,521 @@ fn test_json_mode_stdout_is_a_single_document_even_with_chatty_tools() {
     assert!(!stdout.contains("UV-CHATTER-LINE"), "{}", report(&out));
     sb.cleanup();
 }
+
+// ── Roots handed over by the environment ──
+//
+// `XDG_CACHE_HOME`, `UV_CACHE_DIR`, `DENO_DIR`, `CCACHE_DIR`, `GOMODCACHE` and
+// `GOPATH` name directories that get emptied. A value pointing at the home
+// directory used to empty it.
+
+/// Feed `input` to the process, as someone answering a prompt would.
+fn run_with_input(command: &mut Command, input: &str) -> Output {
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The child may exit without reading (no prompt was due), so a closed pipe
+    // is not a failure here.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+/// Files in the sandbox's home that no cleanup has any business touching.
+fn precious_files(sb: &Sandbox) -> Vec<PathBuf> {
+    let files = vec![
+        sb.home.join("thesis.txt"),
+        sb.home.join("Documents/notes.txt"),
+        sb.home.join("projects/app/src/main.rs"),
+    ];
+    for file in &files {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "irreplaceable").unwrap();
+    }
+    files
+}
+
+fn survive(files: &[PathBuf]) -> bool {
+    files.iter().all(|f| f.exists())
+}
+
+/// A fake tool that only records that it was called.
+fn fake_logger(sb: &Sandbox, name: &str) {
+    let script = format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\n", sb.log.display());
+    write_exec(&sb.bin.join(name), &script);
+}
+
+#[test]
+fn test_xdg_cache_home_pointing_at_home_deletes_nothing() {
+    let sb = Sandbox::new("xdg_home");
+    let precious = precious_files(&sb);
+    let junk = sb.home.join(".cache/junk");
+    fill_cache(&junk);
+    // A symlink must not be a way round the check.
+    let alias = sb.root.join("alias");
+    std::os::unix::fs::symlink(&sb.home, &alias).unwrap();
+
+    for target in [&sb.home, &alias] {
+        let out = sb
+            .oxiclean(&["--cache", "--yes"])
+            .env("XDG_CACHE_HOME", target)
+            .output()
+            .unwrap();
+        let stdout = text(&out.stdout);
+        assert!(
+            survive(&precious),
+            "the home directory was emptied:\n{}",
+            report(&out)
+        );
+        assert!(sb.bin.is_dir(), "{}", report(&out));
+        assert!(
+            stdout.contains("Refusing to clean XDG_CACHE_HOME=")
+                && stdout.contains("home directory"),
+            "no explanation:\n{}",
+            report(&out)
+        );
+        // Nothing is cleaned in its place either: the user's tools use the
+        // variable, so ~/.cache is not where their caches are.
+        assert!(junk.join("data/blob").exists(), "{}", report(&out));
+    }
+    sb.cleanup();
+}
+
+#[test]
+fn test_xdg_cache_home_naming_a_parent_or_a_settings_dir_is_refused() {
+    let sb = Sandbox::new("xdg_parent");
+    let precious = precious_files(&sb);
+    fs::create_dir_all(sb.home.join(".config/app")).unwrap();
+    fs::write(sb.home.join(".config/app/settings"), "x").unwrap();
+
+    for target in [
+        sb.root.clone(),
+        sb.home.join(".config"),
+        sb.home.join("Documents"),
+    ] {
+        let out = sb
+            .oxiclean(&["--cache", "--yes"])
+            .env("XDG_CACHE_HOME", &target)
+            .output()
+            .unwrap();
+        assert!(survive(&precious), "{target:?}\n{}", report(&out));
+        assert!(
+            sb.home.join(".config/app/settings").exists(),
+            "{target:?}\n{}",
+            report(&out)
+        );
+        assert!(
+            text(&out.stdout).contains("Refusing to clean"),
+            "{target:?}\n{}",
+            report(&out)
+        );
+    }
+    sb.cleanup();
+}
+
+#[test]
+fn test_relative_xdg_cache_home_is_ignored_not_read_against_the_cwd() {
+    let sb = Sandbox::new("xdg_relative");
+    let cwd = sb.root.join("cwd");
+    fill_cache(&cwd.join("rel"));
+    let junk = sb.home.join(".cache/junk");
+    fill_cache(&junk);
+
+    let out = sb
+        .oxiclean(&["--cache", "--yes"])
+        .env("XDG_CACHE_HOME", "rel")
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+
+    assert!(
+        cwd.join("rel/data/blob").exists(),
+        "a relative XDG_CACHE_HOME was resolved against the cwd:\n{}",
+        report(&out)
+    );
+    assert!(
+        text(&out.stdout).contains("not an absolute path"),
+        "{}",
+        report(&out)
+    );
+    // The spec says to ignore it, so the default cache is what gets cleaned.
+    assert!(!junk.exists(), "{}", report(&out));
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_moved_cache_is_cleaned_only_with_consent() {
+    let sb = Sandbox::new("xdg_consent");
+    let moved = sb.root.join("moved");
+    let junk = moved.join("junk");
+    let args = ["--cache"];
+
+    // No one to say yes (cron without --yes): left alone.
+    fill_cache(&junk);
+    let out = run_with_input(sb.oxiclean(&args).env("XDG_CACHE_HOME", &moved), "");
+    assert!(junk.join("data/blob").exists(), "{}", report(&out));
+    assert!(
+        text(&out.stdout).contains("XDG_CACHE_HOME points to"),
+        "{}",
+        report(&out)
+    );
+
+    // An explicit no.
+    let out = run_with_input(sb.oxiclean(&args).env("XDG_CACHE_HOME", &moved), "n\n");
+    assert!(junk.join("data/blob").exists(), "{}", report(&out));
+    assert!(text(&out.stdout).contains("Left alone"), "{}", report(&out));
+
+    // An explicit yes.
+    let out = run_with_input(sb.oxiclean(&args).env("XDG_CACHE_HOME", &moved), "y\n");
+    assert!(!junk.exists(), "{}", report(&out));
+    assert!(moved.is_dir(), "the cache directory itself stays");
+
+    // --yes answers for an unattended run, without a prompt.
+    fill_cache(&junk);
+    let out = run_with_input(
+        sb.oxiclean(&["--cache", "--yes"])
+            .env("XDG_CACHE_HOME", &moved),
+        "",
+    );
+    assert!(!junk.exists(), "{}", report(&out));
+    assert!(!text(&out.stdout).contains("[y/N]"), "{}", report(&out));
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_dry_run_over_a_moved_cache_changes_nothing_and_asks_nothing() {
+    let sb = Sandbox::new("xdg_dry_run");
+    let moved = sb.root.join("moved");
+    fill_cache(&moved.join("junk"));
+
+    let out = run_with_input(
+        sb.oxiclean(&["--cache", "--dry-run"])
+            .env("XDG_CACHE_HOME", &moved),
+        "",
+    );
+
+    let stdout = text(&out.stdout);
+    assert!(moved.join("junk/data/blob").exists(), "{}", report(&out));
+    assert!(!stdout.contains("[y/N]"), "{}", report(&out));
+    assert!(
+        stdout.contains("asks first"),
+        "the dry run should say so:\n{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_json_mode_cleans_a_moved_cache_only_with_yes() {
+    let sb = Sandbox::new("xdg_json");
+    let moved = sb.root.join("moved");
+    let junk = moved.join("junk");
+
+    fill_cache(&junk);
+    let out = sb
+        .oxiclean(&["--cache", "--json"])
+        .env("XDG_CACHE_HOME", &moved)
+        .output()
+        .unwrap();
+    assert!(junk.join("data/blob").exists(), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    assert_eq!(stdout.trim_end().lines().count(), 1, "{}", report(&out));
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(doc["operations"]["cache"], 0, "{doc}");
+
+    let out = sb
+        .oxiclean(&["--cache", "--json", "--yes"])
+        .env("XDG_CACHE_HOME", &moved)
+        .output()
+        .unwrap();
+    assert!(!junk.exists(), "{}", report(&out));
+    let doc: serde_json::Value = serde_json::from_str(text(&out.stdout).trim()).unwrap();
+    assert!(
+        doc["operations"]["cache"].as_u64().unwrap_or(0) > 0,
+        "{doc}"
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_xdg_cache_home_naming_the_default_place_needs_no_consent() {
+    // Plenty of profiles export it explicitly. Nothing has moved, so nobody
+    // should be asked (and with no one to ask, the cache would stay dirty).
+    let sb = Sandbox::new("xdg_default");
+    let junk = sb.home.join(".cache/junk");
+    fill_cache(&junk);
+
+    let out = run_with_input(
+        sb.oxiclean(&["--cache"])
+            .env("XDG_CACHE_HOME", sb.home.join(".cache")),
+        "",
+    );
+
+    assert!(!junk.exists(), "{}", report(&out));
+    assert!(!text(&out.stdout).contains("[y/N]"), "{}", report(&out));
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_world_writable_xdg_cache_home_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new("xdg_world_writable");
+    let shared = sb.root.join("shared");
+    fill_cache(&shared.join("junk"));
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let out = sb
+        .oxiclean(&["--cache", "--yes"])
+        .env("XDG_CACHE_HOME", &shared)
+        .output()
+        .unwrap();
+
+    assert!(shared.join("junk/data/blob").exists(), "{}", report(&out));
+    assert!(
+        text(&out.stdout).contains("anyone can write"),
+        "{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_refusal_in_json_mode_is_still_one_document() {
+    let sb = Sandbox::new("xdg_json_refused");
+    let precious = precious_files(&sb);
+
+    let out = sb
+        .oxiclean(&["--cache", "--json", "--yes"])
+        .env("XDG_CACHE_HOME", &sb.home)
+        .output()
+        .unwrap();
+
+    assert!(survive(&precious), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    assert_eq!(stdout.trim_end().lines().count(), 1, "{}", report(&out));
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .unwrap_or_else(|e| panic!("not JSON ({e}):\n{}", report(&out)));
+    sb.cleanup();
+}
+
+#[test]
+fn test_an_empty_or_relative_home_is_not_the_working_directory() {
+    // `HOME=` made "~/.cache" into ".cache" under whatever directory the tool
+    // was started from.
+    for home in ["", "relative/home", "."] {
+        let sb = Sandbox::new("home_unusable");
+        let cwd = sb.root.join("cwd");
+        fill_cache(&cwd.join(".cache/junk"));
+        fill_cache(&cwd.join(".npm/_cacache"));
+        fill_cache(&cwd.join("relative/home/.cache/junk"));
+
+        let out = sb
+            .oxiclean(&["--cache", "--dev", "--yes"])
+            .env("HOME", home)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+
+        assert!(
+            cwd.join(".cache/junk/data/blob").exists(),
+            "HOME={home:?}\n{}",
+            report(&out)
+        );
+        assert!(
+            cwd.join(".npm/_cacache/data/blob").exists(),
+            "HOME={home:?}\n{}",
+            report(&out)
+        );
+        assert!(
+            cwd.join("relative/home/.cache/junk/data/blob").exists(),
+            "HOME={home:?}\n{}",
+            report(&out)
+        );
+        assert!(
+            text(&out.stdout).contains("Cannot determine cache directory"),
+            "HOME={home:?}\n{}",
+            report(&out)
+        );
+        sb.cleanup();
+    }
+}
+
+#[test]
+fn test_uv_and_deno_dirs_naming_home_are_not_wiped_when_the_tool_is_missing() {
+    // With no `uv` or `deno` on PATH the cleaner falls back to emptying the
+    // directory itself, which is exactly where a wrong value did the damage.
+    for var in ["UV_CACHE_DIR", "DENO_DIR"] {
+        let sb = Sandbox::new("dev_dir_home");
+        let precious = precious_files(&sb);
+
+        let out = sb
+            .oxiclean(&["--dev", "--yes", "--deep"])
+            .env(var, &sb.home)
+            .output()
+            .unwrap();
+
+        assert!(survive(&precious), "{var}\n{}", report(&out));
+        assert!(sb.bin.is_dir(), "{var}\n{}", report(&out));
+        assert!(
+            text(&out.stdout).contains(&format!("Not cleaning {var}=")),
+            "{var}\n{}",
+            report(&out)
+        );
+        sb.cleanup();
+    }
+}
+
+#[test]
+fn test_tools_are_never_asked_to_clean_a_directory_that_is_not_a_cache() {
+    // `go clean -modcache` and `ccache -C` do the deleting themselves, so the
+    // only protection is not calling them.
+    let cases = [
+        ("go", "GOMODCACHE", "clean -modcache"),
+        ("ccache", "CCACHE_DIR", "-C"),
+    ];
+    for (tool, var, call) in cases {
+        let sb = Sandbox::new("tool_home");
+        let precious = precious_files(&sb);
+        fake_logger(&sb, tool);
+
+        let out = sb
+            .oxiclean(&["--dev", "--yes", "--deep"])
+            .env(var, &sb.home)
+            .output()
+            .unwrap();
+
+        assert!(survive(&precious), "{var}\n{}", report(&out));
+        let calls = sb.calls();
+        assert!(
+            !calls.contains(call),
+            "{tool} was told to clean a directory that is not a cache ({var}):\n{calls}\n{}",
+            report(&out)
+        );
+        sb.cleanup();
+    }
+}
+
+#[test]
+fn test_ordinary_environment_settings_still_work() {
+    // The check must not cost anyone their relocated caches.
+    let sb = Sandbox::new("env_ordinary");
+    let gomod = sb.root.join("gopath1/pkg/mod");
+    fill_cache(&gomod);
+    let uv = sb.root.join("uvcache");
+    fill_cache(&uv);
+    fake_logger(&sb, "go");
+    fake_uv(&sb, &uv, &WELL_BEHAVED);
+
+    // GOPATH is a list; the first entry owns the module cache.
+    let gopath = format!(
+        "{}:{}",
+        sb.root.join("gopath1").display(),
+        sb.root.join("gopath2").display()
+    );
+    let out = sb
+        .oxiclean(&["--dev", "--yes", "--deep"])
+        .env("GOPATH", gopath)
+        .env("UV_CACHE_DIR", &uv)
+        .output()
+        .unwrap();
+
+    let calls = sb.calls();
+    assert!(
+        calls.contains("go clean -modcache"),
+        "{calls}\n{}",
+        report(&out)
+    );
+    assert!(calls.contains("cache clean"), "{calls}\n{}", report(&out));
+    assert!(
+        !text(&out.stdout).contains("Not cleaning"),
+        "{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_xdg_cache_home_cannot_be_where_the_environment_keeps_data() {
+    // A line copied from the wrong variable in a profile.
+    let sb = Sandbox::new("xdg_named");
+    let shared = sb.root.join("shared");
+    fill_cache(&shared.join("junk"));
+
+    for var in [
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        let out = sb
+            .oxiclean(&["--cache", "--yes"])
+            .env("XDG_CACHE_HOME", &shared)
+            .env(var, &shared)
+            .output()
+            .unwrap();
+        assert!(
+            shared.join("junk/data/blob").exists(),
+            "{var}\n{}",
+            report(&out)
+        );
+        assert!(text(&out.stdout).contains(var), "{var}\n{}", report(&out));
+    }
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_tools_directory_others_can_write_to_is_not_cleaned() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new("dev_world_writable");
+    let shared = sb.root.join("shared-uv");
+    fill_cache(&shared);
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    fake_uv(&sb, &shared, &WELL_BEHAVED);
+
+    let out = sb
+        .oxiclean(&["--dev", "--yes"])
+        .env("UV_CACHE_DIR", &shared)
+        .output()
+        .unwrap();
+
+    assert!(shared.join("data/blob").exists(), "{}", report(&out));
+    assert!(!sb.calls().contains("cache clean"), "{}", report(&out));
+    assert!(
+        text(&out.stdout).contains("anyone can write"),
+        "{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_relative_xdg_cache_home_does_not_stop_uv_from_being_cleaned() {
+    // The spec says to ignore it; uv's own default then applies.
+    let sb = Sandbox::new("uv_relative_xdg");
+    let cache = sb.home.join(".cache/uv");
+    fill_cache(&cache);
+    fake_uv(&sb, &cache, &WELL_BEHAVED);
+
+    let out = sb
+        .oxiclean(&["--dev", "--yes"])
+        .env("XDG_CACHE_HOME", "rel")
+        .current_dir(&sb.root)
+        .output()
+        .unwrap();
+
+    assert!(
+        sb.calls().lines().any(|l| l == "cache clean"),
+        "{:?}\n{}",
+        sb.calls(),
+        report(&out)
+    );
+    assert_eq!(entries(&cache), 0, "{}", report(&out));
+    assert!(
+        !text(&out.stdout).contains("Not cleaning"),
+        "{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
