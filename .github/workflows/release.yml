@@ -9,8 +9,31 @@ permissions:
   contents: write
 
 jobs:
+  # A release has to be able to update itself, and --update refuses to run
+  # without a signing key built in. Find that out before spending time on four
+  # cross builds, not after publishing a release nobody can upgrade from.
+  preflight:
+    name: Release can update itself
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches Cargo.toml
+        # The updater runs the downloaded binary with --version and insists on
+        # exactly the version the signature names. A mismatch here would make
+        # every client reject this release.
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - name: minisign.pub holds a signing key
+        run: cargo test --locked release_builds_must_ship_an_update_key -- --ignored
+
   build:
     name: Build ${{ matrix.name }}
+    needs: preflight
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -38,6 +61,9 @@ jobs:
           target: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/oxiclean ${{ matrix.name }}
+      - name: Record the checksum
+        # What scripts/sign-release.sh asks the maintainer to compare with.
+        run: sha256sum ${{ matrix.name }} | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
@@ -53,6 +79,11 @@ jobs:
           path: artifacts
       - uses: softprops/action-gh-release@v2
         with:
+          # A draft, so nobody (install.sh and `oxiclean --update` included)
+          # sees it until the checksum list has been signed offline with
+          # scripts/sign-release.sh and the draft has been published by hand.
+          # See RELEASING.md.
+          draft: true
           files: |
             artifacts/oxiclean-x86_64-linux-gnu/oxiclean-x86_64-linux-gnu
             artifacts/oxiclean-x86_64-linux-musl/oxiclean-x86_64-linux-musl

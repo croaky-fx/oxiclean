@@ -31,3 +31,8 @@ jobs:
       - run: cargo test --verbose
       - run: cargo clippy -- -D warnings
       - run: cargo fmt -- --check
+      - name: Release signing script
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          scripts/test-sign-release.sh
