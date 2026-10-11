@@ -311,6 +311,17 @@ fn main() {
 
     // Self-update is a standalone mode — it ignores the cleanup flags.
     if cli.update {
+        // --json promises one JSON document on stdout, and the update flow is a
+        // conversation in plain text: it asks before it replaces the binary.
+        // Run silently it would either do nothing or replace the binary with no
+        // word to anyone, so refuse, in the same shape as every other refusal.
+        if cli.json {
+            println!(
+                "{{\"error\":{}}}",
+                json_string("--update does not support --json: it asks first and reports in text")
+            );
+            std::process::exit(2);
+        }
         std::process::exit(update::run(cli.yes));
     }
 

@@ -10,11 +10,16 @@ license = "MIT"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "=4.5.20"
 colored = "2"
-ureq = { version = "3", features = ["json"] }
+# No gzip/brotli: nothing we download is compressed, and a decoder is one more
+# place for a hostile response to misbehave. TLS is rustls with its default
+# (ring) provider.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
 serde_json = "1"
+# Release signatures (--update): a zero-dependency verifier by the author of
+# minisign, and SHA-256 from ring, which rustls already pulls in.
+minisign-verify = "0.3"
+ring = "0.17"
 
 [profile.release]
 opt-level = "z"

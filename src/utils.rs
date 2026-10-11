@@ -430,23 +430,82 @@ pub fn current_privilege() -> Privilege {
 /// This is the single choke point for privileged execution — the ~40 call sites
 /// in `clean.rs` keep passing bare names and inherit the guarantee for free.
 pub fn elevate(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
-    // Refuse rather than fall back to a $PATH lookup: with root behind the
-    // call, "not in a trusted directory" must never mean "try anywhere".
-    let Some(target) = resolve_trusted(cmd) else {
+    let Some((program, argv)) = escalation(privilege, cmd, args, &resolve_trusted) else {
         return false;
     };
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run(&program, &argv)
+}
+
+/// What to spawn to run `cmd args…` under `privilege`: a program and its
+/// arguments, or `None` when it must not run at all. That is the case when no
+/// escalation tool exists, and when the command or the tool is not found by
+/// `resolve` ([`resolve_trusted`] outside of tests).
+///
+/// Refuse rather than fall back to a `$PATH` lookup: with root behind the call,
+/// "not in a trusted directory" must never mean "try anywhere". The command is
+/// handed to `sudo`/`doas` as the absolute path `resolve` found, so it can
+/// neither be looked up again nor be taken for an option.
+fn escalation(
+    privilege: Privilege,
+    cmd: &str,
+    args: &[&str],
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, Vec<String>)> {
+    let target = resolve(cmd)?;
+    let args = args.iter().map(|a| a.to_string());
     match privilege {
-        Privilege::Root => run(&target, args),
+        Privilege::Root => Some((target, args.collect())),
         Privilege::Sudo | Privilege::Doas => {
-            let Some(helper) = resolve_trusted(privilege.name()) else {
-                return false;
-            };
-            let mut a = vec![target.as_str()];
-            a.extend_from_slice(args);
-            run(&helper, &a)
+            let helper = resolve(privilege.name())?;
+            Some((helper, std::iter::once(target).chain(args).collect()))
         }
-        Privilege::None => false,
+        Privilege::None => None,
     }
+}
+
+/// [`elevate`] with `input` fed to the command's stdin.
+///
+/// For handing root a payload without leaving it in a file first: a file in a
+/// directory an unprivileged process can write to is a file that process can
+/// swap between the moment it was checked and the moment root reads it. A pipe
+/// has no such window.
+///
+/// Resolution and environment are exactly [`elevate`]'s. `true` means the
+/// command exited 0 *and* every byte of `input` reached it: a command that
+/// stopped reading early is a failure whatever its exit status says, since
+/// what it did with a short input is not something to vouch for.
+pub fn elevate_with_input(privilege: Privilege, cmd: &str, args: &[&str], input: &[u8]) -> bool {
+    let Some((program, argv)) = escalation(privilege, cmd, args, &resolve_trusted) else {
+        return false;
+    };
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_with_input(&program, &argv, input)
+}
+
+/// Spawn `cmd` with the hardened environment, write `input` to its stdin, and
+/// wait for it. Stdout and stderr follow the usual rules for visible commands,
+/// and a password prompt still reaches the terminal (sudo and doas ask on the
+/// tty, not on stdin).
+fn run_with_input(cmd: &str, args: &[&str], input: &[u8]) -> bool {
+    let mut command = Command::new(cmd);
+    command.args(args).stdin(Stdio::piped());
+    harden_env(&mut command);
+    keep_json_stdout_clean(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    // A command that exits without reading (a refused password, a policy
+    // denial) makes the write fail with a broken pipe. Rust ignores SIGPIPE, so
+    // that arrives here as an error rather than killing us, and the exit
+    // status below tells the rest. Dropping the handle sends EOF.
+    let delivered = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(input).is_ok())
+        .unwrap_or(false);
+    let succeeded = child.wait().map(|s| s.success()).unwrap_or(false);
+    delivered && succeeded
 }
 
 /// Cache the user's password / authorisation for the chosen helper.
@@ -1182,6 +1241,177 @@ mod tests {
         assert!(!acquire_privilege(Privilege::None));
     }
 
+    // ── Escalation: what runs, and with what ──
+
+    #[test]
+    fn test_escalation_builds_the_command_line_for_each_helper() {
+        let resolve = |name: &str| match name {
+            "sh" => Some("/usr/bin/sh".to_string()),
+            "sudo" => Some("/usr/bin/sudo".to_string()),
+            "doas" => Some("/usr/bin/doas".to_string()),
+            _ => None,
+        };
+        let args = ["-c", "echo $0 'quoted'", "with space"];
+        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Root runs the resolved path directly.
+        assert_eq!(
+            escalation(Privilege::Root, "sh", &args, &resolve),
+            Some(("/usr/bin/sh".to_string(), owned(&args)))
+        );
+        // sudo and doas are handed the resolved absolute path of the command,
+        // then its arguments untouched.
+        let through = owned(&["/usr/bin/sh", "-c", "echo $0 'quoted'", "with space"]);
+        assert_eq!(
+            escalation(Privilege::Sudo, "sh", &args, &resolve),
+            Some(("/usr/bin/sudo".to_string(), through.clone()))
+        );
+        assert_eq!(
+            escalation(Privilege::Doas, "sh", &args, &resolve),
+            Some(("/usr/bin/doas".to_string(), through))
+        );
+        // Nothing to escalate with, or nothing to run.
+        assert_eq!(escalation(Privilege::None, "sh", &args, &resolve), None);
+        assert_eq!(
+            escalation(Privilege::Sudo, "unknown", &args, &resolve),
+            None
+        );
+    }
+
+    #[test]
+    fn test_escalation_never_runs_without_the_tool_it_needs() {
+        let only_sh = |name: &str| (name == "sh").then(|| "/usr/bin/sh".to_string());
+        assert_eq!(escalation(Privilege::Sudo, "sh", &[], &only_sh), None);
+        assert_eq!(escalation(Privilege::Doas, "sh", &[], &only_sh), None);
+        // Root needs no helper.
+        assert!(escalation(Privilege::Root, "sh", &[], &only_sh).is_some());
+        // And a helper is never put in front of a command that was not found.
+        let only_sudo = |name: &str| (name == "sudo").then(|| "/usr/bin/sudo".to_string());
+        assert_eq!(escalation(Privilege::Sudo, "sh", &[], &only_sudo), None);
+    }
+
+    #[test]
+    fn test_escalation_resolves_through_the_trusted_directories() {
+        let (program, _) = escalation(Privilege::Root, "sh", &[], &resolve_trusted).unwrap();
+        assert!(program.starts_with('/'), "{program}");
+        assert!(
+            TRUSTED_BIN_DIRS.iter().any(|d| program.starts_with(d)),
+            "{program}"
+        );
+        assert_eq!(
+            escalation(Privilege::Root, "./sh", &[], &resolve_trusted),
+            None
+        );
+        assert_eq!(
+            escalation(
+                Privilege::Root,
+                "oxiclean_no_such_binary_xyz",
+                &[],
+                &resolve_trusted
+            ),
+            None
+        );
+    }
+
+    // ── elevate_with_input ──
+
+    /// `sh -c script out` with `input` on stdin, as `Privilege::Root` would run
+    /// it; `$0` in the script is the path of the output file.
+    fn root_sh_with_input(script: &str, out: &Path, input: &[u8]) -> bool {
+        let out = out.to_str().unwrap();
+        elevate_with_input(Privilege::Root, "sh", &["-c", script, out], input)
+    }
+
+    /// Not one repeated byte, so a dropped or reordered chunk shows.
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn test_elevate_with_input_hands_over_every_byte() {
+        let dir = scratch("input_all");
+        let out = dir.join("out");
+        // Many times a pipe buffer: the writer has to keep going while the
+        // command reads.
+        let input = patterned(3 << 20);
+        assert!(root_sh_with_input("cat > \"$0\"", &out, &input));
+        assert_eq!(fs::read(&out).unwrap(), input);
+        // An empty input is a valid input.
+        assert!(root_sh_with_input("cat > \"$0\"", &out, b""));
+        assert_eq!(fs::read(&out).unwrap(), b"");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_elevate_with_input_reports_a_command_that_fails() {
+        let dir = scratch("input_fails");
+        let out = dir.join("out");
+        assert!(!root_sh_with_input(
+            "cat > \"$0\"; exit 1",
+            &out,
+            b"payload"
+        ));
+        // It did receive the input; the failure is its own.
+        assert_eq!(fs::read(&out).unwrap(), b"payload");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_elevate_with_input_is_a_failure_when_the_command_stops_reading() {
+        // Exits 0 without reading a byte of 4 MiB. Whatever it did with what it
+        // never saw is not something to vouch for, and the writer must not hang
+        // on a pipe nobody reads.
+        let dir = scratch("input_early");
+        let out = dir.join("out");
+        let started = std::time::Instant::now();
+        assert!(!root_sh_with_input("exit 0", &out, &patterned(4 << 20)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_elevate_with_input_runs_nothing_it_may_not() {
+        let dir = scratch("input_refused");
+        let marker = dir.join("ran");
+        let marker = marker.to_str().unwrap();
+        let script = "touch \"$0\"";
+        // No escalation tool exists.
+        assert!(!elevate_with_input(
+            Privilege::None,
+            "sh",
+            &["-c", script, marker],
+            b"x"
+        ));
+        // A command outside the trusted directories, by name or by path.
+        assert!(!elevate_with_input(
+            Privilege::Root,
+            "oxiclean_no_such_binary_xyz",
+            &[marker],
+            b"x"
+        ));
+        assert!(!elevate_with_input(
+            Privilege::Root,
+            "./sh",
+            &["-c", script, marker],
+            b"x"
+        ));
+        assert!(!Path::new(marker).exists(), "something ran");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_elevate_with_input_gives_the_child_the_trusted_path() {
+        let dir = scratch("input_path");
+        let out = dir.join("out");
+        assert!(root_sh_with_input(
+            "printf %s \"$PATH\" > \"$0\"",
+            &out,
+            b""
+        ));
+        assert_eq!(fs::read_to_string(&out).unwrap(), trusted_path());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn test_current_privilege_default_is_sudo() {
         // Until main() sets PRIVILEGE, current_privilege() falls back to Sudo.
@@ -1621,6 +1851,7 @@ mod tests {
             ("dev.rs", include_str!("dev.rs")),
             ("detect.rs", include_str!("detect.rs")),
             ("roots.rs", include_str!("roots.rs")),
+            ("update.rs", include_str!("update.rs")),
         ];
         for (name, source) in modules {
             for (number, line) in source.lines().enumerate() {

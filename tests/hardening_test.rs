@@ -5,10 +5,15 @@
 //! under `env_clear()` plus the few variables a test chooses to set.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 /// A fresh scratch directory, unique to this test and this process.
 fn scratch(name: &str) -> PathBuf {
@@ -82,7 +87,12 @@ impl Sandbox {
     /// The binary under test, with a minimal environment: nothing leaks in from
     /// the developer's shell, and nothing leaks out to their real `HOME`.
     fn oxiclean(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_oxiclean"));
+        self.command_for(Path::new(env!("CARGO_BIN_EXE_oxiclean")), args)
+    }
+
+    /// The same, for a copy of the binary somewhere else.
+    fn command_for(&self, exe: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(exe);
         command
             .env_clear()
             .env("HOME", &self.home)
@@ -951,5 +961,175 @@ fn test_a_relative_xdg_cache_home_does_not_stop_uv_from_being_cleaned() {
         "{}",
         report(&out)
     );
+    sb.cleanup();
+}
+
+// ── --update ──
+
+/// Whether `minisign.pub` holds a signing key yet. Until the maintainer adds
+/// one, a build of this tree refuses to update, and says so.
+fn update_key_is_embedded() -> bool {
+    include_str!("../minisign.pub")
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
+}
+
+/// A stand-in HTTPS proxy on localhost. `ureq` asks it to `CONNECT` to the real
+/// host; it records the request line and refuses, so nothing a test starts can
+/// reach the real network, and the test learns whom the program tried to reach.
+struct FakeProxy {
+    url: String,
+    seen: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FakeProxy {
+    fn start() -> FakeProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut conn, _)) => {
+                            let _ = conn.set_nonblocking(false);
+                            let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+                            let mut head = Vec::new();
+                            let mut buf = [0u8; 1024];
+                            while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16384 {
+                                match conn.read(&mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                                }
+                            }
+                            let first = text(&head).lines().next().unwrap_or("").to_string();
+                            seen.lock().unwrap().push(first);
+                            let _ = conn.write_all(
+                                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        FakeProxy {
+            url,
+            seen,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The first line of every request made so far.
+    fn requests(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for FakeProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[test]
+fn test_update_with_json_is_refused_with_one_document() {
+    // The update flow is a conversation in text. Run under --json it could
+    // only be silent, so it is refused the way every other bad combination is.
+    let sb = Sandbox::new("update_json");
+    let proxy = FakeProxy::start();
+
+    for args in [
+        &["--update", "--json"][..],
+        &["--update", "--json", "--yes"][..],
+    ] {
+        let out = sb
+            .oxiclean(args)
+            .env("HTTPS_PROXY", &proxy.url)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{}", report(&out));
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("not exactly one JSON document ({e}):\n{}", report(&out)));
+        let error = doc["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("--update") && error.contains("--json"),
+            "{doc}"
+        );
+        assert_eq!(doc.as_object().unwrap().len(), 1, "{doc}");
+    }
+    assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
+    sb.cleanup();
+}
+
+#[test]
+fn test_update_fails_closed_and_leaves_the_binary_alone() {
+    let sb = Sandbox::new("update_closed");
+    let proxy = FakeProxy::start();
+
+    // The binary under test, linked into the sandbox: it is what --update
+    // would replace, and a replacement (a rename over this name) cannot reach
+    // the real build output.
+    let exe = sb.bin.join("oxiclean");
+    let built = env!("CARGO_BIN_EXE_oxiclean");
+    fs::hard_link(built, &exe)
+        .or_else(|_| fs::copy(built, &exe).map(|_| ()))
+        .unwrap();
+    let before = fs::metadata(&exe).unwrap();
+
+    let out = sb
+        .command_for(&exe, &["--update", "--yes"])
+        .env("HTTPS_PROXY", &proxy.url)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let said = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    if update_key_is_embedded() {
+        // Asked GitHub, was refused, gave up. GitHub is the only one it asked.
+        assert!(said.contains("couldn't check for updates"), "{said}");
+        let asked = proxy.requests();
+        assert!(!asked.is_empty(), "it never tried the network");
+        assert!(
+            asked
+                .iter()
+                .all(|r| r == "CONNECT api.github.com:443 HTTP/1.1"),
+            "{asked:?}"
+        );
+    } else {
+        // Nothing to verify a download against: it must not even ask.
+        assert!(said.contains("no release-signing key"), "{said}");
+        assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
+    }
+
+    let after = fs::metadata(&exe).unwrap();
+    assert_eq!(
+        (
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec()
+        ),
+        (after.ino(), after.len(), after.mtime(), after.mtime_nsec()),
+        "the binary was touched"
+    );
+    let left: Vec<_> = fs::read_dir(&sb.bin)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["oxiclean"], "something was left beside the binary");
     sb.cleanup();
 }
