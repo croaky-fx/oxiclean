@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::detect::Privilege;
 
@@ -867,7 +867,68 @@ pub fn warning(msg: &str) {
     println!("    {} {}", "⚠".yellow().bold(), msg);
 }
 
+/// What went wrong in this run, so the exit status and the `--json` report can
+/// say so as well as the terminal.
+///
+/// Everything printed through [`error`] lands here, and nothing else does. That
+/// is the contract the rest of the code is written to: a step that did not do
+/// what it was asked reports itself with `error`, and whatever goes through
+/// `error` is a failure by definition. [`warning`] is for what deserves a look
+/// without making the run a failure.
+#[derive(Default)]
+struct Failures {
+    /// Every failure reported, however many messages are kept.
+    count: usize,
+    messages: Vec<String>,
+}
+
+/// Messages kept for the report. A run that fails this many times has nothing
+/// to add that the first few have not said; the count stays exact.
+const KEPT_FAILURES: usize = 100;
+
+impl Failures {
+    fn record(&mut self, message: &str) {
+        self.count += 1;
+        if self.messages.len() < KEPT_FAILURES {
+            self.messages.push(message.to_string());
+        }
+    }
+
+    /// The messages of the failures after the first `mark`.
+    fn since(&self, mark: usize) -> Vec<String> {
+        self.messages.iter().skip(mark).cloned().collect()
+    }
+}
+
+static FAILURES: Mutex<Failures> = Mutex::new(Failures {
+    count: 0,
+    messages: Vec::new(),
+});
+
+fn failures() -> MutexGuard<'static, Failures> {
+    // Nothing here can leave the list half-updated, so a panic elsewhere is no
+    // reason to stop reporting.
+    FAILURES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How many failures this run has reported so far. `main()` turns a non-zero
+/// answer into the exit status; taken before a step and handed to
+/// [`failures_since`] afterwards, it says which failures the step caused.
+pub fn failure_count() -> usize {
+    failures().count
+}
+
+/// The messages of the failures reported after the first `mark`, where `mark`
+/// came from an earlier [`failure_count`].
+pub fn failures_since(mark: usize) -> Vec<String> {
+    failures().since(mark)
+}
+
+/// Report that something did not work. Printed in red, and recorded: this is the
+/// one way to make the run end with a failing exit status, and `--json` mode,
+/// which prints nothing here, still carries the message in its report.
 pub fn error(msg: &str) {
+    failures().record(msg);
     if silent() {
         return;
     }
@@ -1867,5 +1928,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Failures ──
+
+    #[test]
+    fn test_failures_are_counted_and_listed_in_order() {
+        let mut failures = Failures::default();
+        failures.record("first");
+        failures.record("second");
+        failures.record("third");
+        assert_eq!(failures.count, 3);
+        assert_eq!(failures.since(0), ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn test_failures_since_a_mark_are_only_the_later_ones() {
+        let mut failures = Failures::default();
+        failures.record("before");
+        let mark = failures.count;
+        failures.record("after one");
+        failures.record("after two");
+        assert_eq!(failures.since(mark), ["after one", "after two"]);
+        assert!(failures.since(failures.count).is_empty());
+        assert!(failures.since(usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn test_a_flood_of_failures_keeps_the_count_exact_and_the_list_bounded() {
+        let mut failures = Failures::default();
+        for n in 0..KEPT_FAILURES + 25 {
+            failures.record(&format!("failure {n}"));
+        }
+        assert_eq!(failures.count, KEPT_FAILURES + 25);
+        assert_eq!(failures.messages.len(), KEPT_FAILURES);
+        assert_eq!(failures.messages[0], "failure 0");
+        assert_eq!(failures.since(KEPT_FAILURES + 5), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_error_records_even_when_json_mode_prints_nothing() {
+        const ME: &str = "utils::tests::test_error_records_even_when_json_mode_prints_nothing";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                !stdout.contains('\u{2718}'),
+                "JSON mode must not print the line:\n{stdout}"
+            );
+            assert!(
+                stdout.contains("COUNT=2"),
+                "both failures must be counted:\n{stdout}"
+            );
+            assert!(
+                stdout.contains("SINCE-1=[\"second: DISK-ON-FIRE\"]"),
+                "the list must be what came after the mark:\n{stdout}"
+            );
+            return;
+        }
+        set_json(true);
+        assert_eq!(failure_count(), 0, "a run starts with no failures");
+        error("first");
+        let mark = failure_count();
+        error("second: DISK-ON-FIRE");
+        // Warnings are for what deserves a look; they are not failures.
+        warning("just a remark");
+        println!("COUNT={}", failure_count());
+        println!("SINCE-1={:?}", failures_since(mark));
+        println!("CHILD-RAN");
     }
 }

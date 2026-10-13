@@ -1069,7 +1069,11 @@ fn test_update_with_json_is_refused_with_one_document() {
             error.contains("--update") && error.contains("--json"),
             "{doc}"
         );
-        assert_eq!(doc.as_object().unwrap().len(), 1, "{doc}");
+        // An error document and nothing else: the common `status` and `schema`
+        // fields, but no half-finished report mixed in.
+        assert_eq!(doc["status"], "error", "{doc}");
+        assert_eq!(doc["schema"], 1, "{doc}");
+        assert_eq!(doc.as_object().unwrap().len(), 3, "{doc}");
     }
     assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
     sb.cleanup();
@@ -1131,5 +1135,230 @@ fn test_update_fails_closed_and_leaves_the_binary_alone() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(left, ["oxiclean"], "something was left beside the binary");
+    sb.cleanup();
+}
+
+// ── What a run says about itself: exit status and the report ──
+//
+// Every step that did not do what it was asked prints a ✘ line, and the run now
+// ends with a failing exit status to match. The JSON report carries the same
+// news, so a script that never looks at the terminal still hears it.
+
+/// Exactly one JSON document on stdout, parsed.
+fn one_document(out: &Output) -> serde_json::Value {
+    let stdout = text(&out.stdout);
+    assert_eq!(
+        stdout.trim_end().lines().count(),
+        1,
+        "stdout must be exactly one line:\n{}",
+        report(out)
+    );
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}):\n{}", report(out)))
+}
+
+const BROKEN_UV: Behaviour = Behaviour {
+    stdout: "",
+    stderr: "uv: error: disk on fire",
+    exit: 2,
+};
+
+#[test]
+fn test_a_failed_step_ends_the_run_with_status_1_and_says_how_many() {
+    let sb = Sandbox::new("exit_failed_step");
+    let cache = sb.home.join(".cache/uv");
+    fill_cache(&cache);
+    fake_uv(&sb, &cache, &BROKEN_UV);
+
+    let out = sb.oxiclean(&["--dev", "--yes"]).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("`uv cache clean` failed"),
+        "the failure itself is still shown:\n{}",
+        report(&out)
+    );
+    assert!(
+        stdout.contains("1 error \u{2014} see the lines marked"),
+        "the summary must say the run had a failure:\n{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_run_where_nothing_went_wrong_ends_with_status_0() {
+    let sb = Sandbox::new("exit_all_well");
+    let cache = sb.home.join(".cache/uv");
+    fill_cache(&cache);
+    fake_uv(&sb, &cache, &WELL_BEHAVED);
+
+    let out = sb.oxiclean(&["--dev", "--yes"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", report(&out));
+    assert!(!text(&out.stdout).contains("error"), "{}", report(&out));
+
+    // Having nothing to do is not a failure either.
+    let empty = sb.oxiclean(&["--trash"]).output().unwrap();
+    assert_eq!(empty.status.code(), Some(0), "{}", report(&empty));
+    sb.cleanup();
+}
+
+#[test]
+fn test_json_mode_reports_a_failure_in_the_document_and_the_status() {
+    let sb = Sandbox::new("json_failed_step");
+    let cache = sb.home.join(".cache/uv");
+    fill_cache(&cache);
+    fake_uv(&sb, &cache, &BROKEN_UV);
+
+    let out = sb.oxiclean(&["--dev", "--json"]).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let doc = one_document(&out);
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(doc["schema"], 1, "{doc}");
+    let errors = doc["errors"].as_array().expect("errors is a list");
+    assert_eq!(errors.len(), 1, "{doc}");
+    assert_eq!(errors[0]["operation"], "dev", "{doc}");
+    let message = errors[0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("`uv cache clean` failed"), "{doc}");
+    // What already read the document still finds its fields.
+    assert_eq!(doc["operations"]["dev"], 0, "{doc}");
+    assert!(doc["total_freed_bytes"].is_u64(), "{doc}");
+    sb.cleanup();
+}
+
+#[test]
+fn test_json_mode_says_ok_when_nothing_went_wrong() {
+    let sb = Sandbox::new("json_all_well");
+    let cache = sb.home.join(".cache/uv");
+    fill_cache(&cache);
+    fake_uv(&sb, &cache, &WELL_BEHAVED);
+
+    let out = sb.oxiclean(&["--dev", "--json"]).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{}", report(&out));
+    let doc = one_document(&out);
+    assert_eq!(doc["status"], "ok", "{doc}");
+    assert_eq!(doc["schema"], 1, "{doc}");
+    assert_eq!(doc["errors"], serde_json::json!([]), "{doc}");
+    sb.cleanup();
+}
+
+#[test]
+fn test_only_the_operation_that_failed_is_blamed() {
+    let sb = Sandbox::new("json_blame");
+    // `--cache` has something to clean and succeeds; `--dev` fails.
+    fill_cache(&sb.home.join(".cache/some-app"));
+    let cache = sb.home.join(".cache/uv");
+    fill_cache(&cache);
+    fake_uv(&sb, &cache, &BROKEN_UV);
+
+    let out = sb
+        .oxiclean(&["--cache", "--dev", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let doc = one_document(&out);
+    assert!(
+        doc["operations"]["cache"].as_u64().unwrap_or(0) > 0,
+        "the cache step did its work: {doc}"
+    );
+    let errors = doc["errors"].as_array().expect("errors is a list");
+    assert_eq!(errors.len(), 1, "only dev failed: {doc}");
+    assert_eq!(errors[0]["operation"], "dev", "{doc}");
+    assert!(
+        !sb.home.join(".cache/some-app").exists(),
+        "a failure elsewhere must not stop the rest of the run"
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_failure_is_not_blamed_on_the_steps_after_it() {
+    let sb = Sandbox::new("json_blame_order");
+    let uv = sb.root.join("uv-cache");
+    fill_cache(&uv);
+    fake_uv(&sb, &uv, &WELL_BEHAVED);
+
+    // `--cache` runs first and is refused (its root is the home directory);
+    // `--dev` runs after it and has nothing to complain about.
+    let out = sb
+        .oxiclean(&["--cache", "--dev", "--json"])
+        .env("XDG_CACHE_HOME", &sb.home)
+        .env("UV_CACHE_DIR", &uv)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let doc = one_document(&out);
+    let errors = doc["errors"].as_array().expect("errors is a list");
+    assert_eq!(errors.len(), 1, "only the cache step failed: {doc}");
+    assert_eq!(errors[0]["operation"], "cache", "{doc}");
+    assert_eq!(
+        entries(&uv),
+        0,
+        "an earlier failure must not stop the steps after it:\n{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_refused_root_is_a_failure_even_in_a_dry_run() {
+    let sb = Sandbox::new("exit_refused_root");
+    let precious = precious_files(&sb);
+
+    for args in [
+        &["--cache", "--yes"][..],
+        &["--cache", "--dry-run"][..],
+        &["--cache", "--yes", "--json"][..],
+    ] {
+        let out = sb
+            .oxiclean(args)
+            .env("XDG_CACHE_HOME", &sb.home)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} should fail:\n{}",
+            report(&out)
+        );
+        assert!(survive(&precious), "{}", report(&out));
+        if args.contains(&"--json") {
+            let doc = one_document(&out);
+            assert_eq!(doc["status"], "error", "{doc}");
+            assert_eq!(doc["errors"][0]["operation"], "cache", "{doc}");
+            let message = doc["errors"][0]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("Refusing to clean"), "{doc}");
+        }
+    }
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_run_that_cannot_start_is_one_document_with_the_common_fields() {
+    let sb = Sandbox::new("json_cannot_start");
+
+    // No operation selected: exit 1, like always.
+    let out = sb.oxiclean(&["--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let doc = one_document(&out);
+    assert_eq!(doc["error"], "no operation selected", "{doc}");
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(doc["schema"], 1, "{doc}");
+
+    // A command line that makes no sense: exit 2.
+    let out = sb
+        .oxiclean(&["--all", "--skip", "no-such-operation", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", report(&out));
+    let doc = one_document(&out);
+    assert!(doc["error"].is_string(), "{doc}");
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(doc["schema"], 1, "{doc}");
     sb.cleanup();
 }

@@ -317,8 +317,8 @@ fn main() {
         // word to anyone, so refuse, in the same shape as every other refusal.
         if cli.json {
             println!(
-                "{{\"error\":{}}}",
-                json_string("--update does not support --json: it asks first and reports in text")
+                "{}",
+                json_error("--update does not support --json: it asks first and reports in text")
             );
             std::process::exit(2);
         }
@@ -329,7 +329,7 @@ fn main() {
         Ok(o) => o,
         Err(msg) => {
             if cli.json {
-                println!("{{\"error\":{}}}", json_string(&msg));
+                println!("{}", json_error(&msg));
             } else {
                 utils::error(&msg);
             }
@@ -345,7 +345,7 @@ fn main() {
     if !ops.any() {
         utils::banner(env!("CARGO_PKG_VERSION"));
         if cli.json {
-            println!("{{\"error\":\"no operation selected\"}}");
+            println!("{}", json_error("no operation selected"));
         } else {
             println!(
                 "  {} No operation selected. Use {} for all, or select specific operations.",
@@ -427,7 +427,10 @@ fn main() {
     if ops.needs_sudo() && !cli.dry_run {
         if sys.privilege == Privilege::None {
             if cli.json {
-                println!("{{\"error\":\"no privilege-escalation tool found (need root, sudo, or doas)\"}}");
+                println!(
+                    "{}",
+                    json_error("no privilege-escalation tool found (need root, sudo, or doas)")
+                );
             } else {
                 utils::error("No privilege-escalation tool found (need root, sudo, or doas).");
                 utils::info("Install sudo or doas, or re-run as root, for system-level cleanup.");
@@ -439,7 +442,7 @@ fn main() {
         }
         if !utils::acquire_sudo() {
             if cli.json {
-                println!("{{\"error\":\"failed to acquire privileges\"}}");
+                println!("{}", json_error("failed to acquire privileges"));
             } else {
                 utils::error("Failed to acquire privileges. Exiting.");
             }
@@ -449,13 +452,7 @@ fn main() {
 
     // ── Execute ──
     let timer = Instant::now();
-    let mut total_freed = 0u64;
-    // Per-operation freed bytes, in run order, for the JSON report.
-    let mut results: Vec<(&str, u64)> = Vec::new();
-    let record = |name: &'static str, bytes: u64, acc: &mut u64, out: &mut Vec<(&str, u64)>| {
-        *acc += bytes;
-        out.push((name, bytes));
-    };
+    let mut run = Run::default();
 
     if ops.cache {
         // The helper list always goes in; `ops.aur` says whether the AUR section
@@ -464,92 +461,106 @@ fn main() {
         // without ever leaving the dir uncleaned. A hand-pruned helper's dir is
         // held back either way — it stores state (aura's snapshots) that a
         // wholesale wipe would destroy.
-        let f = clean::user_cache(cli.dry_run, cli.yes, &sys.aur_helpers, ops.aur);
-        record("cache", f, &mut total_freed, &mut results);
+        run.step("cache", || {
+            clean::user_cache(cli.dry_run, cli.yes, &sys.aur_helpers, ops.aur)
+        });
     }
 
     if ops.packages {
-        let mut f = clean::pkg_cache(&sys.distro, cli.deep, cli.dry_run, yes);
+        run.step("packages", || {
+            let mut f = clean::pkg_cache(&sys.distro, cli.deep, cli.dry_run, yes);
 
-        // Nix can be installed on *any* distro (not just NixOS). Run its GC
-        // alongside the native package-cache step when /nix/store is present.
-        // On NixOS the existing pkg_cache path already handles Nix, so we
-        // avoid running it twice.
-        if sys.has_nix && sys.distro != Distro::Nix {
-            f += clean::nix_gc(cli.deep, cli.dry_run, yes, sys.disk_type);
-        }
-        record("packages", f, &mut total_freed, &mut results);
+            // Nix can be installed on *any* distro (not just NixOS). Run its GC
+            // alongside the native package-cache step when /nix/store is present.
+            // On NixOS the existing pkg_cache path already handles Nix, so we
+            // avoid running it twice.
+            if sys.has_nix && sys.distro != Distro::Nix {
+                f += clean::nix_gc(cli.deep, cli.dry_run, yes, sys.disk_type);
+            }
+            f
+        });
     }
 
     if ops.orphans {
-        let f = clean::orphans(&sys.distro, cli.dry_run, yes);
-        record("orphans", f, &mut total_freed, &mut results);
+        run.step("orphans", || clean::orphans(&sys.distro, cli.dry_run, yes));
     }
 
     if ops.aur {
-        let mut f = 0u64;
-        if sys.distro == Distro::Arch {
-            // Empty-list handling lives in aur_cache so the skip line is
-            // worded in one place.
-            f = clean::aur_cache(&sys.aur_helpers, cli.deep, cli.dry_run, yes);
-        } else if cli.aur {
-            utils::section("AUR Cache");
-            utils::skip("Not an Arch-based system — skipped");
-        }
-        record("aur", f, &mut total_freed, &mut results);
+        run.step("aur", || {
+            let mut f = 0u64;
+            if sys.distro == Distro::Arch {
+                // Empty-list handling lives in aur_cache so the skip line is
+                // worded in one place.
+                f = clean::aur_cache(&sys.aur_helpers, cli.deep, cli.dry_run, yes);
+            } else if cli.aur {
+                utils::section("AUR Cache");
+                utils::skip("Not an Arch-based system — skipped");
+            }
+            f
+        });
     }
 
     if ops.flatpak {
-        let mut f = 0u64;
-        if sys.has_flatpak {
-            f = clean::flatpak(cli.deep, cli.dry_run);
-        } else if cli.flatpak {
-            utils::section("Flatpak");
-            utils::skip("Flatpak is not installed — skipped");
-        }
-        record("flatpak", f, &mut total_freed, &mut results);
+        run.step("flatpak", || {
+            let mut f = 0u64;
+            if sys.has_flatpak {
+                f = clean::flatpak(cli.deep, cli.dry_run);
+            } else if cli.flatpak {
+                utils::section("Flatpak");
+                utils::skip("Flatpak is not installed — skipped");
+            }
+            f
+        });
     }
 
     if ops.snap {
-        let mut f = 0u64;
-        if sys.has_snap {
-            f = clean::snap(cli.dry_run);
-        } else if cli.snap {
-            utils::section("Snap");
-            utils::skip("Snap is not installed — skipped");
-        }
-        record("snap", f, &mut total_freed, &mut results);
+        run.step("snap", || {
+            let mut f = 0u64;
+            if sys.has_snap {
+                f = clean::snap(cli.dry_run);
+            } else if cli.snap {
+                utils::section("Snap");
+                utils::skip("Snap is not installed — skipped");
+            }
+            f
+        });
     }
 
     if ops.journal {
-        let f = clean::journal(cli.dry_run);
-        record("journal", f, &mut total_freed, &mut results);
+        run.step("journal", || clean::journal(cli.dry_run));
     }
 
     if ops.trash {
-        let f = clean::trash(cli.dry_run);
-        record("trash", f, &mut total_freed, &mut results);
+        run.step("trash", || clean::trash(cli.dry_run));
     }
 
     if ops.coredumps {
-        let f = clean::coredumps(cli.dry_run);
-        record("coredumps", f, &mut total_freed, &mut results);
+        run.step("coredumps", || clean::coredumps(cli.dry_run));
     }
 
     if ops.dev {
-        let f = dev::run(cli.deep, cli.dry_run, yes);
-        record("dev", f, &mut total_freed, &mut results);
+        run.step("dev", || dev::run(cli.deep, cli.dry_run, yes));
     }
 
     if ops.trim {
-        let f = clean::trim(cli.dry_run, sys.disk_type);
-        record("trim", f, &mut total_freed, &mut results);
+        run.step("trim", || clean::trim(cli.dry_run, sys.disk_type));
     }
 
     // ── Summary ──
     let elapsed = timer.elapsed();
+    let failures = utils::failure_count();
     if cli.json {
-        print_json_report(&sys, cli.dry_run, cli.deep, total_freed, elapsed, &results);
+        println!(
+            "{}",
+            json_report(
+                sys.distro.name(),
+                cli.dry_run,
+                cli.deep,
+                elapsed.as_secs_f64(),
+                &run,
+                failures > 0
+            )
+        );
     } else {
         println!();
         println!(
@@ -561,8 +572,11 @@ fn main() {
         println!(
             "  {} {}",
             "⚡ Total freed:".white().bold(),
-            utils::format_size(total_freed).green().bold()
+            utils::format_size(run.total_freed).green().bold()
         );
+        if failures > 0 {
+            println!("  {} {}", "✘".red().bold(), failure_summary(failures).red());
+        }
         println!(
             "  {} {:.2}s",
             "⏱  Completed in:".white().bold(),
@@ -583,6 +597,11 @@ fn main() {
                 .dimmed()
         );
         println!();
+    }
+
+    let status = exit_status(failures);
+    if status != 0 {
+        std::process::exit(status);
     }
 }
 
@@ -608,30 +627,104 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// Emit the single machine-readable JSON object for `--json`. One line, valid
-/// JSON, nothing else on stdout — safe to pipe into `jq`.
-fn print_json_report(
-    sys: &SystemInfo,
+/// Version of the shape of the `--json` documents, for consumers that want to
+/// notice when it changes. Within a version fields are only ever added.
+const JSON_SCHEMA: u32 = 1;
+
+/// The document for a run that could not start: `{"error": "..."}`, with the
+/// fields every document carries.
+fn json_error(message: &str) -> String {
+    format!(
+        "{{\"error\":{},\"status\":\"error\",\"schema\":{JSON_SCHEMA}}}",
+        json_string(message)
+    )
+}
+
+/// What the operations did, in run order: the raw material of the report.
+#[derive(Default)]
+struct Run {
+    total_freed: u64,
+    /// Freed bytes per operation.
+    results: Vec<(&'static str, u64)>,
+    /// What each operation reported as failed, as (operation, message).
+    failures: Vec<(&'static str, String)>,
+}
+
+impl Run {
+    /// Run one operation, keeping its result and the failures it reported.
+    fn step(&mut self, name: &'static str, operation: impl FnOnce() -> u64) {
+        let mark = utils::failure_count();
+        let freed = operation();
+        self.record(name, freed, utils::failures_since(mark));
+    }
+
+    fn record(&mut self, name: &'static str, freed: u64, failures: Vec<String>) {
+        self.total_freed += freed;
+        self.results.push((name, freed));
+        self.failures
+            .extend(failures.into_iter().map(|message| (name, message)));
+    }
+}
+
+/// The exit status of a run that reported `failures` failures: 0 when every step
+/// did what it was asked, 1 otherwise. A command line that makes no sense exits
+/// with 2, where it is found.
+fn exit_status(failures: usize) -> i32 {
+    i32::from(failures > 0)
+}
+
+/// The line under the total when something went wrong. The details are in the
+/// lines marked ✘ above it.
+fn failure_summary(failures: usize) -> String {
+    format!(
+        "{failures} error{} — see the lines marked ✘ above",
+        if failures == 1 { "" } else { "s" }
+    )
+}
+
+/// The single machine-readable JSON object for `--json`. One line, valid JSON,
+/// nothing else on stdout — safe to pipe into `jq`.
+///
+/// `schema`, `status` and `errors` come last, so everything a consumer already
+/// reads is where it was. `status` is `"ok"` or `"error"`, and `errors` lists
+/// what each operation reported as failed.
+fn json_report(
+    distro: &str,
     dry_run: bool,
     deep: bool,
-    total_freed: u64,
-    elapsed: std::time::Duration,
-    results: &[(&str, u64)],
-) {
-    let ops_json: Vec<String> = results
+    elapsed_secs: f64,
+    run: &Run,
+    failed: bool,
+) -> String {
+    let operations: Vec<String> = run
+        .results
         .iter()
         .map(|(name, bytes)| format!("{}:{}", json_string(name), bytes))
         .collect();
-    println!(
-        "{{\"version\":{},\"distro\":{},\"dry_run\":{},\"deep\":{},\"operations\":{{{}}},\"total_freed_bytes\":{},\"elapsed_secs\":{:.2}}}",
+    let errors: Vec<String> = run
+        .failures
+        .iter()
+        .map(|(operation, message)| {
+            format!(
+                "{{\"operation\":{},\"message\":{}}}",
+                json_string(operation),
+                json_string(message)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"version\":{},\"distro\":{},\"dry_run\":{},\"deep\":{},\"operations\":{{{}}},\"total_freed_bytes\":{},\"elapsed_secs\":{:.2},\"schema\":{},\"status\":{},\"errors\":[{}]}}",
         json_string(env!("CARGO_PKG_VERSION")),
-        json_string(sys.distro.name()),
+        json_string(distro),
         dry_run,
         deep,
-        ops_json.join(","),
-        total_freed,
-        elapsed.as_secs_f64()
-    );
+        operations.join(","),
+        run.total_freed,
+        elapsed_secs,
+        JSON_SCHEMA,
+        json_string(if failed { "error" } else { "ok" }),
+        errors.join(",")
+    )
 }
 
 #[cfg(test)]
@@ -728,5 +821,126 @@ mod tests {
         assert_eq!(json_string("a\"b"), "\"a\\\"b\"");
         assert_eq!(json_string("a\\b"), "\"a\\\\b\"");
         assert_eq!(json_string("a\nb"), "\"a\\nb\"");
+    }
+
+    // ── The report and the exit status ──
+
+    fn parsed(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+    }
+
+    #[test]
+    fn test_a_clean_run_reports_ok_and_no_errors() {
+        let mut run = Run::default();
+        run.record("cache", 100, Vec::new());
+        run.record("trash", 50, Vec::new());
+
+        let text = json_report("Arch Linux", false, true, 1.234, &run, false);
+
+        assert!(!text.contains('\n'), "the report is one line: {text}");
+        let doc = parsed(&text);
+        assert_eq!(doc["status"], "ok");
+        assert_eq!(doc["schema"], 1);
+        assert_eq!(doc["errors"], serde_json::json!([]));
+        assert_eq!(doc["operations"]["cache"], 100);
+        assert_eq!(doc["operations"]["trash"], 50);
+        assert_eq!(doc["total_freed_bytes"], 150);
+        assert_eq!(doc["dry_run"], false);
+        assert_eq!(doc["deep"], true);
+        assert_eq!(doc["distro"], "Arch Linux");
+        assert_eq!(doc["elapsed_secs"], 1.23);
+    }
+
+    #[test]
+    fn test_failures_are_listed_under_the_operation_that_reported_them() {
+        let mut run = Run::default();
+        run.record("cache", 10, Vec::new());
+        run.record(
+            "flatpak",
+            0,
+            vec![
+                "Flatpak repair failed".to_string(),
+                "second \"quoted\"\nline".to_string(),
+            ],
+        );
+
+        let doc = parsed(&json_report("X", false, false, 0.0, &run, true));
+
+        assert_eq!(doc["status"], "error");
+        let errors = doc["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert_eq!(
+            errors[0],
+            serde_json::json!({"operation": "flatpak", "message": "Flatpak repair failed"})
+        );
+        assert_eq!(errors[1]["message"], "second \"quoted\"\nline");
+        // A failed operation still says what it freed, and the others are untouched.
+        assert_eq!(doc["operations"]["flatpak"], 0);
+        assert_eq!(doc["operations"]["cache"], 10);
+        assert_eq!(doc["total_freed_bytes"], 10);
+    }
+
+    #[test]
+    fn test_the_fields_a_consumer_already_reads_keep_their_place() {
+        // The new fields come last, so a consumer that matches on the raw line
+        // (it should not, but one will) sees what it always saw.
+        let mut run = Run::default();
+        run.record("cache", 1, vec!["x".to_string()]);
+        let text = json_report("D", true, false, 2.0, &run, true);
+        let keys = [
+            "version",
+            "distro",
+            "dry_run",
+            "deep",
+            "operations",
+            "total_freed_bytes",
+            "elapsed_secs",
+            "schema",
+            "status",
+            "errors",
+        ];
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|k| {
+                text.find(&format!("\"{k}\":"))
+                    .unwrap_or_else(|| panic!("{k} missing: {text}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "fields out of order: {text}"
+        );
+        assert!(text.starts_with("{\"version\":\""), "{text}");
+    }
+
+    #[test]
+    fn test_a_run_that_could_not_start_is_one_document_with_the_common_fields() {
+        let doc = parsed(&json_error("no operation selected"));
+        assert_eq!(doc["error"], "no operation selected");
+        assert_eq!(doc["status"], "error");
+        assert_eq!(doc["schema"], 1);
+
+        let doc = parsed(&json_error("a \"b\"\nc"));
+        assert_eq!(doc["error"], "a \"b\"\nc");
+    }
+
+    #[test]
+    fn test_the_summary_counts_the_errors_in_the_right_number() {
+        assert_eq!(failure_summary(1), "1 error — see the lines marked ✘ above");
+        assert_eq!(
+            failure_summary(2),
+            "2 errors — see the lines marked ✘ above"
+        );
+        assert_eq!(
+            failure_summary(40),
+            "40 errors — see the lines marked ✘ above"
+        );
+    }
+
+    #[test]
+    fn test_a_run_fails_exactly_when_something_was_reported() {
+        assert_eq!(exit_status(0), 0);
+        assert_eq!(exit_status(1), 1);
+        assert_eq!(exit_status(250), 1);
     }
 }
