@@ -25,6 +25,45 @@ use crate::utils;
 //
 // The line is: we hide chatter, never results or progress.
 
+/// What a step has to say for itself, decided apart from the printing so the
+/// decision can be tested without running a package manager.
+///
+/// The rule it serves: a success line is printed for work that happened. A step
+/// whose command failed says so with [`Verdict::Failed`], and that is also what
+/// makes the run end with a failing exit status.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// It did what was asked.
+    Done(String),
+    /// Nothing to do, or left alone on purpose.
+    Skipped(String),
+    /// It did not do what was asked.
+    Failed(String),
+}
+
+fn done(msg: &str) -> Verdict {
+    Verdict::Done(msg.to_string())
+}
+
+fn skipped(msg: &str) -> Verdict {
+    Verdict::Skipped(msg.to_string())
+}
+
+fn failed(msg: &str) -> Verdict {
+    Verdict::Failed(msg.to_string())
+}
+
+/// Print the verdicts in order.
+fn say(verdicts: Vec<Verdict>) {
+    for verdict in verdicts {
+        match verdict {
+            Verdict::Done(msg) => utils::success(&msg),
+            Verdict::Skipped(msg) => utils::skip(&msg),
+            Verdict::Failed(msg) => utils::error(&msg),
+        }
+    }
+}
+
 /// Remove partial-download leftovers from interrupted `pacman -Syu` runs.
 ///
 /// Modern pacman (6.1+) downloads packages in a sandbox under the dedicated
@@ -50,7 +89,11 @@ fn cleanup_pacman_partial_downloads() {
         .collect();
     let mut args: Vec<&str> = vec!["-rf"];
     args.extend(paths.iter().map(|s| s.as_str()));
-    utils::sudo_quiet("rm", &args);
+    // A tidy-up for the commands that follow, not a step with a result of its
+    // own: if it fails they trip over the leftovers and say so themselves.
+    if !utils::sudo_quiet("rm", &args) {
+        utils::warning("Could not remove pacman's partial downloads first");
+    }
 }
 
 /// True if `name` is a pacman partial-download leftover that is always safe to
@@ -185,14 +228,20 @@ fn clean_portage_tmp(dry_run: bool) -> u64 {
 
     // The contents are root-owned (built via sudo emerge), so delete through
     // sudo. `-mindepth 1` keeps the `portage` dir itself; `-delete` handles the
-    // nested trees. We report the pre-measured size as freed.
+    // nested trees. What was freed is what is gone afterwards: a `find` that
+    // failed may have removed some of it, and a build started meanwhile adds to it.
     let target = build_dir.to_string_lossy().into_owned();
-    utils::sudo_quiet("find", &[&target, "-mindepth", "1", "-delete"]);
-    utils::success(&format!(
-        "Cleared portage build leftovers ({})",
-        utils::format_size(size).green()
-    ));
-    size
+    let removed = utils::sudo_quiet("find", &[&target, "-mindepth", "1", "-delete"]);
+    let freed = size.saturating_sub(utils::dir_size(&build_dir));
+    if removed {
+        utils::success(&format!(
+            "Cleared portage build leftovers ({})",
+            utils::format_size(freed).green()
+        ));
+    } else {
+        utils::error(&format!("Could not clear {}", build_dir.display()));
+    }
+    freed
 }
 
 /// Resolve the package-cache directory to measure on Fedora/RHEL. dnf5 keeps
@@ -739,7 +788,14 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 yes,
                 "Run pacman -Scc? (removes ALL cached packages) [y/N]:",
             ) {
-                if utils::sudo_quiet("pacman", &["-Scc", "--noconfirm"]) {
+                // Not with `--noconfirm`: that answers every question with its
+                // default, and the default for "remove ALL files from cache?" is
+                // no, so `pacman -Scc --noconfirm` exits 0 having removed nothing
+                // (checked against pacman 7.1). The two questions are answered
+                // here instead: the cache, and the sync databases of repositories
+                // that are no longer configured, which the `-Sc --noconfirm`
+                // above has already said yes to.
+                if utils::sudo_quiet_with_input("pacman", &["-Scc"], b"y\ny\n") {
                     utils::success("pacman deep clean done");
                 } else {
                     utils::error("pacman -Scc failed");
@@ -793,24 +849,38 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
             // line instead; see `parse_nix_freed`. The privileged run stays
             // visible because it can take minutes.
             utils::info("Running Nix garbage collection...");
-            if let Some(out) = utils::capture("nix-collect-garbage", &[]) {
-                extra_freed += parse_nix_freed(&out).unwrap_or(0);
+            let user_gc = utils::capture_checked("nix-collect-garbage", &[]);
+            if let Some(out) = &user_gc {
+                extra_freed += parse_nix_freed(out).unwrap_or(0);
             }
-            utils::sudo("nix-collect-garbage", &[]);
-            utils::success("Garbage collected");
+            let system_gc = utils::sudo("nix-collect-garbage", &[]);
+            say(nix_gc_verdicts(
+                "nix-collect-garbage",
+                "Garbage collected",
+                user_gc.is_some(),
+                Some(system_gc),
+            ));
 
             if should_deep(
                 deep,
                 yes,
                 "Delete ALL old generations? (nix-collect-garbage -d) [y/N]:",
             ) {
-                utils::run_user("nix-collect-garbage", &["-d"]);
-                utils::sudo("nix-collect-garbage", &["-d"]);
-                utils::success("Old generations deleted");
+                let user_ok = utils::run_user("nix-collect-garbage", &["-d"]);
+                let system_ok = utils::sudo("nix-collect-garbage", &["-d"]);
+                say(nix_gc_verdicts(
+                    "nix-collect-garbage -d",
+                    "Old generations deleted",
+                    user_ok,
+                    Some(system_ok),
+                ));
 
                 utils::info("Optimizing Nix store (may take a while)...");
-                utils::sudo("nix-store", &["--optimise"]);
-                utils::success("Nix store optimized");
+                if nix_optimise(true) {
+                    utils::success("Nix store optimized");
+                } else {
+                    utils::error("nix-store --optimise failed");
+                }
             }
         }
 
@@ -833,14 +903,13 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                  (removes downgrade targets) [y/N]:",
             );
             let flag = if clean_all { "-OO" } else { "-O" };
-            if utils::sudo_quiet("xbps-remove", &[flag, "-y"]) {
-                utils::success("xbps cache cleaned");
-                if !clean_all {
-                    utils::skip("Cached current versions kept — remove them with --deep");
-                }
-            } else {
-                utils::error(&format!("xbps-remove {} failed", flag));
-            }
+            let ran_ok = utils::sudo_quiet("xbps-remove", &[flag, "-y"]);
+            say(xbps_verdicts(
+                flag,
+                ran_ok,
+                clean_all,
+                Path::new("/var/cache/xbps").is_dir(),
+            ));
         }
 
         Distro::Alpine => {
@@ -856,24 +925,16 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
             // a re-download, so it stays behind `--deep`. The APKINDEX files go
             // with them and are refetched on the next `apk update`.
             // https://wiki.alpinelinux.org/wiki/Alpine_Package_Keeper
-            if !utils::sudo_quiet("apk", &["cache", "clean"]) {
-                utils::warning("apk cache clean failed");
-            }
+            let cleaned = utils::sudo_quiet("apk", &["cache", "clean"]);
             let purge = should_deep(
                 deep,
                 yes,
                 "Also remove cached packages for installed versions? \
                  (they re-download on next install) [y/N]:",
             );
-            if purge && PathBuf::from("/var/cache/apk").is_dir() {
-                utils::sudo_quiet("find", &["/var/cache/apk", "-type", "f", "-delete"]);
-                utils::success("apk cache cleared");
-            } else {
-                utils::success("apk cache cleaned");
-                if !purge {
-                    utils::skip("Cached current versions kept — remove them with --deep");
-                }
-            }
+            let purged = (purge && Path::new("/var/cache/apk").is_dir())
+                .then(|| utils::sudo_quiet("find", &["/var/cache/apk", "-type", "f", "-delete"]));
+            say(apk_verdicts(cleaned, purge, purged));
         }
 
         Distro::Gentoo => {
@@ -883,10 +944,16 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 } else {
                     utils::error("eclean distfiles failed");
                 }
-                if should_deep(deep, yes, "Also clean binary packages? [y/N]:")
-                    && utils::sudo_quiet("eclean", &["packages"])
-                {
-                    utils::success("Binary packages cleaned");
+                if should_deep(deep, yes, "Also clean binary packages? [y/N]:") {
+                    // Said, but not counted as a failure of the run: what
+                    // `eclean packages` exits with when there are no binary
+                    // packages to clean is not something we could check, and a
+                    // healthy system must not fail the run over it.
+                    if utils::sudo_quiet("eclean", &["packages"]) {
+                        utils::success("Binary packages cleaned");
+                    } else {
+                        utils::warning("eclean packages did not finish cleanly");
+                    }
                 }
             } else {
                 utils::warning("eclean not found — install app-portage/gentoolkit");
@@ -895,8 +962,11 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                 // rather than panic on unwrap.
                 if let Some(path) = distfiles.to_str() {
                     if distfiles.is_dir() {
-                        utils::sudo_quiet("find", &[path, "-type", "f", "-delete"]);
-                        utils::success("Distfiles cleaned");
+                        if utils::sudo_quiet("find", &[path, "-type", "f", "-delete"]) {
+                            utils::success("Distfiles cleaned");
+                        } else {
+                            utils::error(&format!("Could not clear {path}"));
+                        }
                     }
                 }
             }
@@ -973,11 +1043,20 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
 
     match distro {
         Distro::Arch => {
-            let out = utils::capture_trusted("pacman", &["-Qdtq"]).unwrap_or_default();
-            if out.is_empty() {
-                utils::success("No orphans found");
-                return 0;
-            }
+            // Exit 1 with no output is how `pacman -Qdtq` says there are none; a
+            // database it cannot read is the same exit status, told apart by its
+            // `error:` line.
+            let out = match utils::list_trusted("pacman", &["-Qdtq"], utils::WhenEmpty::Exit1) {
+                utils::Listing::Found(out) => out,
+                utils::Listing::Nothing => {
+                    utils::success("No orphans found");
+                    return 0;
+                }
+                utils::Listing::Failed => {
+                    utils::error("Could not list orphaned packages (pacman -Qdtq failed)");
+                    return 0;
+                }
+            };
             let pkgs: Vec<&str> = out.lines().collect();
             utils::info(&format!("Found {} orphan(s):", pkgs.len()));
             for p in &pkgs {
@@ -1030,9 +1109,26 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
         }
 
         Distro::Suse => {
-            let out =
-                utils::capture_trusted("zypper", &["packages", "--orphaned"]).unwrap_or_default();
-            if out.is_empty() || !out.contains('|') {
+            // A zypper that is locked by another zypper or by YaST prints nothing
+            // on stdout either: that is not "no orphans".
+            let out = match utils::list_trusted(
+                "zypper",
+                &["packages", "--orphaned"],
+                utils::WhenEmpty::Exit0,
+            ) {
+                utils::Listing::Found(out) => out,
+                utils::Listing::Nothing => {
+                    utils::success("No orphans found");
+                    return 0;
+                }
+                utils::Listing::Failed => {
+                    utils::error(
+                        "Could not list orphaned packages (zypper packages --orphaned failed)",
+                    );
+                    return 0;
+                }
+            };
+            if !out.contains('|') {
                 utils::success("No orphans found");
                 return 0;
             }
@@ -1081,10 +1177,13 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
                 return 0;
             }
             utils::info("Removing orphans...");
+            // `xbps-remove -o` exits 0 when there is nothing to remove (checked
+            // on Void), so a failing status is a failure, and a zero one does
+            // not say anything was removed.
             if utils::sudo("xbps-remove", &["-o", "-y"]) {
-                utils::success("Orphans removed");
+                utils::success("Orphan removal finished");
             } else {
-                utils::warning("No orphans found or removal failed");
+                utils::error("xbps-remove -o failed");
             }
         }
 
@@ -1117,8 +1216,10 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
                 return 0;
             }
             utils::info("Removing orphans...");
+            // A warning rather than an error: what `eopkg remove-orphans` exits
+            // with when there are none is not something we could check.
             if utils::sudo("eopkg", &["remove-orphans", "-y"]) {
-                utils::success("Orphans removed");
+                utils::success("Orphan removal finished");
             } else {
                 utils::warning("No orphans or removal failed");
             }
@@ -1278,6 +1379,76 @@ fn clean_helper_at(
     freed
 }
 
+/// How `xbps-remove -O` / `-OO` went. `default_cache_exists` says whether
+/// /var/cache/xbps is there: when it is not, the command exits 1 although there
+/// is nothing to clean (checked on Void), and that is not a failure.
+fn xbps_verdicts(
+    flag: &str,
+    ran_ok: bool,
+    clean_all: bool,
+    default_cache_exists: bool,
+) -> Vec<Verdict> {
+    if ran_ok {
+        let mut out = vec![done("xbps cache cleaned")];
+        if !clean_all {
+            out.push(skipped(
+                "Cached current versions kept — remove them with --deep",
+            ));
+        }
+        out
+    } else if !default_cache_exists {
+        vec![skipped("No xbps cache directory — nothing to clean")]
+    } else {
+        vec![failed(&format!("xbps-remove {flag} failed"))]
+    }
+}
+
+/// How the Alpine cache cleaning went: `cleaned` is `apk cache clean`, `purge`
+/// whether the user asked for the rest to go as well, and `purged` the result of
+/// deleting it (`None` when that was not attempted).
+fn apk_verdicts(cleaned: bool, purge: bool, purged: Option<bool>) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    if !cleaned {
+        out.push(failed("apk cache clean failed"));
+    }
+    match purged {
+        Some(true) => out.push(done("apk cache cleared")),
+        Some(false) => out.push(failed("Could not clear /var/cache/apk")),
+        None if cleaned => {
+            out.push(done("apk cache cleaned"));
+            if !purge {
+                out.push(skipped(
+                    "Cached current versions kept — remove them with --deep",
+                ));
+            }
+        }
+        None => {}
+    }
+    out
+}
+
+/// How the Flatpak clean-up went: whether each installation's `uninstall
+/// --unused` worked, and how many refs are gone since before.
+fn flatpak_verdicts(user_ok: bool, system_ok: bool, removed: usize) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    match removed {
+        0 if user_ok && system_ok => out.push(done("No unused runtimes")),
+        0 => {}
+        n => out.push(done(&format!("Removed {n} unused runtime(s)"))),
+    }
+    if !user_ok {
+        out.push(failed(
+            "flatpak uninstall --unused failed (user installation)",
+        ));
+    }
+    if !system_ok {
+        out.push(failed(
+            "flatpak uninstall --unused failed (system installation)",
+        ));
+    }
+    out
+}
+
 /// Number of installed Flatpak refs across both the user and system
 /// installations. `--columns=ref` keeps the output one machine-stable token per
 /// line, with no header, so counting non-empty lines is enough. A failed or
@@ -1308,13 +1479,17 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
     // they want to know is how many runtimes went away.
     let before = flatpak_ref_count();
 
-    utils::run_quiet("flatpak", &["uninstall", "--unused", "-y"]);
-    utils::sudo_quiet("flatpak", &["uninstall", "--unused", "-y"]);
-
-    match before.saturating_sub(flatpak_ref_count()) {
-        0 => utils::success("No unused runtimes"),
-        n => utils::success(&format!("Removed {} unused runtime(s)", n)),
-    }
+    // One installation at a time. A bare `flatpak uninstall` reaches for both:
+    // run as the user it also asks for the system installation, which needs an
+    // authorisation we do not mean to ask for, and run as root it also takes
+    // root's own user installation, which nobody asked about.
+    let user_ok = utils::run_quiet("flatpak", &["uninstall", "--user", "--unused", "-y"]);
+    let system_ok = utils::sudo_quiet("flatpak", &["uninstall", "--system", "--unused", "-y"]);
+    say(flatpak_verdicts(
+        user_ok,
+        system_ok,
+        before.saturating_sub(flatpak_ref_count()),
+    ));
 
     if deep {
         if utils::sudo_quiet("flatpak", &["repair"]) {
@@ -1335,7 +1510,7 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
         }
     }
 
-    utils::sudo_quiet(
+    if !utils::sudo_quiet(
         "find",
         &[
             "/var/tmp",
@@ -1347,14 +1522,18 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
             "{}",
             "+",
         ],
-    );
+    ) {
+        utils::error("Could not remove flatpak's leftovers from /var/tmp");
+    }
 
     let sys_fp_tmp = PathBuf::from("/var/lib/flatpak/repo/tmp");
-    if sys_fp_tmp.exists() {
-        utils::sudo_quiet(
+    if sys_fp_tmp.exists()
+        && !utils::sudo_quiet(
             "find",
             &["/var/lib/flatpak/repo/tmp", "-mindepth", "1", "-delete"],
-        );
+        )
+    {
+        utils::error("Could not clear /var/lib/flatpak/repo/tmp");
     }
 
     // The runtime count above is already this section's result line, so only
@@ -1374,7 +1553,11 @@ pub fn snap(dry_run: bool) -> u64 {
         return 0;
     }
 
-    let out = utils::capture_trusted("snap", &["list", "--all"]).unwrap_or_default();
+    let listing = utils::list_trusted("snap", &["list", "--all"], utils::WhenEmpty::Exit0);
+    let out = match &listing {
+        utils::Listing::Found(out) => out.as_str(),
+        _ => "",
+    };
     let disabled: Vec<(&str, &str)> = out
         .lines()
         .filter(|l| l.contains("disabled"))
@@ -1388,7 +1571,10 @@ pub fn snap(dry_run: bool) -> u64 {
         })
         .collect();
 
-    if disabled.is_empty() {
+    if listing == utils::Listing::Failed {
+        // Not "no disabled revisions": snapd could not be asked.
+        utils::error("Could not list snaps (snap list --all failed)");
+    } else if disabled.is_empty() {
         utils::info("No disabled snap revisions found");
     } else {
         utils::info(&format!("Found {} disabled revision(s)", disabled.len()));
@@ -1407,9 +1593,15 @@ pub fn snap(dry_run: bool) -> u64 {
     if snap_cache.exists() {
         let size = utils::dir_size(&snap_cache);
         if size > 0 {
-            utils::sudo_quiet("find", &["/var/lib/snapd/cache", "-type", "f", "-delete"]);
-            freed += size;
-            utils::success(&format!("Freed {}", utils::format_size(size).green()));
+            let removed =
+                utils::sudo_quiet("find", &["/var/lib/snapd/cache", "-type", "f", "-delete"]);
+            let got = size.saturating_sub(utils::dir_size(&snap_cache));
+            freed += got;
+            if removed {
+                utils::success(&format!("Freed {}", utils::format_size(got).green()));
+            } else {
+                utils::error("Could not clear /var/lib/snapd/cache");
+            }
         }
     }
 
@@ -1670,17 +1862,21 @@ pub fn coredumps(dry_run: bool) -> u64 {
         } else {
             // Direct file removal — the only portable method. `coredumpctl`
             // has no `delete` verb on current systemd, so it can't be relied on.
-            utils::sudo_quiet(
+            let removed = utils::sudo_quiet(
                 "find",
                 &["/var/lib/systemd/coredump", "-type", "f", "-delete"],
             );
             let after = utils::dir_size(&sd_dir);
             let got = size.saturating_sub(after);
             freed += got;
-            utils::success(&format!(
-                "systemd coredumps cleared ({})",
-                utils::format_size(got).green()
-            ));
+            if removed {
+                utils::success(&format!(
+                    "systemd coredumps cleared ({})",
+                    utils::format_size(got).green()
+                ));
+            } else {
+                utils::error("Could not clear every systemd coredump");
+            }
         }
     }
 
@@ -1699,17 +1895,21 @@ pub fn coredumps(dry_run: bool) -> u64 {
         } else {
             // -maxdepth 1 -type f: top-level report files only, never the
             // dated kdump subdirectories.
-            utils::sudo_quiet(
+            let removed = utils::sudo_quiet(
                 "find",
                 &["/var/crash", "-maxdepth", "1", "-type", "f", "-delete"],
             );
             let after = apport_report_size(&apport_dir);
             let got = size.saturating_sub(after);
             freed += got;
-            utils::success(&format!(
-                "Apport reports cleared ({})",
-                utils::format_size(got).green()
-            ));
+            if removed {
+                utils::success(&format!(
+                    "Apport reports cleared ({})",
+                    utils::format_size(got).green()
+                ));
+            } else {
+                utils::error("Could not clear every Apport report");
+            }
         }
     }
 
@@ -1782,8 +1982,47 @@ pub fn trim(dry_run: bool, disk_type: crate::detect::DiskType) -> u64 {
 //  Nix garbage collection — works on *any* distro that has /nix/store
 // ══════════════════════════════════════════════════
 
+/// How a round of `nix-collect-garbage` went: once as the user and, where a
+/// daemon owns the store, once more as root (`system_ok` is `None` when that
+/// second run does not apply).
+fn nix_gc_verdicts(
+    command: &str,
+    done_msg: &str,
+    user_ok: bool,
+    system_ok: Option<bool>,
+) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    if !user_ok {
+        out.push(failed(&format!("{command} failed (as your user)")));
+    }
+    if system_ok == Some(false) {
+        out.push(failed(&format!("{command} failed (as root)")));
+    }
+    if user_ok && system_ok != Some(false) {
+        out.push(done(done_msg));
+    }
+    out
+}
+
+/// `nix-store --optimise`: hard-link identical files in the store.
+///
+/// A store that a daemon owns takes root. In a single-user install the store is
+/// the user's own and the tool lives in the user's profile, which root's
+/// trusted lookup cannot see: run as root it would not even be found.
+///
+/// `nix store --optimise`, which this used to run, is not a command: the flag
+/// is spelled `nix store optimise` in the new CLI and `nix-store --optimise` in
+/// the classic one (checked against Nix 2.35).
+fn nix_optimise(multiuser: bool) -> bool {
+    if multiuser {
+        utils::sudo("nix-store", &["--optimise"])
+    } else {
+        utils::run_user("nix-store", &["--optimise"])
+    }
+}
+
 /// Run Nix garbage collection. Detects multi-user vs single-user installs
-/// and skips `nix store --optimise` on HDDs because it is extremely slow.
+/// and skips `nix-store --optimise` on HDDs because it is extremely slow.
 pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::DiskType) -> u64 {
     utils::section("Nix GC");
 
@@ -1809,15 +2048,24 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
     // hang) contribute nothing rather than a guess.
     let mut freed = 0u64;
 
+    let multiuser = crate::detect::nix_is_multiuser();
+
     utils::info("Collecting garbage (user)...");
-    if let Some(out) = utils::capture("nix-collect-garbage", &[]) {
-        freed += parse_nix_freed(&out).unwrap_or(0);
+    let user_gc = utils::capture_checked("nix-collect-garbage", &[]);
+    if let Some(out) = &user_gc {
+        freed += parse_nix_freed(out).unwrap_or(0);
     }
 
-    if crate::detect::nix_is_multiuser() {
+    let system_gc = multiuser.then(|| {
         utils::info("Collecting garbage (system)...");
-        utils::sudo("nix-collect-garbage", &[]);
-    }
+        utils::sudo("nix-collect-garbage", &[])
+    });
+    say(nix_gc_verdicts(
+        "nix-collect-garbage",
+        "Garbage collected",
+        user_gc.is_some(),
+        system_gc,
+    ));
 
     if should_deep(
         deep,
@@ -1825,11 +2073,14 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
         "Delete old Nix generations? (removes all but current) [y/N]:",
     ) {
         utils::info("Removing old generations...");
-        utils::run_user("nix-collect-garbage", &["-d"]);
-        if crate::detect::nix_is_multiuser() {
-            utils::sudo("nix-collect-garbage", &["-d"]);
-        }
-        utils::success("Old generations removed");
+        let user_ok = utils::run_user("nix-collect-garbage", &["-d"]);
+        let system_ok = multiuser.then(|| utils::sudo("nix-collect-garbage", &["-d"]));
+        say(nix_gc_verdicts(
+            "nix-collect-garbage -d",
+            "Old generations removed",
+            user_ok,
+            system_ok,
+        ));
 
         // `nix-collect-garbage -d` cleans the classic (nix-env) profile
         // generations but does NOT touch flake-profile history. On a flakes
@@ -1842,19 +2093,26 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
         // finds `nix` through the user's `$PATH`: a single-user install keeps it
         // in `~/.nix-profile/bin`, which the trusted lookup cannot see.
         if utils::which("nix") {
-            utils::run_user("nix", &["profile", "wipe-history"]);
+            // Best effort, with nothing to report: `nix profile` needs the
+            // `nix-command` feature, which a stock install leaves off ("error:
+            // experimental Nix feature 'nix-command' is disabled", Nix 2.35),
+            // and that says nothing about the collection above.
+            let _ = utils::run_user("nix", &["profile", "wipe-history"]);
         }
 
-        // `nix store --optimise` walks the entire store and hard-links
+        // `nix-store --optimise` walks the entire store and hard-links
         // identical files. On a spinning disk that can take *hours*.
         if disk_type == crate::detect::DiskType::HDD {
             utils::info(
-                "Skipping store optimise on HDD (too slow). Run manually: nix store --optimise",
+                "Skipping store optimise on HDD (too slow). Run manually: nix-store --optimise",
             );
         } else {
             utils::info("Optimising Nix store (hard-linking identical files)...");
-            utils::sudo("nix", &["store", "--optimise"]);
-            utils::success("Store optimised");
+            if nix_optimise(multiuser) {
+                utils::success("Store optimised");
+            } else {
+                utils::error("nix-store --optimise failed");
+            }
         }
     }
 
@@ -1870,6 +2128,132 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── What a step says about how it went ──
+
+    #[test]
+    fn test_xbps_says_cleaned_only_when_the_command_worked() {
+        assert_eq!(
+            xbps_verdicts("-O", true, false, true),
+            vec![
+                done("xbps cache cleaned"),
+                skipped("Cached current versions kept — remove them with --deep")
+            ]
+        );
+        assert_eq!(
+            xbps_verdicts("-OO", true, true, true),
+            vec![done("xbps cache cleaned")]
+        );
+        // No cache directory: `xbps-remove -O` exits 1, and there is nothing to
+        // clean. Not a failure.
+        assert_eq!(
+            xbps_verdicts("-O", false, false, false),
+            vec![skipped("No xbps cache directory — nothing to clean")]
+        );
+        // A cache that is there and a command that failed: a failure, naming
+        // the flag it ran with.
+        assert_eq!(
+            xbps_verdicts("-OO", false, true, true),
+            vec![failed("xbps-remove -OO failed")]
+        );
+    }
+
+    #[test]
+    fn test_apk_says_what_was_done_and_only_that() {
+        let hint = skipped("Cached current versions kept — remove them with --deep");
+        // Cleaned, nothing more asked.
+        assert_eq!(
+            apk_verdicts(true, false, None),
+            vec![done("apk cache cleaned"), hint]
+        );
+        // Cleaned, purge asked but there was no directory to purge.
+        assert_eq!(
+            apk_verdicts(true, true, None),
+            vec![done("apk cache cleaned")]
+        );
+        // Purged.
+        assert_eq!(
+            apk_verdicts(true, true, Some(true)),
+            vec![done("apk cache cleared")]
+        );
+        // The purge failed: no claim that it was cleared.
+        assert_eq!(
+            apk_verdicts(true, true, Some(false)),
+            vec![failed("Could not clear /var/cache/apk")]
+        );
+        // `apk cache clean` failed: a failure, and no "cleaned".
+        assert_eq!(
+            apk_verdicts(false, false, None),
+            vec![failed("apk cache clean failed")]
+        );
+        assert_eq!(
+            apk_verdicts(false, true, Some(true)),
+            vec![failed("apk cache clean failed"), done("apk cache cleared")]
+        );
+    }
+
+    #[test]
+    fn test_flatpak_names_the_installation_that_failed() {
+        assert_eq!(
+            flatpak_verdicts(true, true, 0),
+            vec![done("No unused runtimes")]
+        );
+        assert_eq!(
+            flatpak_verdicts(true, true, 3),
+            vec![done("Removed 3 unused runtime(s)")]
+        );
+        // Nothing went away *and* something failed: "no unused runtimes" would
+        // be a claim nobody checked.
+        assert_eq!(
+            flatpak_verdicts(true, false, 0),
+            vec![failed(
+                "flatpak uninstall --unused failed (system installation)"
+            )]
+        );
+        assert_eq!(
+            flatpak_verdicts(false, true, 0),
+            vec![failed(
+                "flatpak uninstall --unused failed (user installation)"
+            )]
+        );
+        // Half of it worked: what went away is still reported.
+        assert_eq!(
+            flatpak_verdicts(false, true, 2),
+            vec![
+                done("Removed 2 unused runtime(s)"),
+                failed("flatpak uninstall --unused failed (user installation)")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nix_gc_blames_the_run_that_failed() {
+        let done_msg = "Garbage collected";
+        assert_eq!(
+            nix_gc_verdicts("nix-collect-garbage", done_msg, true, Some(true)),
+            vec![done(done_msg)]
+        );
+        // A single-user install has no second run.
+        assert_eq!(
+            nix_gc_verdicts("nix-collect-garbage", done_msg, true, None),
+            vec![done(done_msg)]
+        );
+        assert_eq!(
+            nix_gc_verdicts("nix-collect-garbage -d", done_msg, false, Some(true)),
+            vec![failed("nix-collect-garbage -d failed (as your user)")]
+        );
+        assert_eq!(
+            nix_gc_verdicts("nix-collect-garbage", done_msg, true, Some(false)),
+            vec![failed("nix-collect-garbage failed (as root)")]
+        );
+        assert_eq!(
+            nix_gc_verdicts("nix-collect-garbage", done_msg, false, Some(false)),
+            vec![
+                failed("nix-collect-garbage failed (as your user)"),
+                failed("nix-collect-garbage failed (as root)")
+            ]
+        );
+    }
 
     #[test]
     fn test_parse_nix_freed_real_output() {
@@ -2729,5 +3113,38 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_a_failed_verdict_is_an_error_and_the_others_are_not() {
+        const ME: &str = "clean::tests::test_a_failed_verdict_is_an_error_and_the_others_are_not";
+        if std::env::var_os("OXI_CHILD").is_none() {
+            // The failure counter is process-wide and settable from one place only,
+            // so the check runs in a child of its own.
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ME, "--nocapture", "--test-threads=1"])
+                .env("OXI_CHILD", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+            // The markers go to stderr: report modules print to stdout only
+            // through the helpers in utils.
+            assert!(stderr.contains("CHILD-RAN"), "child never ran:\n{stderr}");
+            assert!(stderr.contains("NEW-FAILURES=1"), "{stderr}");
+            for shown in ["it worked", "left alone", "it broke"] {
+                assert!(stdout.contains(shown), "missing {shown:?}:\n{stdout}");
+            }
+            return;
+        }
+        let before = utils::failure_count();
+        say(vec![
+            done("it worked"),
+            skipped("left alone"),
+            failed("it broke"),
+        ]);
+        eprintln!("NEW-FAILURES={}", utils::failure_count() - before);
+        eprintln!("CHILD-RAN");
     }
 }

@@ -92,6 +92,7 @@ pub fn trusted_path() -> String {
 /// `~/.local/bin`, `cargo` in `~/.cargo/bin`): the trusted lookup cannot see
 /// them, so the call returns `false` and nothing says why. Those go through
 /// [`run_user`].
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn run(cmd: &str, args: &[&str]) -> bool {
     let mut command = Command::new(cmd);
     command.args(args);
@@ -129,6 +130,7 @@ fn keep_json_stdout_clean(command: &mut Command) {
 /// This is not an escalation: the tool runs with the caller's rights against
 /// the caller's caches, so a binary the caller controls gains nothing. It must
 /// never be paired with [`elevate`], which has its own trusted lookup.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn run_user(cmd: &str, args: &[&str]) -> bool {
     run_user_in(&env::var_os("PATH").unwrap_or_default(), cmd, args)
 }
@@ -154,6 +156,7 @@ fn run_user_in(paths: &OsStr, cmd: &str, args: &[&str]) -> bool {
 /// first run after an SDK install or upgrade, `dotnet` a welcome banner with
 /// documentation links and a telemetry notice. None of it is ours, and it all
 /// lands in the middle of our report.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn run_user_quiet(cmd: &str, args: &[&str]) -> bool {
     if is_verbose() {
         return run_user(cmd, args);
@@ -265,6 +268,7 @@ fn apply_tool_env(command: &mut Command, program: &Path) {
 /// leave the terminal silently waiting for an answer nobody was asked for.
 /// Privileged calls work because `main()` caches credentials up front via
 /// `acquire_sudo`, which does inherit the terminal.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn run_quiet(cmd: &str, args: &[&str]) -> bool {
     if is_verbose() {
         return run(cmd, args);
@@ -309,27 +313,20 @@ fn replay_failure(out: &Output) {
     replay_stderr(failure_detail(out));
 }
 
-/// [`run_quiet`] with privilege escalation. Mirrors [`elevate`]'s dispatch.
+/// [`run_quiet`] with privilege escalation. Resolves and dispatches exactly as
+/// [`elevate`] does — see the rationale there.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn elevate_quiet(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
-    // Same trusted-path resolution as [`elevate`] — see the rationale there.
-    let Some(target) = resolve_trusted(cmd) else {
+    let Some((program, argv)) = escalation(privilege, cmd, args, &resolve_trusted) else {
+        explain_unavailable(privilege, cmd);
         return false;
     };
-    match privilege {
-        Privilege::Root => run_quiet(&target, args),
-        Privilege::Sudo | Privilege::Doas => {
-            let Some(helper) = resolve_trusted(privilege.name()) else {
-                return false;
-            };
-            let mut a = vec![target.as_str()];
-            a.extend_from_slice(args);
-            run_quiet(&helper, &a)
-        }
-        Privilege::None => false,
-    }
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_quiet(&program, &argv)
 }
 
 /// Quiet counterpart to [`sudo`], using the helper detected at startup.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn sudo_quiet(cmd: &str, args: &[&str]) -> bool {
     elevate_quiet(current_privilege(), cmd, args)
 }
@@ -429,8 +426,10 @@ pub fn current_privilege() -> Privilege {
 /// [`resolve_trusted`] first, so neither is looked up in the caller's `$PATH`.
 /// This is the single choke point for privileged execution — the ~40 call sites
 /// in `clean.rs` keep passing bare names and inherit the guarantee for free.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn elevate(privilege: Privilege, cmd: &str, args: &[&str]) -> bool {
     let Some((program, argv)) = escalation(privilege, cmd, args, &resolve_trusted) else {
+        explain_unavailable(privilege, cmd);
         return false;
     };
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -475,8 +474,10 @@ fn escalation(
 /// command exited 0 *and* every byte of `input` reached it: a command that
 /// stopped reading early is a failure whatever its exit status says, since
 /// what it did with a short input is not something to vouch for.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn elevate_with_input(privilege: Privilege, cmd: &str, args: &[&str], input: &[u8]) -> bool {
     let Some((program, argv)) = escalation(privilege, cmd, args, &resolve_trusted) else {
+        explain_unavailable(privilege, cmd);
         return false;
     };
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -508,6 +509,111 @@ fn run_with_input(cmd: &str, args: &[&str], input: &[u8]) -> bool {
     delivered && succeeded
 }
 
+/// [`elevate_with_input`] for a command whose output is not ours to show: what
+/// it prints is captured, and a failure replays what it said, as for
+/// [`elevate_quiet`].
+///
+/// For the tools that can only be told "yes" at a prompt. `pacman -Scc` is the
+/// one that matters: `--noconfirm` answers every question with its default, and
+/// the default for "remove ALL files from cache?" is no, so the deep clean was
+/// a command that succeeded at doing nothing.
+///
+/// `true` means the command exited 0 and every byte of `input` reached it.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
+pub fn elevate_quiet_with_input(
+    privilege: Privilege,
+    cmd: &str,
+    args: &[&str],
+    input: &[u8],
+) -> bool {
+    let Some((program, argv)) = escalation(privilege, cmd, args, &resolve_trusted) else {
+        explain_unavailable(privilege, cmd);
+        return false;
+    };
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    if is_verbose() {
+        return run_with_input(&program, &argv, input);
+    }
+    run_quiet_with_input(&program, &argv, input)
+}
+
+/// [`elevate_quiet_with_input`] with the helper detected at startup.
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
+pub fn sudo_quiet_with_input(cmd: &str, args: &[&str], input: &[u8]) -> bool {
+    elevate_quiet_with_input(current_privilege(), cmd, args, input)
+}
+
+/// [`run_with_input`] with stdout and stderr captured instead of inherited.
+///
+/// The input is written from a thread, because a command is free to fill its
+/// output pipes before it reads a byte of ours, and a writer that waits for the
+/// reader while the reader waits for the writer is a hang.
+fn run_quiet_with_input(cmd: &str, args: &[&str], input: &[u8]) -> bool {
+    let mut command = Command::new(cmd);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    harden_env(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let writer = child.stdin.take().map(|mut stdin| {
+        let input = input.to_vec();
+        std::thread::spawn(move || stdin.write_all(&input).is_ok())
+    });
+    let Ok(out) = child.wait_with_output() else {
+        return false;
+    };
+    // Joined after the wait: the command has exited by now, so the writer has
+    // either finished or failed on a pipe nobody reads.
+    let delivered = writer
+        .map(|handle| handle.join().unwrap_or(false))
+        .unwrap_or(false);
+    if !out.status.success() {
+        replay_failure(&out);
+    }
+    delivered && out.status.success()
+}
+
+/// A dimmed line of explanation, indented like the lines [`run_quiet`] replays
+/// from a failed command.
+fn note(msg: &str) {
+    if silent() {
+        return;
+    }
+    println!("      {}", msg.dimmed());
+}
+
+/// Say why a privileged command was not even started. Without this a `false`
+/// from [`elevate`] reads as the command having failed, when what failed is
+/// finding it.
+fn explain_unavailable(privilege: Privilege, cmd: &str) {
+    note(&unavailable(privilege, cmd, &resolve_trusted));
+}
+
+/// The sentence for [`explain_unavailable`], with the lookup passed in so a test
+/// does not depend on what the machine has installed.
+fn unavailable(
+    privilege: Privilege,
+    cmd: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let dirs = TRUSTED_BIN_DIRS.join(", ");
+    match privilege {
+        Privilege::None => "not run: not root, and neither sudo nor doas was found".to_string(),
+        _ if resolve(cmd).is_none() => {
+            format!("not run: {cmd} is not in a directory trusted for root ({dirs})")
+        }
+        Privilege::Sudo | Privilege::Doas => format!(
+            "not run: {} is not in a directory trusted for root ({dirs})",
+            privilege.name()
+        ),
+        Privilege::Root => format!("not run: {cmd} could not be started"),
+    }
+}
+
 /// Cache the user's password / authorisation for the chosen helper.
 ///
 /// `sudo -v` extends the auth-cache; `doas` has no equivalent, so we send a
@@ -532,6 +638,7 @@ pub fn acquire_privilege(privilege: Privilege) -> bool {
 
 /// Backwards-compatible wrapper. Delegates to [`elevate`] with the helper
 /// detected at startup (set by `main()` via [`set_privilege`]).
+#[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn sudo(cmd: &str, args: &[&str]) -> bool {
     elevate(current_privilege(), cmd, args)
 }
@@ -574,17 +681,122 @@ fn capture_program(program: &Path, args: &[&str], harden: bool) -> Option<String
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// [`capture`] that also looks at how the tool ended: its output when it exited
+/// 0, and `None` when it did not or could not be started.
+///
+/// **User tier**, like [`capture`]. For the runs whose output we read *and*
+/// whose success we report, `nix-collect-garbage` among them: [`capture`] hands
+/// back whatever the tool printed even when it failed, so a failure looked like
+/// a quiet success. What a failed tool said is shown, as [`run_user_quiet`] does.
+#[must_use = "None means the tool failed, and that has to be reported"]
+pub fn capture_checked(cmd: &str, args: &[&str]) -> Option<String> {
+    capture_checked_in(&env::var_os("PATH").unwrap_or_default(), cmd, args)
+}
+
+/// [`capture_checked`] over an explicit search path (see [`run_user_in`]).
+fn capture_checked_in(paths: &OsStr, cmd: &str, args: &[&str]) -> Option<String> {
+    let Some(program) = which_path_in(cmd, paths) else {
+        note(&format!("{cmd} was not found in your PATH"));
+        return None;
+    };
+    let out = user_command(&program, args).output().ok()?;
+    if !out.status.success() {
+        replay_failure(&out);
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// [`capture`] restricted to [`TRUSTED_BIN_DIRS`], for output we act on with
 /// root behind it.
 ///
-/// `pacman -Qdtq` and `zypper packages --orphaned` produce the package list that
-/// is then fed to a privileged removal command, so a shadowed binary here does
-/// not need to run as root itself — it just has to name packages, and we delete
-/// them. Returns `None` when the tool is not in a trusted directory, which
-/// callers already treat as "not available".
+/// A tool whose output is handed to a privileged command must not be one a
+/// user can shadow: it would not need to run as root itself, only to name the
+/// things we then delete. Returns `None` when the tool is not in a trusted
+/// directory, and the output whatever the tool's exit status was; a caller that
+/// reads a list and acts on "nothing there" wants [`list_trusted`] instead.
 pub fn capture_trusted(cmd: &str, args: &[&str]) -> Option<String> {
     let target = resolve_trusted(cmd)?;
     capture_program(Path::new(&target), args, true)
+}
+
+/// How a read-only listing came out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// The tool printed a list.
+    Found(String),
+    /// It ran, and there is nothing to list.
+    Nothing,
+    /// It could not be run, or it ended the way a broken tool does. What it said
+    /// has been shown.
+    Failed,
+}
+
+/// What a tool that has nothing to list exits with.
+#[derive(Clone, Copy, Debug)]
+pub enum WhenEmpty {
+    /// 0, like nearly everything.
+    Exit0,
+    /// 1, with no output: `pacman -Qdtq` (checked against pacman 7.1).
+    Exit1,
+}
+
+/// What a finished listing means, decided apart from running it.
+///
+/// A tool that cannot look and a tool that looked and found nothing both print
+/// nothing, and "nothing found" is a success line that must not be said of a
+/// listing that never happened: a locked package database was reported as
+/// "No orphans found". Where the exit status separates the two it is enough;
+/// where a tool uses 1 for both (pacman), what separates them is that its
+/// errors are the `error:` lines — its warnings, for instance about sync
+/// databases that were never downloaded, come with a harmless run too.
+fn classify_listing(code: Option<i32>, stdout: &str, stderr: &str, empty: WhenEmpty) -> Listing {
+    let stdout = stdout.trim();
+    match code {
+        Some(0) => {}
+        Some(1)
+            if matches!(empty, WhenEmpty::Exit1)
+                && stdout.is_empty()
+                && !stderr.lines().any(|l| l.trim_start().starts_with("error:")) =>
+        {
+            return Listing::Nothing;
+        }
+        _ => return Listing::Failed,
+    }
+    if stdout.is_empty() {
+        Listing::Nothing
+    } else {
+        Listing::Found(stdout.to_string())
+    }
+}
+
+/// Run a read-only listing from a [`TRUSTED_BIN_DIRS`] tool and say what it
+/// came to ([`Listing`]); a failure explains itself, as for [`run_quiet`].
+pub fn list_trusted(cmd: &str, args: &[&str], empty: WhenEmpty) -> Listing {
+    let Some(target) = resolve_trusted(cmd) else {
+        note(&format!(
+            "{cmd} is not in a directory trusted for root ({})",
+            TRUSTED_BIN_DIRS.join(", ")
+        ));
+        return Listing::Failed;
+    };
+    let mut command = Command::new(&target);
+    command.args(args);
+    harden_env(&mut command);
+    let Ok(out) = command.output() else {
+        note(&format!("{cmd} could not be started"));
+        return Listing::Failed;
+    };
+    let listing = classify_listing(
+        out.status.code(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+        empty,
+    );
+    if listing == Listing::Failed {
+        replay_failure(&out);
+    }
+    listing
 }
 
 /// Check if a command exists in PATH, as something [`run_user`] could start.
@@ -1994,6 +2206,345 @@ mod tests {
         warning("just a remark");
         println!("COUNT={}", failure_count());
         println!("SINCE-1={:?}", failures_since(mark));
+        println!("CHILD-RAN");
+    }
+
+    // ── Commands that are told "yes", and commands that cannot be started ──
+
+    /// `sh -c script out` with `input` on stdin, run quietly as `Privilege::Root`
+    /// would run it; `$0` in the script is the path of the output file.
+    fn root_quiet_sh_with_input(script: &str, out: &Path, input: &[u8]) -> bool {
+        let out = out.to_str().unwrap();
+        elevate_quiet_with_input(Privilege::Root, "sh", &["-c", script, out], input)
+    }
+
+    #[test]
+    fn test_a_quiet_command_with_input_gets_every_byte() {
+        let dir = scratch("quiet_input_all");
+        let out = dir.join("out");
+        // Many times a pipe buffer: the writer has to keep going while the
+        // command reads.
+        let input = patterned(3 << 20);
+        assert!(root_quiet_sh_with_input("cat > \"$0\"", &out, &input));
+        assert_eq!(fs::read(&out).unwrap(), input);
+        assert!(root_quiet_sh_with_input("cat > \"$0\"", &out, b""));
+        assert_eq!(fs::read(&out).unwrap(), b"");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_quiet_command_may_fill_its_output_before_it_reads() {
+        // Hundreds of KB on stdout and on stderr, several pipe buffers each,
+        // before the first byte of input is read. A writer that did not run
+        // alongside the reader would wait for a command that is waiting for it.
+        let dir = scratch("quiet_input_noisy");
+        let out = dir.join("out");
+        let input = patterned(1 << 20);
+        let script = "yes out | head -c 300000; yes err | head -c 300000 >&2; cat > \"$0\"";
+        let started = std::time::Instant::now();
+        assert!(root_quiet_sh_with_input(script, &out, &input));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(fs::read(&out).unwrap(), input);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_quiet_command_with_input_reports_its_own_failure() {
+        let dir = scratch("quiet_input_fails");
+        let out = dir.join("out");
+        assert!(!root_quiet_sh_with_input(
+            "cat > \"$0\"; exit 1",
+            &out,
+            b"payload"
+        ));
+        // It did receive the input; the failure is its own.
+        assert_eq!(fs::read(&out).unwrap(), b"payload");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_quiet_command_that_stops_reading_is_a_failure() {
+        // Exits 0 without reading a byte of 4 MiB: what it did with what it
+        // never saw is not something to vouch for, and the writer must not hang
+        // on a pipe nobody reads.
+        let dir = scratch("quiet_input_early");
+        let out = dir.join("out");
+        let started = std::time::Instant::now();
+        assert!(!root_quiet_sh_with_input(
+            "exit 0",
+            &out,
+            &patterned(4 << 20)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_each_answer_reaches_its_own_prompt() {
+        // The shape of `pacman -Scc`: one question for the cache and one for
+        // the sync databases, answered in that order.
+        let dir = scratch("quiet_input_prompts");
+        let out = dir.join("out");
+        let script = "read first; read second; printf '%s,%s' \"$first\" \"$second\" > \"$0\"";
+        assert!(root_quiet_sh_with_input(script, &out, b"y\nn\n"));
+        assert_eq!(fs::read_to_string(&out).unwrap(), "y,n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_quiet_command_with_input_runs_nothing_it_may_not() {
+        let dir = scratch("quiet_input_refused");
+        let marker = dir.join("ran");
+        let marker = marker.to_str().unwrap();
+        let script = "touch \"$0\"";
+        assert!(!elevate_quiet_with_input(
+            Privilege::None,
+            "sh",
+            &["-c", script, marker],
+            b"x"
+        ));
+        assert!(!elevate_quiet_with_input(
+            Privilege::Root,
+            "oxiclean_no_such_binary_xyz",
+            &[marker],
+            b"x"
+        ));
+        assert!(!elevate_quiet_with_input(
+            Privilege::Root,
+            "./sh",
+            &["-c", script, marker],
+            b"x"
+        ));
+        assert!(!Path::new(marker).exists(), "something ran");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_quiet_command_with_input_keeps_its_chatter_off_stdout() {
+        const ME: &str =
+            "utils::tests::test_a_quiet_command_with_input_keeps_its_chatter_off_stdout";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                !stdout.contains("TOOL-CHATTER"),
+                "chatter leaked:\n{stdout}"
+            );
+            assert!(
+                stdout.contains("TOOL-COMPLAINT"),
+                "a failing tool's complaint must be replayed:\n{stdout}"
+            );
+            return;
+        }
+        let noisy = "echo TOOL-CHATTER; echo TOOL-CHATTER >&2; cat > /dev/null";
+        assert!(elevate_quiet_with_input(
+            Privilege::Root,
+            "sh",
+            &["-c", noisy],
+            b"x"
+        ));
+        let failing = "echo TOOL-COMPLAINT >&2; cat > /dev/null; exit 1";
+        assert!(!elevate_quiet_with_input(
+            Privilege::Root,
+            "sh",
+            &["-c", failing],
+            b"x"
+        ));
+        println!("CHILD-RAN");
+    }
+
+    #[test]
+    fn test_capture_checked_tells_a_failure_from_an_answer() {
+        let dir = scratch("capture_checked");
+        sh_as(&dir, "sh");
+        let paths = dir.as_os_str();
+
+        assert_eq!(
+            capture_checked_in(paths, "sh", &["-c", "echo '  freed 5  '"]),
+            Some("freed 5".to_string())
+        );
+        // `capture` hands back what a tool printed even when it failed...
+        assert_eq!(
+            capture_in(paths, "sh", &["-c", "echo partial; exit 3"]),
+            Some("partial".to_string())
+        );
+        // ...and this one does not.
+        assert_eq!(
+            capture_checked_in(paths, "sh", &["-c", "echo partial; exit 3"]),
+            None
+        );
+        assert_eq!(
+            capture_checked_in(paths, "oxiclean-no-such-tool", &[]),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_the_reason_a_command_was_not_started_names_what_is_missing() {
+        let nothing = |_: &str| -> Option<String> { None };
+        let only = |found: &'static str| {
+            move |c: &str| -> Option<String> { (c == found).then(|| format!("/usr/bin/{c}")) }
+        };
+
+        let msg = unavailable(Privilege::None, "pacman", &only("pacman"));
+        assert!(msg.contains("neither sudo nor doas"), "{msg}");
+
+        // Root with a command that is nowhere trusted: the command is named, and
+        // so are the places that were looked in.
+        let msg = unavailable(Privilege::Root, "nix-collect-garbage", &nothing);
+        assert!(msg.contains("nix-collect-garbage"), "{msg}");
+        assert!(msg.contains("/usr/bin"), "{msg}");
+        assert!(msg.contains("/nix/var/nix/profiles/default/bin"), "{msg}");
+
+        // The command is there; it is the helper that is not.
+        let msg = unavailable(Privilege::Doas, "pacman", &only("pacman"));
+        assert!(msg.contains("doas"), "{msg}");
+        assert!(!msg.contains("pacman"), "{msg}");
+        let msg = unavailable(Privilege::Sudo, "pacman", &only("pacman"));
+        assert!(msg.contains("sudo"), "{msg}");
+    }
+
+    #[test]
+    fn test_every_privileged_entry_point_says_why_it_did_not_run() {
+        const ME: &str = "utils::tests::test_every_privileged_entry_point_says_why_it_did_not_run";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            // One sentence from each of the four ways in.
+            assert_eq!(
+                stdout.matches("neither sudo nor doas was found").count(),
+                4,
+                "every entry point must say why it did nothing:\n{stdout}"
+            );
+            return;
+        }
+        // `Privilege::None` runs nothing, so nothing here can touch the machine.
+        assert!(!elevate(Privilege::None, "true", &[]));
+        assert!(!elevate_quiet(Privilege::None, "true", &[]));
+        assert!(!elevate_with_input(Privilege::None, "true", &[], b"x"));
+        assert!(!elevate_quiet_with_input(
+            Privilege::None,
+            "true",
+            &[],
+            b"x"
+        ));
+        println!("CHILD-RAN");
+    }
+
+    #[test]
+    fn test_the_reason_a_command_did_not_run_is_not_printed_in_json_mode() {
+        const ME: &str =
+            "utils::tests::test_the_reason_a_command_did_not_run_is_not_printed_in_json_mode";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                !stdout.contains("not run:"),
+                "--json must keep stdout to the one document:\n{stdout}"
+            );
+            return;
+        }
+        set_json(true);
+        assert!(!elevate_quiet(Privilege::None, "true", &[]));
+        println!("CHILD-RAN");
+    }
+
+    #[test]
+    fn test_a_listing_tells_nothing_to_list_from_a_broken_tool() {
+        use WhenEmpty::{Exit0, Exit1};
+        let found = |s: &str| Listing::Found(s.to_string());
+        // A list.
+        assert_eq!(
+            classify_listing(Some(0), "a\nb\n", "", Exit0),
+            found("a\nb")
+        );
+        assert_eq!(
+            classify_listing(Some(0), "a\n", "warning: x", Exit1),
+            found("a")
+        );
+        // Nothing to list: exit 0 and no output (a tool may say so on stderr)...
+        assert_eq!(classify_listing(Some(0), "", "", Exit0), Listing::Nothing);
+        assert_eq!(
+            classify_listing(Some(0), " \n", "No snaps are installed yet", Exit0),
+            Listing::Nothing
+        );
+        // ...or, for pacman, exit 1 and no output, warnings or not.
+        assert_eq!(classify_listing(Some(1), "", "", Exit1), Listing::Nothing);
+        let unsynced = "warning: database file for 'core' does not exist (use '-Sy' to download)";
+        assert_eq!(
+            classify_listing(Some(1), "", unsynced, Exit1),
+            Listing::Nothing
+        );
+        // Broken: an `error:` line, any other status, a signal, or an exit 1
+        // from a tool that does not use it for "nothing".
+        let broken = "error: failed to initialize alpm library";
+        assert_eq!(
+            classify_listing(Some(1), "", broken, Exit1),
+            Listing::Failed
+        );
+        assert_eq!(
+            classify_listing(Some(1), "", &format!("{unsynced}\n{broken}"), Exit1),
+            Listing::Failed
+        );
+        assert_eq!(classify_listing(Some(1), "", "", Exit0), Listing::Failed);
+        assert_eq!(classify_listing(Some(2), "", "", Exit1), Listing::Failed);
+        assert_eq!(
+            classify_listing(Some(1), "partial", "", Exit1),
+            Listing::Failed
+        );
+        assert_eq!(classify_listing(None, "a", "", Exit0), Listing::Failed);
+    }
+
+    #[test]
+    fn test_list_trusted_runs_the_tool_and_classifies_what_it_did() {
+        use WhenEmpty::{Exit0, Exit1};
+        let run = |script: &str, empty| list_trusted("sh", &["-c", script], empty);
+        assert_eq!(
+            run("echo one; echo two", Exit0),
+            Listing::Found("one\ntwo".to_string())
+        );
+        assert_eq!(run("exit 0", Exit0), Listing::Nothing);
+        assert_eq!(
+            run("echo 'warning: x' >&2; exit 1", Exit1),
+            Listing::Nothing
+        );
+        assert_eq!(
+            run("echo 'error: broken' >&2; exit 1", Exit1),
+            Listing::Failed
+        );
+        assert_eq!(run("exit 3", Exit0), Listing::Failed);
+        // Not a tool that is trusted at all: a failure, not an empty answer.
+        assert_eq!(
+            list_trusted("oxiclean_no_such_binary_xyz", &[], Exit0),
+            Listing::Failed
+        );
+    }
+
+    #[test]
+    fn test_a_failed_listing_says_what_the_tool_said() {
+        const ME: &str = "utils::tests::test_a_failed_listing_says_what_the_tool_said";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                stdout.contains("TOOL-COMPLAINT"),
+                "a failed listing must explain itself:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("TOOL-FINE"),
+                "a listing that worked has nothing to explain:\n{stdout}"
+            );
+            return;
+        }
+        let fine = list_trusted(
+            "sh",
+            &["-c", "echo TOOL-FINE >&2; echo item"],
+            WhenEmpty::Exit0,
+        );
+        assert_eq!(fine, Listing::Found("item".to_string()));
+        let broken = list_trusted(
+            "sh",
+            &["-c", "echo TOOL-COMPLAINT >&2; exit 2"],
+            WhenEmpty::Exit0,
+        );
+        assert_eq!(broken, Listing::Failed);
         println!("CHILD-RAN");
     }
 }
