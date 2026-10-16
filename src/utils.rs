@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -949,34 +949,196 @@ pub fn dir_size(path: &Path) -> u64 {
     total
 }
 
-/// Remove all contents inside a directory (keeps the dir itself)
-/// Returns total bytes freed
-pub fn rm_contents(path: &Path) -> u64 {
-    let mut freed = 0u64;
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        // `DirEntry::metadata` is an lstat: one call gives symlink, dir and size.
-        let Ok(md) = entry.metadata() else {
-            continue;
-        };
-        let is_real_dir = md.is_dir() && !md.is_symlink();
+/// What emptying a directory came to.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Emptied {
+    /// Bytes of what is gone.
+    pub freed: u64,
+    /// Entries tried, and how many of those are still there.
+    pub tried: usize,
+    pub failed: usize,
+    /// The first that is still there, and why.
+    pub first_failure: Option<String>,
+}
 
-        let size = if is_real_dir { dir_size(&p) } else { md.len() };
-
-        let ok = if is_real_dir {
-            fs::remove_dir_all(&p).is_ok()
-        } else {
-            fs::remove_file(&p).is_ok()
-        };
-
-        if ok {
-            freed += size;
+impl Emptied {
+    /// Note what became of one entry of `size` bytes (see [`remove_entry`]).
+    pub fn add(&mut self, path: &Path, size: u64, result: io::Result<bool>) {
+        self.tried += 1;
+        match result {
+            Ok(true) => self.freed += size,
+            // Gone before we got to it: nothing of ours was freed, nothing is left.
+            Ok(false) => {}
+            Err(why) => {
+                self.failed += 1;
+                if self.first_failure.is_none() {
+                    self.first_failure = Some(format!("{}: {why}", path.display()));
+                }
+            }
         }
     }
-    freed
+
+    /// The error to report for emptying `dir`, when anything is still there.
+    pub fn complaint(&self, dir: &Path) -> Option<String> {
+        let first = self.first_failure.as_deref()?;
+        Some(format!(
+            "Could not remove {} of {} item(s) in {}: {first}",
+            self.failed,
+            self.tried,
+            dir.display()
+        ))
+    }
+}
+
+/// Remove one entry of a cache directory: a file, a symlink (the link, never
+/// what it points to) or a directory tree. `Ok(true)` when it was removed,
+/// `Ok(false)` when it was already gone, which is as good.
+///
+/// What most often stops an owner from removing a tree is a directory that has
+/// lost its write bit. Go makes its module cache read-only on purpose; an AUR
+/// build that fetched modules without `-modcacherw` leaves exactly that in the
+/// helper's cache; and whatever was trashed from such a tree arrives in the
+/// trash the same way. `rm -rf` fails on it too. Giving the owner back access to
+/// the tree's directories and trying once more is the `chmod -R u+w` that
+/// clearing it by hand takes, and it only touches what is being deleted. What
+/// still cannot be removed after that — another user's files, a mount point —
+/// comes back as the error, for the caller to report.
+pub fn remove_entry(path: &Path, is_real_dir: bool) -> io::Result<bool> {
+    let attempt = || -> io::Result<bool> {
+        let removed = if is_real_dir {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        match removed {
+            Ok(()) => Ok(true),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(why) => Err(why),
+        }
+    };
+    match attempt() {
+        Err(why) if is_real_dir && why.kind() == io::ErrorKind::PermissionDenied => {
+            make_dirs_accessible(path);
+            attempt()
+        }
+        outcome => outcome,
+    }
+}
+
+/// Give the owner read, write and search permission on `root` and on every
+/// directory below it. Symlinks are never entered and nothing outside the tree
+/// is touched. Best effort: what cannot be changed is not ours to change.
+fn make_dirs_accessible(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // This one first: without search permission nothing below it is reachable.
+        grant_owner_access(&dir);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `DirEntry::file_type` does not follow a link.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(entry.path());
+            }
+        }
+    }
+}
+
+/// `chmod u+rwx` on `dir`, and only on a real directory: it is looked at
+/// without following links, opened, and the opened thing must be the same
+/// inode, so a link put in its place after the look is not changed through.
+fn grant_owner_access(dir: &Path) {
+    if let Ok(seen) = fs::symlink_metadata(dir) {
+        grant_if_unchanged(dir, &seen);
+    }
+}
+
+/// The second half of [`grant_owner_access`], with the first look (`seen`)
+/// handed in so that a test can put something else in the path's place.
+fn grant_if_unchanged(dir: &Path, seen: &fs::Metadata) {
+    // Only a directory is ever opened: opening a FIFO would wait for a writer
+    // and opening a device can have effects of its own.
+    if !seen.is_dir() {
+        return;
+    }
+    // A directory the owner cannot even read cannot be opened here, and is
+    // left alone: it is reported rather than changed through a path that a
+    // link could be put in the way of.
+    let Ok(file) = fs::File::open(dir) else {
+        return;
+    };
+    let Ok(opened) = file.metadata() else {
+        return;
+    };
+    if !is_same_directory(seen, &opened) {
+        return;
+    }
+    let mode = opened.permissions().mode() & 0o7777;
+    if mode & 0o700 != 0o700 {
+        let _ = file.set_permissions(fs::Permissions::from_mode(mode | 0o700));
+    }
+}
+
+/// Whether `opened`, what opening a path reached, is a directory and the very
+/// one that `seen`, a look at the same path that did not follow links, found:
+/// the same device and inode. Anything else, a link or another directory or a
+/// file that took its place in between, is not something to change.
+fn is_same_directory(seen: &fs::Metadata, opened: &fs::Metadata) -> bool {
+    opened.is_dir() && opened.dev() == seen.dev() && opened.ino() == seen.ino()
+}
+
+/// Empty a directory, keeping the directory itself. `Err` only when it exists
+/// and cannot be read; what could not be removed is in the [`Emptied`].
+fn empty_dir(path: &Path) -> io::Result<Emptied> {
+    let mut emptied = Emptied::default();
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(emptied),
+        Err(why) => return Err(why),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(why) => {
+                emptied.add(path, 0, Err(why));
+                continue;
+            }
+        };
+        let p = entry.path();
+        // `DirEntry::metadata` is an lstat: one call gives symlink, dir and size.
+        let md = match entry.metadata() {
+            Ok(md) => md,
+            Err(why) if why.kind() == io::ErrorKind::NotFound => continue,
+            Err(why) => {
+                emptied.add(&p, 0, Err(why));
+                continue;
+            }
+        };
+        let is_real_dir = md.is_dir() && !md.is_symlink();
+        let size = if is_real_dir { dir_size(&p) } else { md.len() };
+        emptied.add(&p, size, remove_entry(&p, is_real_dir));
+    }
+    Ok(emptied)
+}
+
+/// Remove all contents inside a directory (keeps the dir itself).
+/// Returns total bytes freed. What could not be removed is reported as an error,
+/// once for the directory: a "freed" figure that quietly leaves out what stayed
+/// behind is how a cache that never shrinks goes unnoticed.
+pub fn rm_contents(path: &Path) -> u64 {
+    match empty_dir(path) {
+        Ok(emptied) => {
+            if let Some(complaint) = emptied.complaint(path) {
+                error(&complaint);
+            }
+            emptied.freed
+        }
+        Err(why) => {
+            error(&format!("Could not read {}: {why}", path.display()));
+            0
+        }
+    }
 }
 
 /// Format bytes to human-readable string
@@ -2545,6 +2707,306 @@ mod tests {
             WhenEmpty::Exit0,
         );
         assert_eq!(broken, Listing::Failed);
+        println!("CHILD-RAN");
+    }
+
+    // ── Removing what cannot be removed as it stands ──
+
+    fn chmod(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// A tree like Go's module cache: nobody may write to its directories or files.
+    fn read_only_tree(root: &Path) {
+        let deep = root.join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("file"), b"payload").unwrap();
+        fs::write(root.join("a/top"), b"payload").unwrap();
+        chmod(&deep.join("file"), 0o444);
+        chmod(&root.join("a/top"), 0o444);
+        for dir in [deep, root.join("a/b"), root.join("a"), root.to_path_buf()] {
+            chmod(&dir, 0o555);
+        }
+    }
+
+    #[test]
+    fn test_a_tree_of_read_only_directories_is_removed() {
+        let base = scratch("ro_tree");
+        let tree = base.join("tree");
+        read_only_tree(&tree);
+        if !is_root() {
+            // The reason this exists: as it stands, plain removal gets nowhere,
+            // and it used to be left at that without a word.
+            assert!(fs::remove_dir_all(&tree).is_err());
+            assert!(tree.join("a/b/c/file").exists());
+        }
+        let removed = remove_entry(&tree, true);
+        assert!(matches!(removed, Ok(true)), "{removed:?}");
+        assert!(!tree.exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_only_the_very_directory_that_was_looked_at_is_changed() {
+        let base = scratch("same-directory");
+        let one = base.join("one");
+        let two = base.join("two");
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        fs::write(base.join("file"), b"x").unwrap();
+
+        let meta = |p: &Path| fs::metadata(p).unwrap();
+        let lmeta = |p: &Path| fs::symlink_metadata(p).unwrap();
+
+        // The same directory, looked at twice.
+        assert!(is_same_directory(&lmeta(&one), &meta(&one)));
+        // Another directory in its place.
+        assert!(!is_same_directory(&lmeta(&one), &meta(&two)));
+        // A file is not a directory, even when it is the very thing looked at.
+        let file = base.join("file");
+        assert!(!is_same_directory(&lmeta(&file), &meta(&file)));
+
+        // The device is part of the identity: the roots of /proc and /sys are
+        // both inode 1, on different devices. (Only checked where the machine
+        // has two such directories.)
+        if let (Ok(a), Ok(b)) = (fs::metadata("/proc"), fs::metadata("/sys")) {
+            if a.ino() == b.ino() && a.dev() != b.dev() {
+                assert!(!is_same_directory(&a, &b));
+            }
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_nothing_is_changed_when_the_path_no_longer_leads_to_what_was_seen() {
+        let base = scratch("swapped");
+        let make = |name: &str| {
+            let dir = base.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            chmod(&dir, 0o555);
+            dir
+        };
+        let seen = make("seen");
+        let other = make("other");
+        let target = make("target");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = base.join("file");
+        fs::write(&file, b"x").unwrap();
+        chmod(&file, 0o444);
+        let first_look = fs::symlink_metadata(&seen).unwrap();
+
+        // The path now leads to another directory, to a link to one, or to a
+        // file: none of them is what was looked at.
+        grant_if_unchanged(&other, &first_look);
+        grant_if_unchanged(&link, &first_look);
+        grant_if_unchanged(&file, &first_look);
+        assert_eq!(mode_of(&other), 0o555);
+        assert_eq!(mode_of(&target), 0o555);
+        assert_eq!(mode_of(&file), 0o444);
+
+        // What was looked at, and still is there, is given access.
+        grant_if_unchanged(&seen, &first_look);
+        assert_eq!(mode_of(&seen), 0o755);
+        // A look at a link is never followed, whatever it leads to.
+        grant_if_unchanged(&link, &fs::symlink_metadata(&link).unwrap());
+        assert_eq!(mode_of(&target), 0o555);
+
+        for dir in [&seen, &other, &target] {
+            chmod(dir, 0o755);
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_an_entry_that_is_already_gone_is_not_an_error() {
+        let base = scratch("gone");
+        assert!(matches!(remove_entry(&base.join("nope"), false), Ok(false)));
+        assert!(matches!(remove_entry(&base.join("nope"), true), Ok(false)));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_removing_a_tree_never_changes_what_a_link_in_it_points_to() {
+        use std::os::unix::fs::symlink;
+        let base = scratch("ro_link");
+        let outside = base.join("outside");
+        let outside_sub = outside.join("sub");
+        fs::create_dir_all(&outside_sub).unwrap();
+        fs::write(outside.join("keep"), b"keep").unwrap();
+        chmod(&outside_sub, 0o555);
+        chmod(&outside, 0o555);
+        let tree = base.join("tree");
+        fs::create_dir_all(tree.join("a")).unwrap();
+        symlink(&outside, tree.join("a/link_to_dir")).unwrap();
+        symlink(outside.join("keep"), tree.join("a/link_to_file")).unwrap();
+        read_only_tree(&tree);
+
+        let removed = remove_entry(&tree, true);
+        assert!(matches!(removed, Ok(true)), "{removed:?}");
+        assert!(!tree.exists());
+        // Neither the directory a link points to nor anything inside it.
+        assert_eq!(
+            mode_of(&outside),
+            0o555,
+            "a link was followed and what it points to was changed"
+        );
+        assert_eq!(mode_of(&outside_sub), 0o555, "a link was entered");
+        assert!(outside.join("keep").is_file());
+
+        // A link handed in directly is removed as the link it is.
+        let link = base.join("direct");
+        symlink(&outside, &link).unwrap();
+        assert!(matches!(remove_entry(&link, false), Ok(true)));
+        assert!(outside.join("keep").is_file());
+        chmod(&outside, 0o755);
+        chmod(&outside_sub, 0o755);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_access_is_only_given_to_a_directory_that_is_one() {
+        use std::os::unix::fs::symlink;
+        let base = scratch("grant");
+        let dir = base.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        chmod(&dir, 0o500);
+        grant_owner_access(&dir);
+        assert_eq!(mode_of(&dir), 0o700);
+        // Group and others keep what they had; nothing is taken away.
+        chmod(&dir, 0o750);
+        grant_owner_access(&dir);
+        assert_eq!(mode_of(&dir), 0o750);
+        // Through a link, nothing changes.
+        let link = base.join("link");
+        symlink(&dir, &link).unwrap();
+        chmod(&dir, 0o500);
+        grant_owner_access(&link);
+        assert_eq!(mode_of(&dir), 0o500);
+        // Nor on a file.
+        let file = base.join("file");
+        fs::write(&file, b"x").unwrap();
+        chmod(&file, 0o400);
+        grant_owner_access(&file);
+        assert_eq!(mode_of(&file), 0o400);
+        chmod(&dir, 0o755);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_what_cannot_be_removed_is_an_error_not_a_success() {
+        if is_root() {
+            return; // root can remove anything
+        }
+        let base = scratch("ro_parent");
+        let parent = base.join("parent");
+        fs::create_dir_all(parent.join("tree")).unwrap();
+        fs::write(parent.join("file"), b"x").unwrap();
+        // The entries of `parent` cannot be unlinked, whatever is done to them.
+        chmod(&parent, 0o555);
+        let file = remove_entry(&parent.join("file"), false);
+        let tree = remove_entry(&parent.join("tree"), true);
+        chmod(&parent, 0o755);
+        assert_eq!(file.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(tree.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(parent.join("file").exists() && parent.join("tree").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_emptying_a_directory_counts_what_went_and_what_stayed() {
+        let base = scratch("empty_count");
+        fs::write(base.join("a"), vec![0u8; 100]).unwrap();
+        fs::create_dir_all(base.join("d")).unwrap();
+        fs::write(base.join("d/b"), vec![0u8; 200]).unwrap();
+        let emptied = empty_dir(&base).unwrap();
+        assert_eq!((emptied.tried, emptied.failed), (2, 0));
+        assert!(emptied.freed >= 300, "{emptied:?}");
+        assert!(emptied.complaint(&base).is_none());
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
+
+        // A directory that is not there has nothing to empty.
+        assert_eq!(empty_dir(&base.join("nope")).unwrap(), Emptied::default());
+
+        if !is_root() {
+            fs::write(base.join("x"), b"1").unwrap();
+            fs::write(base.join("y"), b"2").unwrap();
+            chmod(&base, 0o555);
+            let emptied = empty_dir(&base);
+            chmod(&base, 0o755);
+            let emptied = emptied.unwrap();
+            assert_eq!((emptied.freed, emptied.tried, emptied.failed), (0, 2, 2));
+            let complaint = emptied.complaint(&base).unwrap();
+            assert!(
+                complaint.starts_with("Could not remove 2 of 2 item(s) in "),
+                "{complaint}"
+            );
+            assert!(complaint.contains("ermission denied"), "{complaint}");
+
+            // One that exists and cannot be read is an error of its own.
+            chmod(&base, 0o000);
+            let unreadable = empty_dir(&base);
+            chmod(&base, 0o755);
+            assert!(unreadable.is_err());
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_the_complaint_names_the_count_the_first_entry_and_the_reason() {
+        let mut emptied = Emptied::default();
+        emptied.add(Path::new("/c/a"), 10, Ok(true));
+        emptied.add(
+            Path::new("/c/b"),
+            20,
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        );
+        emptied.add(Path::new("/c/c"), 30, Err(io::Error::other("busy")));
+        emptied.add(Path::new("/c/d"), 40, Ok(false));
+        assert_eq!((emptied.freed, emptied.tried, emptied.failed), (10, 4, 2));
+        assert_eq!(
+            emptied.complaint(Path::new("/c")).unwrap(),
+            "Could not remove 2 of 4 item(s) in /c: /c/b: permission denied"
+        );
+        let clean = Emptied::default();
+        assert_eq!(clean.complaint(Path::new("/c")), None);
+    }
+
+    #[test]
+    fn test_rm_contents_reports_what_it_could_not_remove() {
+        const ME: &str = "utils::tests::test_rm_contents_reports_what_it_could_not_remove";
+        if env::var_os(CHILD_ENV).is_none() {
+            if is_root() {
+                return; // root can remove anything
+            }
+            let stdout = child_stdout(ME);
+            assert!(
+                stdout.contains("Could not remove 2 of 2 item(s) in "),
+                "{stdout}"
+            );
+            assert!(stdout.contains("Could not read "), "{stdout}");
+            assert!(stdout.contains("FREED=0 NEW-FAILURES=2"), "{stdout}");
+            return;
+        }
+        let base = scratch("rm_reports");
+        let stuck = base.join("stuck");
+        let locked = base.join("locked");
+        fs::create_dir_all(&stuck).unwrap();
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(stuck.join("x"), b"1").unwrap();
+        fs::write(stuck.join("y"), b"2").unwrap();
+        chmod(&stuck, 0o555);
+        chmod(&locked, 0o000);
+        let before = failure_count();
+        let freed = rm_contents(&stuck) + rm_contents(&locked);
+        chmod(&stuck, 0o755);
+        chmod(&locked, 0o755);
+        println!("FREED={freed} NEW-FAILURES={}", failure_count() - before);
+        fs::remove_dir_all(&base).unwrap();
         println!("CHILD-RAN");
     }
 }

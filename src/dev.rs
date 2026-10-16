@@ -735,7 +735,11 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "ruby gems (old versions)" => {
             // `gem cleanup` removes old versions only \u2014 it never touches
             // currently required gems. Safe by design.
-            run_tool(c, "gem", &["cleanup"]);
+            if run_tool(c, "gem", &["cleanup"]) {
+                // The one line this cache gets: it has no size to report, and a
+                // cleanup that worked should not look like one that did not run.
+                utils::success(&format!("{}: cleaned (size not measured)", c.name));
+            }
             0 // gem cleanup doesn't report freed bytes in a parseable way
         }
 

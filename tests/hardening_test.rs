@@ -1362,3 +1362,138 @@ fn test_a_run_that_cannot_start_is_one_document_with_the_common_fields() {
     assert_eq!(doc["schema"], 1, "{doc}");
     sb.cleanup();
 }
+
+// ── Removing what cannot be removed as it stands ──
+
+fn running_as_root() -> bool {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("Uid:"))
+                .map(|ids| ids.split_whitespace().nth(1) == Some("0"))
+        })
+        .unwrap_or(false)
+}
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A tree like Go's module cache: nobody may write to its directories or files.
+fn read_only_tree(root: &Path) {
+    let deep = root.join("a/b/c");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("file"), vec![1u8; 32 * 1024]).unwrap();
+    chmod(&deep.join("file"), 0o444);
+    for dir in [deep, root.join("a/b"), root.join("a"), root.to_path_buf()] {
+        chmod(&dir, 0o555);
+    }
+}
+
+#[test]
+fn test_trash_holding_read_only_directories_is_emptied() {
+    let sb = Sandbox::new("trash_read_only");
+    let files = sb.home.join(".local/share/Trash/files");
+    read_only_tree(&files.join("old-checkout"));
+
+    let out = sb.oxiclean(&["--trash"]).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("Freed"), "{}", report(&out));
+    assert!(!stdout.contains("Could not"), "{}", report(&out));
+    assert_eq!(entries(&files), 0, "the trash is not empty");
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_trash_that_cannot_be_emptied_is_a_failure_that_says_so() {
+    if running_as_root() {
+        return; // root can remove anything
+    }
+    let sb = Sandbox::new("trash_stuck");
+    let files = sb.home.join(".local/share/Trash/files");
+    fs::create_dir_all(&files).unwrap();
+    fs::write(files.join("a"), vec![1u8; 4096]).unwrap();
+    fs::write(files.join("b"), vec![1u8; 4096]).unwrap();
+    // The entries of this directory cannot be unlinked.
+    chmod(&files, 0o555);
+
+    let out = sb.oxiclean(&["--trash"]).output().unwrap();
+    let json = sb.oxiclean(&["--trash", "--json"]).output().unwrap();
+    chmod(&files, 0o755);
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("Could not remove 2 of 2 item(s) in "),
+        "{}",
+        report(&out)
+    );
+    assert!(stdout.contains("ermission denied"), "{}", report(&out));
+    assert!(stdout.contains("1 error"), "{}", report(&out));
+    assert!(
+        !stdout.contains("Freed 0 B"),
+        "a success line for work that did not happen:\n{}",
+        report(&out)
+    );
+    assert_eq!(entries(&files), 2, "nothing was removed");
+
+    assert_eq!(json.status.code(), Some(1), "{}", report(&json));
+    let doc = one_document(&json);
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(doc["errors"][0]["operation"], "trash", "{doc}");
+    let message = doc["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("Could not remove 2 of 2"), "{doc}");
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_cache_holding_read_only_directories_is_cleaned() {
+    let sb = Sandbox::new("cache_read_only");
+    let cache = sb.home.join(".cache");
+    read_only_tree(&cache.join("some-app/go-mod"));
+    fs::write(cache.join("plain"), vec![1u8; 4096]).unwrap();
+
+    let out = sb.oxiclean(&["--cache", "--yes"]).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("Freed"), "{}", report(&out));
+    assert!(!stdout.contains("Could not"), "{}", report(&out));
+    assert_eq!(entries(&cache), 0, "the cache is not empty");
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_cache_that_cannot_be_cleaned_is_a_failure_that_says_so() {
+    if running_as_root() {
+        return; // root can remove anything
+    }
+    let sb = Sandbox::new("cache_stuck");
+    let cache = sb.home.join(".cache");
+    fs::create_dir_all(cache.join("app")).unwrap();
+    fs::write(cache.join("app/blob"), vec![1u8; 4096]).unwrap();
+    fs::write(cache.join("loose"), vec![1u8; 4096]).unwrap();
+    // The entries of ~/.cache cannot be unlinked.
+    chmod(&cache, 0o555);
+
+    let out = sb.oxiclean(&["--cache", "--yes"]).output().unwrap();
+    chmod(&cache, 0o755);
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("Could not remove 2 of 2 item(s) in "),
+        "{}",
+        report(&out)
+    );
+    assert!(!stdout.contains("Freed 0 B"), "{}", report(&out));
+    // Both entries are still there. What was inside `app` went, as it would
+    // for `rm -rf`, and the directory itself could not be unlinked.
+    assert!(cache.join("app").exists() && cache.join("loose").exists());
+    sb.cleanup();
+}

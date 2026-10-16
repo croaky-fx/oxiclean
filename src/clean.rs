@@ -692,19 +692,22 @@ pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: 
         return 0;
     }
 
-    let mut freed = 0u64;
+    let mut emptied = utils::Emptied::default();
     for (path, size, is_dir) in &sized {
-        let ok = if *is_dir {
-            std::fs::remove_dir_all(path).is_ok()
-        } else {
-            std::fs::remove_file(path).is_ok()
-        };
-        if ok {
-            freed += size;
-        }
+        emptied.add(path, *size, utils::remove_entry(path, *is_dir));
     }
-    utils::success(&format!("Freed {}", utils::format_size(freed).green()));
-    freed
+    if let Some(complaint) = emptied.complaint(&cache) {
+        utils::error(&complaint);
+    }
+    // "Freed 0 B" on top of that would be a success line for work that did not
+    // happen.
+    if emptied.freed > 0 || emptied.failed == 0 {
+        utils::success(&format!(
+            "Freed {}",
+            utils::format_size(emptied.freed).green()
+        ));
+    }
+    emptied.freed
 }
 
 pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
@@ -1799,6 +1802,7 @@ pub fn trash(dry_run: bool) -> u64 {
         return 0;
     }
 
+    let failures_before = utils::failure_count();
     let mut freed = 0u64;
     for dir in &trash_dirs {
         if dir.exists() {
@@ -1806,7 +1810,11 @@ pub fn trash(dry_run: bool) -> u64 {
         }
     }
 
-    utils::success(&format!("Freed {}", utils::format_size(freed).green()));
+    // `rm_contents` has reported what it could not remove; "Freed 0 B" on top of
+    // that would be a success line for work that did not happen.
+    if freed > 0 || utils::failure_count() == failures_before {
+        utils::success(&format!("Freed {}", utils::format_size(freed).green()));
+    }
     freed
 }
 
