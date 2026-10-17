@@ -1313,7 +1313,23 @@ fn prune_targets(h: &AurHelper, deep: bool) -> Vec<&'static str> {
 /// Clean a single helper and report its result. Split out so the per-helper
 /// loop above stays readable.
 fn clean_one_helper(h: &AurHelper, deep: bool, yes: bool) -> u64 {
+    if !helper_launchable(h, &utils::which_trusted) {
+        // Found on `$PATH`, which is how helpers are detected (so that their
+        // cache is spared elsewhere), but a command is only started from a
+        // system directory. Say so instead of reporting a failed `-Sc`.
+        utils::skip(&format!(
+            "{} is not in a system directory (/usr/bin and the like), so it is not run",
+            h.bin
+        ));
+        return 0;
+    }
     clean_helper_at(helper_cache_dir(h), h, deep, yes)
+}
+
+/// Whether the helper can be started: one that has a command of its own has to
+/// be found by `resolves`; one cleaned by hand (aura) is never started.
+fn helper_launchable(h: &AurHelper, resolves: &dyn Fn(&str) -> bool) -> bool {
+    h.clean.is_none() || resolves(h.bin)
 }
 
 /// [`clean_one_helper`] with the cache directory decided by the caller.
@@ -3060,6 +3076,28 @@ mod tests {
             "{err}"
         );
         assert!(helper_dir_in(CacheBase::Unknown, &aura).is_err());
+    }
+
+    #[test]
+    fn test_a_helper_is_run_only_where_it_can_be_started() {
+        let paru = crate::detect::AurHelper {
+            bin: "paru",
+            clean: Some(&["-Sc", "--noconfirm"]),
+            deep_clean: None,
+            prune_dirs: &[],
+            prune_dirs_deep: &[],
+        };
+        let aura = crate::detect::AurHelper {
+            bin: "aura",
+            clean: None,
+            deep_clean: None,
+            prune_dirs: &["builds"],
+            prune_dirs_deep: &[],
+        };
+        assert!(helper_launchable(&paru, &|name| name == "paru"));
+        assert!(!helper_launchable(&paru, &|_| false));
+        // A helper cleaned by hand is never started, so where it is does not matter.
+        assert!(helper_launchable(&aura, &|_| panic!("looked for aura")));
     }
 
     #[test]

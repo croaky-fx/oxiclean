@@ -37,6 +37,50 @@ const TRUSTED_BIN_DIRS: &[&str] = &[
     "/nix/var/nix/profiles/default/bin",
 ];
 
+/// NixOS keeps its tools where no other distribution does. The setuid wrappers
+/// (`sudo`, `doas`) are in `/run/wrappers/bin`, which is a tmpfs set up at
+/// boot, and everything else is reached through the system profile,
+/// `/run/current-system/sw/bin`, a link into the immutable store. Neither
+/// exists elsewhere, and neither is fixed by this list alone: they are used
+/// only where [`only_root_can_change`] holds for them right now, so a machine
+/// where one of them is something else (a directory that is not root's)
+/// simply does not get it.
+const NIXOS_WRAPPER_DIR: &str = "/run/wrappers/bin";
+const NIXOS_SYSTEM_DIR: &str = "/run/current-system/sw/bin";
+
+/// Whether a directory owned by `uid` with this `mode` can be changed by root
+/// alone: root's, and writable by neither its group nor everyone.
+fn only_root_can_change(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
+/// [`only_root_can_change`] for what `dir` is now. Links are followed, because
+/// `/run/current-system` is one; the directory they lead to is what counts.
+fn is_root_controlled(dir: &Path) -> bool {
+    fs::metadata(dir).is_ok_and(|m| m.is_dir() && only_root_can_change(m.uid(), m.mode()))
+}
+
+/// The directories a privileged command may come from, in search order:
+/// [`TRUSTED_BIN_DIRS`], with the NixOS ones added where `checked` accepts
+/// them. The wrappers come first, as they do in a NixOS `PATH`, so that the
+/// setuid `sudo` is the one found and not a plain copy of it further on.
+fn trusted_dirs_with(checked: &dyn Fn(&Path) -> bool) -> Vec<&'static str> {
+    let mut dirs = Vec::new();
+    if checked(Path::new(NIXOS_WRAPPER_DIR)) {
+        dirs.push(NIXOS_WRAPPER_DIR);
+    }
+    dirs.extend_from_slice(TRUSTED_BIN_DIRS);
+    if checked(Path::new(NIXOS_SYSTEM_DIR)) {
+        dirs.push(NIXOS_SYSTEM_DIR);
+    }
+    dirs
+}
+
+/// [`trusted_dirs_with`] for this machine.
+fn trusted_dirs() -> Vec<&'static str> {
+    trusted_dirs_with(&is_root_controlled)
+}
+
 /// Resolve `cmd` to an absolute path inside [`TRUSTED_BIN_DIRS`], ignoring
 /// `$PATH`. Returns `None` when it isn't there, which callers treat as "not
 /// available" — refusing beats running something unverified as root.
@@ -54,8 +98,12 @@ pub fn resolve_trusted(cmd: &str) -> Option<String> {
     if cmd.contains('/') {
         return None;
     }
-    TRUSTED_BIN_DIRS
-        .iter()
+    resolve_in(&trusted_dirs(), cmd)
+}
+
+/// The first of `dirs` that holds a file called `cmd`, as an absolute path.
+fn resolve_in(dirs: &[&str], cmd: &str) -> Option<String> {
+    dirs.iter()
         .map(|dir| Path::new(dir).join(cmd))
         .find(|p| p.is_file())
         .and_then(|p| p.to_str().map(|s| s.to_string()))
@@ -77,7 +125,7 @@ fn harden_env(cmd: &mut Command) -> &mut Command {
 /// The `PATH` handed to every child: [`TRUSTED_BIN_DIRS`] only. Public so the
 /// few call sites that build a `Command` directly can apply the same hardening.
 pub fn trusted_path() -> String {
-    TRUSTED_BIN_DIRS.join(":")
+    trusted_dirs().join(":")
 }
 
 /// Run a system tool with visible output (inherits stdio).
@@ -600,7 +648,7 @@ fn unavailable(
     cmd: &str,
     resolve: &dyn Fn(&str) -> Option<String>,
 ) -> String {
-    let dirs = TRUSTED_BIN_DIRS.join(", ");
+    let dirs = trusted_dirs().join(", ");
     match privilege {
         Privilege::None => "not run: not root, and neither sudo nor doas was found".to_string(),
         _ if resolve(cmd).is_none() => {
@@ -776,7 +824,7 @@ pub fn list_trusted(cmd: &str, args: &[&str], empty: WhenEmpty) -> Listing {
     let Some(target) = resolve_trusted(cmd) else {
         note(&format!(
             "{cmd} is not in a directory trusted for root ({})",
-            TRUSTED_BIN_DIRS.join(", ")
+            trusted_dirs().join(", ")
         ));
         return Listing::Failed;
     };
@@ -1421,6 +1469,119 @@ mod tests {
                 "{d} is a per-user Nix profile, which its owner can write to"
             );
         }
+    }
+
+    #[test]
+    fn test_only_a_directory_root_alone_can_change_is_trusted() {
+        // (owner, mode, trusted). The mode a stat reports carries the file
+        // type too; it must not matter.
+        let cases = [
+            (0, 0o755, true),
+            (0, 0o555, true),
+            (0, 0o700, true),
+            (0, 0o040_755, true),
+            (0, 0o775, false),
+            (0, 0o757, false),
+            (0, 0o777, false),
+            (0, 0o041_777, false),
+            (1000, 0o755, false),
+            (1000, 0o555, false),
+        ];
+        for (uid, mode, want) in cases {
+            assert_eq!(only_root_can_change(uid, mode), want, "uid {uid} {mode:o}");
+        }
+    }
+
+    #[test]
+    fn test_a_directory_is_judged_by_what_it_is_now() {
+        let base = scratch("root-controlled");
+        fs::write(base.join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink("/usr/bin", base.join("link-to-usr-bin")).unwrap();
+        std::os::unix::fs::symlink(&base, base.join("link-to-mine")).unwrap();
+
+        // A system directory, and a link that leads to one, as `/run/current-system` does.
+        assert!(is_root_controlled(Path::new("/usr/bin")));
+        assert!(is_root_controlled(&base.join("link-to-usr-bin")));
+        // Something that is not a directory, or is not there, never is, not
+        // even a file of root's.
+        assert!(!is_root_controlled(&base.join("file")));
+        if Path::new("/etc/passwd").is_file() {
+            assert!(!is_root_controlled(Path::new("/etc/passwd")));
+        }
+        assert!(!is_root_controlled(&base.join("missing")));
+        // The user's own directory, and a link to it, are not (root can be
+        // anyone's owner, so a test run as root cannot say).
+        if !is_root() {
+            assert!(!is_root_controlled(&base));
+            assert!(!is_root_controlled(&base.join("link-to-mine")));
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_the_nixos_directories_are_trusted_one_by_one_and_only_when_checked() {
+        use std::cell::RefCell;
+
+        // Nothing passes: the list is what it always was.
+        assert_eq!(trusted_dirs_with(&|_| false), TRUSTED_BIN_DIRS);
+
+        // Everything passes: the wrappers lead, as in a NixOS PATH, so the
+        // setuid `sudo` is found before any plain copy; the system profile ends.
+        let all = trusted_dirs_with(&|_| true);
+        assert_eq!(all.len(), TRUSTED_BIN_DIRS.len() + 2);
+        assert_eq!(all.first(), Some(&"/run/wrappers/bin"));
+        assert_eq!(all.last(), Some(&"/run/current-system/sw/bin"));
+        assert_eq!(&all[1..all.len() - 1], TRUSTED_BIN_DIRS);
+
+        // Each is judged on its own.
+        let wrappers = trusted_dirs_with(&|d| d == Path::new("/run/wrappers/bin"));
+        assert_eq!(wrappers.first(), Some(&"/run/wrappers/bin"));
+        assert!(!wrappers.contains(&"/run/current-system/sw/bin"));
+        let system = trusted_dirs_with(&|d| d == Path::new("/run/current-system/sw/bin"));
+        assert_eq!(system.last(), Some(&"/run/current-system/sw/bin"));
+        assert!(!system.contains(&"/run/wrappers/bin"));
+
+        // And only those two are ever put to the check: the standard
+        // directories are root's by convention on every distribution.
+        let asked = RefCell::new(Vec::new());
+        let _ = trusted_dirs_with(&|d| {
+            asked.borrow_mut().push(d.to_path_buf());
+            false
+        });
+        assert_eq!(
+            asked.into_inner(),
+            [
+                PathBuf::from("/run/wrappers/bin"),
+                PathBuf::from("/run/current-system/sw/bin")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_the_first_directory_that_has_the_command_wins() {
+        let base = scratch("resolve-in");
+        let (a, b) = (base.join("a"), base.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("tool"), b"x").unwrap();
+        }
+        fs::write(b.join("only-b"), b"x").unwrap();
+        let (sa, sb) = (a.to_str().unwrap(), b.to_str().unwrap());
+
+        assert_eq!(resolve_in(&[sa, sb], "tool"), Some(format!("{sa}/tool")));
+        assert_eq!(resolve_in(&[sb, sa], "tool"), Some(format!("{sb}/tool")));
+        assert_eq!(
+            resolve_in(&[sa, sb], "only-b"),
+            Some(format!("{sb}/only-b"))
+        );
+        assert_eq!(resolve_in(&[sa, sb], "nothing"), None);
+        assert_eq!(resolve_in(&[], "tool"), None);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_children_get_the_same_directories_the_lookup_uses() {
+        assert_eq!(trusted_path(), trusted_dirs().join(":"));
     }
 
     #[test]

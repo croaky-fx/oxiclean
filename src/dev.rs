@@ -248,11 +248,47 @@ fn ccache_dir_path() -> Root {
     home_join(".cache/ccache").map_or(Root::Absent, Root::Dir)
 }
 
-/// NuGet's global package cache (`~/.nuget/packages`). `dotnet nuget locals`
-/// honours `NUGET_PACKAGES`, but that is rarely set and the default location
-/// is overwhelmingly the one in use, so we report the default.
-fn nuget_cache_path() -> Option<PathBuf> {
-    home_join(".nuget/packages")
+/// A cache that the environment can move, found the way the tool finds it: its
+/// own variable first, then `$XDG_CACHE_HOME/<xdg_subdir>` for a tool that
+/// honours that (a relative one is invalid and ignored), and otherwise the
+/// default below `$HOME`.
+///
+/// `pip cache purge`, `composer clear-cache` and `dotnet nuget locals --clear`
+/// empty whatever the tool takes from its variable, so the value goes through
+/// [`roots::check`] like the others, and a refusal keeps the tool from being
+/// run at all (see [`scan_all`]). It also makes the scan look where the tool
+/// does: a relocated cache used to be reported as the empty default.
+fn relocatable_root(var: &str, xdg_subdir: Option<&str>, home_default: &str) -> Root {
+    if let Ok(val) = std::env::var(var) {
+        if !val.is_empty() {
+            return env_root(&format!("{var}={val}"), PathBuf::from(val));
+        }
+    }
+    if let Some(sub) = xdg_subdir {
+        if let Some(x) = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+        {
+            return env_root(&format!("XDG_CACHE_HOME={}", x.display()), x.join(sub));
+        }
+    }
+    home_join(home_default).map_or(Root::Absent, Root::Dir)
+}
+
+/// pip's cache: `PIP_CACHE_DIR`, else `$XDG_CACHE_HOME/pip`, else `~/.cache/pip`.
+fn pip_cache_path() -> Root {
+    relocatable_root("PIP_CACHE_DIR", Some("pip"), ".cache/pip")
+}
+
+/// Composer's cache: `COMPOSER_CACHE_DIR`, else `$XDG_CACHE_HOME/composer`, else
+/// `~/.cache/composer`.
+fn composer_cache_path() -> Root {
+    relocatable_root("COMPOSER_CACHE_DIR", Some("composer"), ".cache/composer")
+}
+
+/// NuGet's global package cache: `NUGET_PACKAGES`, else `~/.nuget/packages`.
+fn nuget_cache_path() -> Root {
+    relocatable_root("NUGET_PACKAGES", None, ".nuget/packages")
 }
 
 // ─── Scanners (read-only) ────────────────────────────
@@ -322,7 +358,7 @@ pub fn scan_all() -> Vec<DevCache> {
     }
 
     // ── Python ecosystem ──
-    if let Some(c) = scan_simple("pip", home_join(".cache/pip"), "safe") {
+    if let Some(c) = scan_simple("pip", reported(pip_cache_path()), "safe") {
         out.push(c);
     }
     if let Some(c) = scan_simple("uv", reported(uv_cache_path()), "safe") {
@@ -349,7 +385,7 @@ pub fn scan_all() -> Vec<DevCache> {
     }
 
     // ── .NET ──
-    if let Some(c) = scan_simple("nuget", nuget_cache_path(), "safe") {
+    if let Some(c) = scan_simple("nuget", reported(nuget_cache_path()), "safe") {
         out.push(c);
     }
 
@@ -407,7 +443,7 @@ pub fn scan_all() -> Vec<DevCache> {
 
     // ── PHP ──
     if utils::which("composer") {
-        if let Some(p) = home_join(".cache/composer") {
+        if let Some(p) = reported(composer_cache_path()) {
             if p.exists() {
                 let size = utils::dir_size(&p);
                 if size > 0 {
@@ -658,12 +694,14 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             if utils::which("pip") {
                 let before = c.size;
                 run_tool(c, "pip", &["cache", "purge"]);
-                let after = home_join(".cache/pip")
+                let after = pip_cache_path()
+                    .dir()
                     .map(|p| utils::dir_size(&p))
                     .unwrap_or(0);
                 before.saturating_sub(after)
             } else {
-                home_join(".cache/pip")
+                pip_cache_path()
+                    .dir()
                     .as_deref()
                     .map(clean_dir_contents)
                     .unwrap_or(0)
@@ -749,7 +787,8 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "composer" if utils::which("composer") => {
             let before = c.size;
             run_tool(c, "composer", &["clear-cache", "--no-interaction"]);
-            let after = home_join(".cache/composer")
+            let after = composer_cache_path()
+                .dir()
                 .map(|p| utils::dir_size(&p))
                 .unwrap_or(0);
             before.saturating_sub(after)
@@ -780,7 +819,10 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         "nuget" if utils::which("dotnet") => {
             let before = c.size;
             run_tool(c, "dotnet", &["nuget", "locals", "all", "--clear"]);
-            let after = nuget_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
+            let after = nuget_cache_path()
+                .dir()
+                .map(|p| utils::dir_size(&p))
+                .unwrap_or(0);
             before.saturating_sub(after)
         }
         "nuget" => 0,
@@ -1059,9 +1101,12 @@ mod tests {
     /// Guard the path shape.
     #[test]
     fn test_nuget_path_shape() {
-        if let Some(p) = nuget_cache_path() {
-            let s = p.to_string_lossy().to_string();
-            assert!(s.ends_with(".nuget/packages"), "unexpected nuget path: {s}");
+        // Only the default is a fixed shape; a relocated one is the user's.
+        if std::env::var_os("NUGET_PACKAGES").is_none() {
+            if let Some(p) = nuget_cache_path().dir() {
+                let s = p.to_string_lossy().to_string();
+                assert!(s.ends_with(".nuget/packages"), "unexpected nuget path: {s}");
+            }
         }
     }
 }

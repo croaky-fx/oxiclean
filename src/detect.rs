@@ -321,14 +321,16 @@ pub fn aur_helpers() -> Vec<AurHelper> {
         .collect()
 }
 
-/// Check if Flatpak is installed
+/// Check if Flatpak is installed, where it will be started from: flatpak is run
+/// through the system lookup, so one that only a user's `$PATH` reaches would be
+/// announced here and then fail on every step.
 pub fn has_flatpak() -> bool {
-    crate::utils::which("flatpak")
+    crate::utils::which_trusted("flatpak")
 }
 
-/// Check if Snap is installed
+/// Check if Snap is installed, on the same terms as [`has_flatpak`].
 pub fn has_snap() -> bool {
-    crate::utils::which("snap")
+    crate::utils::which_trusted("snap")
 }
 
 /// Check if Nix is installed (the /nix/store directory is the unambiguous marker)
@@ -939,5 +941,14 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
 /dev/sda5 /usrlocal ext4 ro 0 0
 ";
         assert_eq!(path_is_readonly_in(mounts, "/usr"), Some(false));
+    }
+
+    #[test]
+    fn test_flatpak_and_snap_are_announced_only_where_they_will_be_started() {
+        assert_eq!(
+            has_flatpak(),
+            crate::utils::resolve_trusted("flatpak").is_some()
+        );
+        assert_eq!(has_snap(), crate::utils::resolve_trusted("snap").is_some());
     }
 }

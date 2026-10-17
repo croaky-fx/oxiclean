@@ -818,6 +818,9 @@ fn test_tools_are_never_asked_to_clean_a_directory_that_is_not_a_cache() {
     let cases = [
         ("go", "GOMODCACHE", "clean -modcache"),
         ("ccache", "CCACHE_DIR", "-C"),
+        ("pip", "PIP_CACHE_DIR", "cache purge"),
+        ("composer", "COMPOSER_CACHE_DIR", "clear-cache"),
+        ("dotnet", "NUGET_PACKAGES", "nuget locals"),
     ];
     for (tool, var, call) in cases {
         let sb = Sandbox::new("tool_home");
@@ -852,6 +855,17 @@ fn test_ordinary_environment_settings_still_work() {
     fake_logger(&sb, "go");
     fake_uv(&sb, &uv, &WELL_BEHAVED);
 
+    // The Python, PHP and .NET caches move the same way.
+    let pip = sb.root.join("pipcache");
+    let composer = sb.root.join("composercache");
+    let nuget = sb.root.join("nugetpkgs");
+    for dir in [&pip, &composer, &nuget] {
+        fill_cache(dir);
+    }
+    for tool in ["pip", "composer", "dotnet"] {
+        fake_logger(&sb, tool);
+    }
+
     // GOPATH is a list; the first entry owns the module cache.
     let gopath = format!(
         "{}:{}",
@@ -862,6 +876,9 @@ fn test_ordinary_environment_settings_still_work() {
         .oxiclean(&["--dev", "--yes", "--deep"])
         .env("GOPATH", gopath)
         .env("UV_CACHE_DIR", &uv)
+        .env("PIP_CACHE_DIR", &pip)
+        .env("COMPOSER_CACHE_DIR", &composer)
+        .env("NUGET_PACKAGES", &nuget)
         .output()
         .unwrap();
 
@@ -871,6 +888,17 @@ fn test_ordinary_environment_settings_still_work() {
         "{calls}\n{}",
         report(&out)
     );
+    for call in [
+        "pip cache purge",
+        "composer clear-cache",
+        "dotnet nuget locals all --clear",
+    ] {
+        assert!(
+            calls.contains(call),
+            "{call} not run:\n{calls}\n{}",
+            report(&out)
+        );
+    }
     assert!(calls.contains("cache clean"), "{calls}\n{}", report(&out));
     assert!(
         !text(&out.stdout).contains("Not cleaning"),
@@ -1495,5 +1523,57 @@ fn test_a_cache_that_cannot_be_cleaned_is_a_failure_that_says_so() {
     // Both entries are still there. What was inside `app` went, as it would
     // for `rm -rf`, and the directory itself could not be unlinked.
     assert!(cache.join("app").exists() && cache.join("loose").exists());
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_relocated_pip_cache_is_found_where_pip_keeps_it() {
+    // With XDG_CACHE_HOME set, pip's cache is $XDG_CACHE_HOME/pip, not
+    // ~/.cache/pip, which used to be the only place looked at: the cache was
+    // never reported and pip's own purge was never asked for.
+    let sb = Sandbox::new("pip_xdg");
+    let xdg = sb.root.join("xdg-cache");
+    fill_cache(&xdg.join("pip"));
+    fake_logger(&sb, "pip");
+
+    let out = sb
+        .oxiclean(&["--dev", "--yes"])
+        .env("XDG_CACHE_HOME", &xdg)
+        .output()
+        .unwrap();
+
+    assert!(
+        sb.calls().contains("pip cache purge"),
+        "{}\n{}",
+        sb.calls(),
+        report(&out)
+    );
+    assert!(
+        !text(&out.stdout).contains("Not cleaning"),
+        "{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_pip_variable_that_names_home_is_refused_in_the_report() {
+    let sb = Sandbox::new("pip_home");
+    let precious = precious_files(&sb);
+    fake_logger(&sb, "pip");
+
+    let out = sb
+        .oxiclean(&["--dev", "--yes"])
+        .env("PIP_CACHE_DIR", &sb.home)
+        .output()
+        .unwrap();
+
+    assert!(survive(&precious), "{}", report(&out));
+    assert!(
+        text(&out.stdout).contains("Not cleaning PIP_CACHE_DIR="),
+        "{}",
+        report(&out)
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
     sb.cleanup();
 }
