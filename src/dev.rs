@@ -931,7 +931,10 @@ mod tests {
         fs::write(dir.join("a"), b"hello world").unwrap();
         let c = scan_simple("real", Some(dir.clone()), "safe").expect("expected Some");
         assert_eq!(c.name, "real");
-        assert_eq!(c.size, 11);
+        // What the file occupies on disk (a block, not its eleven bytes).
+        let on_disk = utils::allocated(&fs::metadata(dir.join("a")).unwrap());
+        assert!(on_disk > 0);
+        assert_eq!(c.size, on_disk);
         assert!(!c.needs_redownload);
         let _ = fs::remove_dir_all(&dir);
     }

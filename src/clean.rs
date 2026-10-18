@@ -543,9 +543,8 @@ fn partition_cache_entries(cache_dir: &Path, protected: &[String]) -> (Vec<PathB
 /// path three times per entry.
 fn entry_size(p: &Path) -> u64 {
     match std::fs::symlink_metadata(p) {
-        Ok(md) if md.is_symlink() => md.len(),
         Ok(md) if md.is_dir() => utils::dir_size(p),
-        Ok(md) => md.len(),
+        Ok(md) => utils::footprint_of(&md),
         Err(_) => 0,
     }
 }
@@ -1949,7 +1948,7 @@ fn apport_report_size(dir: &Path) -> u64 {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() && !p.is_symlink() {
-                total += p.metadata().map(|m| m.len()).unwrap_or(0);
+                total += utils::dir_size(&p);
             }
         }
     }
@@ -3136,6 +3135,47 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn test_what_an_entry_frees_is_what_it_occupies_and_not_what_stays() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let base = cache_scratch("entry-size");
+        let data = |n: u32| -> Vec<u8> {
+            (0..n)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect()
+        };
+        let md = |p: &Path| fs::symlink_metadata(p).unwrap();
+
+        // A file: its blocks, which is not its length.
+        fs::write(base.join("file"), data(70_000)).unwrap();
+        let file = utils::allocated(&md(&base.join("file")));
+        assert_eq!(entry_size(&base.join("file")), file);
+        assert_ne!(file, 70_000);
+
+        // A directory: what is in it, and nothing for itself.
+        fs::create_dir_all(base.join("dir/sub")).unwrap();
+        fs::write(base.join("dir/sub/inner"), data(70_000)).unwrap();
+        assert_eq!(
+            entry_size(&base.join("dir")),
+            utils::allocated(&md(&base.join("dir/sub/inner")))
+        );
+
+        // A link frees its own entry, never what it leads to.
+        symlink(base.join("file"), base.join("link")).unwrap();
+        assert_eq!(
+            entry_size(&base.join("link")),
+            utils::allocated(&md(&base.join("link")))
+        );
+        assert!(entry_size(&base.join("link")) < 70_000);
+
+        // A file with another name stays on disk when this one goes.
+        fs::hard_link(base.join("file"), base.join("twin")).unwrap();
+        assert_eq!(entry_size(&base.join("twin")), 0);
+        assert_eq!(entry_size(&base.join("missing")), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // ── Apport: measure only flat report files, never kdump subdirs ──
 
     #[test]
@@ -3152,10 +3192,17 @@ mod tests {
         fs::create_dir_all(base.join("202607091200")).unwrap();
         fs::write(base.join("202607091200/vmcore"), vec![0u8; 100_000]).unwrap();
 
+        let on_disk = |name: &str| utils::allocated(&fs::metadata(base.join(name)).unwrap());
+        let reports = on_disk("_usr_bin_foo.1000.crash") + on_disk("_usr_bin_bar.1000.uploaded");
+        assert!(reports > 0);
         assert_eq!(
             apport_report_size(&base),
-            150,
-            "only the two flat report files (100+50) count; the vmcore subdir is excluded"
+            reports,
+            "only the two flat report files count; the vmcore subdir is excluded"
+        );
+        assert!(
+            on_disk("202607091200/vmcore") > reports,
+            "the fixture is lopsided"
         );
 
         let _ = fs::remove_dir_all(&base);

@@ -954,7 +954,78 @@ pub fn acquire_sudo() -> bool {
 //  File Operations
 // ═══════════════════════════════════════════════════
 
-/// Recursively calculate directory size, skipping symlinks.
+/// What a file occupies on disk: the blocks its filesystem gave it (`st_blocks`,
+/// always counted in 512-byte units), not the length of what it holds.
+///
+/// The two differ both ways. A sparse file, or one the filesystem compresses,
+/// takes less than its length, and a small file takes a whole block. Everything
+/// reported as freed is about the disk, so this is the one that counts, as it
+/// is for `du`. (On a filesystem that shares extents between files, a snapshot
+/// or a reflink, it is still an upper bound: what another file shares stays.)
+pub fn allocated(md: &fs::Metadata) -> u64 {
+    md.blocks().saturating_mul(512)
+}
+
+/// What removing a set of files frees: their [`allocated`] blocks, except that a
+/// file with more than one name frees nothing until its last name is gone. Only
+/// files are added (a directory's own count of links is its subdirectories). So
+/// such a file counts once, and only when every one of its names is in the set;
+/// a pnpm store whose files are also linked into projects is worth nothing
+/// until those projects go, and says so.
+#[derive(Default)]
+struct Footprint {
+    /// Files with a single name.
+    whole: u64,
+    /// Files with several, by device and inode.
+    shared: std::collections::HashMap<(u64, u64), Shared>,
+}
+
+struct Shared {
+    bytes: u64,
+    /// Names the filesystem says it has, and names met so far.
+    links: u64,
+    seen: u64,
+}
+
+impl Footprint {
+    fn add(&mut self, md: &fs::Metadata) {
+        let bytes = allocated(md);
+        if md.nlink() <= 1 {
+            self.whole += bytes;
+            return;
+        }
+        let entry = self.shared.entry((md.dev(), md.ino())).or_insert(Shared {
+            bytes,
+            links: md.nlink(),
+            seen: 0,
+        });
+        entry.seen += 1;
+    }
+
+    fn total(&self) -> u64 {
+        self.whole
+            + self
+                .shared
+                .values()
+                .filter(|f| f.seen >= f.links)
+                .map(|f| f.bytes)
+                .sum::<u64>()
+    }
+}
+
+/// What removing the one directory entry described by `md` frees (see
+/// [`Footprint`]): for a file, its blocks when it has no other name. A directory
+/// is [`dir_size`]'s business, and a link is its own few bytes.
+pub fn footprint_of(md: &fs::Metadata) -> u64 {
+    let mut footprint = Footprint::default();
+    footprint.add(md);
+    footprint.total()
+}
+
+/// What removing `path` frees: the disk space ([`allocated`]) of the files in
+/// it, skipping symlinks, with the rule for files that have other names (see
+/// [`Footprint`]). Directories are not counted, so a tree of empty directories
+/// is 0, as "nothing to clean" needs.
 ///
 /// Reads type and size from the `DirEntry` the directory scan already produced.
 /// The `is_symlink()` / `is_dir()` / `metadata()` chain this replaced re-resolved
@@ -970,11 +1041,12 @@ pub fn dir_size(path: &Path) -> u64 {
     if top.is_symlink() {
         return 0;
     }
+    let mut footprint = Footprint::default();
     if !top.is_dir() {
-        return top.len();
+        footprint.add(&top);
+        return footprint.total();
     }
 
-    let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -990,11 +1062,11 @@ pub fn dir_size(path: &Path) -> u64 {
             if ft.is_dir() {
                 stack.push(entry.path());
             } else if let Ok(md) = entry.metadata() {
-                total += md.len();
+                footprint.add(&md);
             }
         }
     }
-    total
+    footprint.total()
 }
 
 /// What emptying a directory came to.
@@ -1164,7 +1236,11 @@ fn empty_dir(path: &Path) -> io::Result<Emptied> {
             }
         };
         let is_real_dir = md.is_dir() && !md.is_symlink();
-        let size = if is_real_dir { dir_size(&p) } else { md.len() };
+        let size = if is_real_dir {
+            dir_size(&p)
+        } else {
+            footprint_of(&md)
+        };
         emptied.add(&p, size, remove_entry(&p, is_real_dir));
     }
     Ok(emptied)
@@ -1733,16 +1809,34 @@ mod tests {
         let _ = fs::remove_dir_all(&test_dir);
     }
 
+    /// `len` bytes that no filesystem can compress or share, so that a size
+    /// means the same on every one of them (a cheap xorshift stream).
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ len as u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// What the filesystem says `path` occupies.
+    fn on_disk(path: &Path) -> u64 {
+        allocated(&fs::symlink_metadata(path).unwrap())
+    }
+
     #[test]
     fn test_dir_size_and_rm_handle_symlinks() {
-        // dir_size and rm_contents were rewritten to take type and size from the
-        // DirEntry rather than re-stat each path. The subtle part is that
-        // DirEntry::metadata is an lstat: it must report the *link*, never follow
-        // it. Getting that wrong would count a symlink target's bytes (inflating
-        // the freed figure) or, worse, descend out of the tree being cleaned.
+        // dir_size and rm_contents take type and size from the DirEntry rather
+        // than re-stat each path. The subtle part is that DirEntry::metadata is
+        // an lstat: it must report the *link*, never follow it. Getting that
+        // wrong would count a symlink target's bytes (inflating the freed
+        // figure) or, worse, descend out of the tree being cleaned.
         use std::os::unix::fs::symlink;
-        let base = std::env::temp_dir().join(format!("oxi_lnk_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
+        let base = scratch("lnk");
 
         let outside = base.join("outside");
         let tree = base.join("tree");
@@ -1750,35 +1844,37 @@ mod tests {
         fs::create_dir_all(tree.join("sub")).unwrap();
 
         // A big file OUTSIDE the tree, and a big directory outside it.
-        fs::write(outside.join("big.bin"), vec![0u8; 100_000]).unwrap();
-        // Real content inside the tree: 500 + 300 bytes.
-        fs::write(tree.join("real.txt"), vec![0u8; 500]).unwrap();
-        fs::write(tree.join("sub/inner.txt"), vec![0u8; 300]).unwrap();
+        fs::write(outside.join("big.bin"), noise(1 << 20)).unwrap();
+        // Real content inside the tree.
+        fs::write(tree.join("real.bin"), noise(64 << 10)).unwrap();
+        fs::write(tree.join("sub/inner.bin"), noise(48 << 10)).unwrap();
+        let real = on_disk(&tree.join("real.bin")) + on_disk(&tree.join("sub/inner.bin"));
         // Links that must contribute their own (tiny) size, never the target's.
         symlink(outside.join("big.bin"), tree.join("link_to_big")).unwrap();
         symlink(&outside, tree.join("link_to_dir")).unwrap();
         symlink("/nonexistent/xyz", tree.join("broken")).unwrap();
 
-        // 800 bytes of real content. Symlinks are skipped entirely by dir_size,
-        // and the 100 KB target must not be counted through either link.
+        // The real content only: symlinks are skipped by dir_size, and the
+        // megabyte they lead to is not counted through either of them.
         assert_eq!(
             dir_size(&tree),
-            800,
+            real,
             "symlinks must be skipped and never followed"
         );
 
         let freed = rm_contents(&tree);
         assert!(tree.is_dir(), "the directory itself must survive");
         assert_eq!(dir_size(&tree), 0, "contents must be gone");
-        // The link target must still exist — we unlinked the links, not the files.
+        // The link target must still exist: we unlinked the links, not the files.
         assert!(
             outside.join("big.bin").is_file(),
             "rm_contents followed a symlink and deleted outside the tree"
         );
-        // Freed counts the real bytes plus the links' own entries, never 100 KB.
+        // Freed is the real content, plus at most a block for each link's own
+        // entry (a filesystem may give a long link target one); never the megabyte.
         assert!(
-            (800..2_000).contains(&freed),
-            "freed should be ~800 B of real content, got {freed}"
+            (real..real + 3 * 4096 + 1).contains(&freed),
+            "freed should be about {real}, got {freed}"
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -1788,17 +1884,141 @@ mod tests {
     fn test_dir_size_on_a_symlink_is_zero() {
         // A symlink handed in directly must report 0, not the target's size.
         use std::os::unix::fs::symlink;
-        let base = std::env::temp_dir().join(format!("oxi_lnktop_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        fs::write(base.join("target.bin"), vec![0u8; 50_000]).unwrap();
+        let base = scratch("lnktop");
+        fs::write(base.join("target.bin"), noise(50_000)).unwrap();
         let link = base.join("thelink");
         symlink(base.join("target.bin"), &link).unwrap();
 
         assert_eq!(dir_size(&link), 0);
-        assert_eq!(dir_size(&base.join("target.bin")), 50_000);
+        let target = dir_size(&base.join("target.bin"));
+        assert_eq!(target, on_disk(&base.join("target.bin")));
+        assert!(target >= 50_000, "{target}");
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_a_file_counts_what_it_occupies_on_disk() {
+        let base = scratch("on-disk");
+        // A small file takes a block, not its length.
+        fs::write(base.join("small"), b"x").unwrap();
+        let small = dir_size(&base.join("small"));
+        assert_eq!(small, on_disk(&base.join("small")));
+        assert!(small >= 512, "{small}");
+        // In whole blocks, and in the right unit: 70 000 bytes of noise take
+        // 70 000 rounded up to a block, give or take what a filesystem adds.
+        fs::write(base.join("big"), noise(70_000)).unwrap();
+        let big = dir_size(&base.join("big"));
+        assert!((70_000..70_000 + 16_384).contains(&big), "{big}");
+
+        // A sparse file takes what was written, not what it spans.
+        let sparse = base.join("sparse");
+        let file = fs::File::create(&sparse).unwrap();
+        file.set_len(8 << 20).unwrap();
+        drop(file);
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut f = fs::OpenOptions::new().write(true).open(&sparse).unwrap();
+            f.seek(SeekFrom::Start(4 << 20)).unwrap();
+            f.write_all(&noise(4096)).unwrap();
+        }
+        let span = fs::metadata(&sparse).unwrap().len();
+        let used = dir_size(&sparse);
+        assert_eq!(used, on_disk(&sparse));
+        // (A filesystem that cannot make holes would give the span back.)
+        if used < span {
+            assert!(used < 1 << 20, "a sparse file counted as {used} of {span}");
+        }
+        // Inside a tree it is the same.
+        fs::create_dir(base.join("tree")).unwrap();
+        fs::rename(&sparse, base.join("tree/sparse")).unwrap();
+        assert_eq!(dir_size(&base.join("tree")), used);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_empty_directories_are_not_something_to_clean() {
+        // "Nothing to clean" is a size of 0; the blocks a directory itself
+        // occupies must not turn an empty skeleton into one.
+        let base = scratch("skeleton");
+        fs::create_dir_all(base.join("a/b/c")).unwrap();
+        fs::create_dir_all(base.join("d")).unwrap();
+        assert_eq!(dir_size(&base), 0);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_file_with_two_names_counts_once_and_only_when_both_are_going() {
+        let base = scratch("links");
+        let tree = base.join("tree");
+        let outside = base.join("outside");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // Both names in the tree: counted once, at its size.
+        fs::write(tree.join("a"), noise(64 << 10)).unwrap();
+        fs::hard_link(tree.join("a"), tree.join("sub/a2")).unwrap();
+        let a = on_disk(&tree.join("a"));
+        assert!(a >= 64 << 10);
+        assert_eq!(dir_size(&tree), a, "two names of one file are one file");
+
+        // A name outside the tree: removing the tree frees nothing for it.
+        fs::write(outside.join("x"), noise(64 << 10)).unwrap();
+        fs::hard_link(outside.join("x"), tree.join("x-in-tree")).unwrap();
+        assert_eq!(dir_size(&tree), a, "a file that stays is not freed");
+        assert_eq!(dir_size(&tree.join("x-in-tree")), 0);
+
+        // Three names, two of them in the tree and one outside: it stays.
+        fs::write(outside.join("y"), noise(64 << 10)).unwrap();
+        fs::hard_link(outside.join("y"), tree.join("y1")).unwrap();
+        fs::hard_link(outside.join("y"), tree.join("sub/y2")).unwrap();
+        assert_eq!(dir_size(&tree), a);
+
+        // And the file without other names is counted in full beside them.
+        fs::write(tree.join("z"), noise(32 << 10)).unwrap();
+        assert_eq!(dir_size(&tree), a + on_disk(&tree.join("z")));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_emptying_a_directory_frees_nothing_for_a_file_that_stays() {
+        let base = scratch("links-rm");
+        let tree = base.join("tree");
+        let outside = base.join("outside");
+        fs::create_dir_all(&tree).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // Sizes that are not a multiple of a block, so that a length is not
+        // mistaken for what the file occupies.
+        fs::write(outside.join("shared"), noise(70_000)).unwrap();
+        fs::hard_link(outside.join("shared"), tree.join("shared")).unwrap();
+        fs::write(tree.join("own"), noise(70_001)).unwrap();
+        let own = on_disk(&tree.join("own"));
+
+        let freed = rm_contents(&tree);
+
+        assert_eq!(freed, own, "only the file that had no other name was freed");
+        // The data is still there, under its other name.
+        assert_eq!(fs::read(outside.join("shared")).unwrap(), noise(70_000));
+        // Under that name alone it is now the file's to free.
+        let md = fs::symlink_metadata(outside.join("shared")).unwrap();
+        assert_eq!(footprint_of(&md), on_disk(&outside.join("shared")));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_what_one_entry_frees_is_its_blocks_unless_it_has_another_name() {
+        let base = scratch("footprint");
+        fs::write(base.join("one"), noise(64 << 10)).unwrap();
+        let alone = footprint_of(&fs::symlink_metadata(base.join("one")).unwrap());
+        assert_eq!(alone, on_disk(&base.join("one")));
+        assert!(alone >= 64 << 10);
+
+        fs::hard_link(base.join("one"), base.join("two")).unwrap();
+        for name in ["one", "two"] {
+            let md = fs::symlink_metadata(base.join(name)).unwrap();
+            assert_eq!(footprint_of(&md), 0, "{name} has another name");
+        }
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
