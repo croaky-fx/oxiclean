@@ -171,32 +171,14 @@ fn signed_version(trusted_comment: &str) -> Option<String> {
     strict_version(trusted_comment.strip_prefix("oxiclean ")?)
 }
 
-/// Characters that make a terminal do something other than show text, or show
-/// text as something it is not: every control character (ESC begins the escape
-/// sequences, and the C1 range holds the one-byte CSI), the bidirectional
-/// overrides and isolates behind "Trojan Source", the line/paragraph
-/// separators and the byte-order mark.
-fn is_terminal_hazard(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{061C}'
-                | '\u{200E}'
-                | '\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
-}
-
 /// One line of text from the network, safe to print: tabs become spaces and
-/// everything in [`is_terminal_hazard`] disappears. Release notes are free text
+/// everything in [`utils::is_terminal_hazard`] disappears. Release notes are free text
 /// from an API; without this a hostile one could repaint the screen or move the
 /// cursor over the prompt that asks for consent.
 fn sanitize_line(line: &str) -> String {
     line.chars()
         .map(|c| if c == '\t' { ' ' } else { c })
-        .filter(|c| !is_terminal_hazard(*c))
+        .filter(|c| !utils::is_terminal_hazard(*c))
         .collect()
 }
 
@@ -2018,7 +2000,7 @@ QWB3lB28Rlqbw8YxEaH8xtlW2WEE6Z+KYzefvA3vlrrZwVuc1l4hUsI8GtC1krZdGHOIXZFzbIyUgWBV
             let Err(UpdateError::BadTag(shown)) = &r else {
                 panic!("{tag:?}: {r:?}")
             };
-            assert!(!shown.chars().any(is_terminal_hazard), "{shown:?}");
+            assert!(!shown.chars().any(utils::is_terminal_hazard), "{shown:?}");
             assert_eq!(net.asked(), [API.to_string()], "{tag:?}");
         }
     }

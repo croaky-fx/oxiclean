@@ -1,4 +1,5 @@
 use colored::Colorize;
+use std::borrow::Cow;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -342,7 +343,7 @@ fn replay_stderr(stderr: &[u8]) {
     }
     let text = String::from_utf8_lossy(stderr);
     for line in text.lines().filter(|l| !l.trim().is_empty()).take(5) {
-        println!("      {}", line.dimmed());
+        println!("      {}", shown(line).dimmed());
     }
 }
 
@@ -631,7 +632,7 @@ fn note(msg: &str) {
     if silent() {
         return;
     }
-    println!("      {}", msg.dimmed());
+    println!("      {}", shown(msg).dimmed());
 }
 
 /// Say why a privileged command was not even started. Without this a `false`
@@ -1305,7 +1306,7 @@ pub fn confirm(msg: &str) -> bool {
     if silent() {
         return false;
     }
-    print!("  {} {} ", "?".cyan().bold(), msg);
+    print!("  {} {} ", "?".cyan().bold(), shown(msg));
     io::stdout().flush().ok();
     let mut input = String::new();
     io::stdin().read_line(&mut input).ok();
@@ -1315,6 +1316,74 @@ pub fn confirm(msg: &str) -> bool {
 // ═══════════════════════════════════════════════════
 //  UI Helpers
 // ═══════════════════════════════════════════════════
+
+/// Characters that make a terminal do something other than show text, or show
+/// text as something it is not: every control character (ESC begins the escape
+/// sequences, and the C1 range holds the one-byte CSI), the bidirectional
+/// overrides and isolates behind "Trojan Source", the line/paragraph
+/// separators and the byte-order mark.
+pub fn is_terminal_hazard(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// Text from outside, made safe to print: whatever a terminal would act on is
+/// shown as the escape that names it (`\u{1b}`, `\n`), so the reader sees what
+/// is there and the terminal does nothing about it.
+///
+/// File names are the reason. Linux allows any byte in one but `/` and NUL, so
+/// a file in a cache can be called ESC `[2J` (clear the screen), ESC `]0;...`
+/// BEL (retitle the window), or a name, a newline and `✔ Freed 4 GB` (a line
+/// that looks like one of ours); and a tool's complaint, replayed under a
+/// failure, can quote such a name. Every helper that prints a message passes it
+/// through here, so what builds a message does not have to remember to.
+///
+/// One thing is let through: a color sequence, ESC `[`, digits and `;`, `m`,
+/// which is what `colored` writes into our own messages. Text that carries one
+/// can change colors and nothing else.
+pub fn shown(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(is_terminal_hazard) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c == '\u{1b}' {
+            if let Some(len) = color_sequence_len(rest) {
+                out.push_str(&rest[..len]);
+                rest = &rest[len..];
+                continue;
+            }
+        }
+        if is_terminal_hazard(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    Cow::Owned(out)
+}
+
+/// The length of the color sequence at the start of `s`, if there is one: ESC
+/// `[`, up to 64 digits and semicolons, `m`. Anything longer is not a color
+/// `colored` would write, and is not let through as one.
+fn color_sequence_len(s: &str) -> Option<usize> {
+    let params = s.strip_prefix("\u{1b}[")?;
+    let n = params
+        .bytes()
+        .take_while(|b| b.is_ascii_digit() || *b == b';')
+        .count();
+    (n <= 64 && params.as_bytes().get(n) == Some(&b'm')).then_some(2 + n + 1)
+}
 
 pub fn banner(version: &str) {
     if is_quiet() || silent() {
@@ -1348,14 +1417,14 @@ pub fn section(title: &str) {
         return;
     }
     println!();
-    println!("  {} {}", "━━▶".cyan().bold(), title.white().bold());
+    println!("  {} {}", "━━▶".cyan().bold(), shown(title).white().bold());
 }
 
 pub fn success(msg: &str) {
     if silent() {
         return;
     }
-    println!("    {} {}", "✔".green().bold(), msg);
+    println!("    {} {}", "✔".green().bold(), shown(msg));
 }
 
 /// Whether a cleanup that freed `freed` bytes ends with a "Freed …" line.
@@ -1382,7 +1451,7 @@ pub fn warning(msg: &str) {
     if silent() {
         return;
     }
-    println!("    {} {}", "⚠".yellow().bold(), msg);
+    println!("    {} {}", "⚠".yellow().bold(), shown(msg));
 }
 
 /// What went wrong in this run, so the exit status and the `--json` report can
@@ -1450,7 +1519,7 @@ pub fn error(msg: &str) {
     if silent() {
         return;
     }
-    println!("    {} {}", "✘".red().bold(), msg);
+    println!("    {} {}", "✘".red().bold(), shown(msg));
 }
 
 /// Informational line. Suppressed by `--quiet` (noisiest lines) and by JSON
@@ -1459,7 +1528,7 @@ pub fn info(msg: &str) {
     if is_quiet() || silent() {
         return;
     }
-    println!("    {} {}", "ℹ".blue(), msg);
+    println!("    {} {}", "ℹ".blue(), shown(msg));
 }
 
 /// "Skipped" line. Suppressed by `--quiet` and JSON mode; nothing to act on.
@@ -1467,7 +1536,7 @@ pub fn skip(msg: &str) {
     if is_quiet() || silent() {
         return;
     }
-    println!("    {} {}", "⊘".dimmed(), msg.dimmed());
+    println!("    {} {}", "⊘".dimmed(), shown(msg).dimmed());
 }
 
 /// A line of report content with no marker of its own: a table row, a package
@@ -1482,7 +1551,7 @@ pub fn plain(msg: &str) {
     if silent() {
         return;
     }
-    println!("{msg}");
+    println!("{}", shown(msg));
 }
 
 #[cfg(test)]
@@ -2717,6 +2786,155 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Text from outside ──
+
+    #[test]
+    fn test_ordinary_text_is_shown_as_it_is() {
+        for text in [
+            "",
+            "plain ascii: /home/me/.cache/pip (3 items)",
+            "héllo wörld — ✔ ⚠ ✘",
+            "مرحبا بالعالم",
+            "日本語のファイル名.txt",
+            "emoji 📋 and a joiner 👩‍💻",
+        ] {
+            assert!(
+                matches!(shown(text), Cow::Borrowed(_)),
+                "{text:?} was copied"
+            );
+            assert_eq!(shown(text), text);
+        }
+    }
+
+    #[test]
+    fn test_what_a_terminal_would_act_on_is_spelled_out_instead() {
+        let cases = [
+            // Cursor movement and "clear the screen".
+            ("a\u{1b}[2Jb", r"a\u{1b}[2Jb"),
+            ("a\u{1b}[1;31Hb", r"a\u{1b}[1;31Hb"),
+            // OSC: window title, clipboard, hyperlinks.
+            ("x\u{1b}]0;pwned\u{7}y", r"x\u{1b}]0;pwned\u{7}y"),
+            // The one-byte CSI of the C1 range.
+            ("x\u{9b}2Jy", r"x\u{9b}2Jy"),
+            // A name that starts a line that looks like ours.
+            ("n\n    ✔ Freed 9 GB", r"n\n    ✔ Freed 9 GB"),
+            ("a\rb", r"a\rb"),
+            ("a\tb", r"a\tb"),
+            ("a\u{7f}b\0c", r"a\u{7f}b\u{0}c"),
+            // Text that reads backwards, or is not there.
+            ("gnp.\u{202e}exe", r"gnp.\u{202e}exe"),
+            ("a\u{2067}b\u{2069}", r"a\u{2067}b\u{2069}"),
+            ("\u{feff}x", r"\u{feff}x"),
+            ("a\u{2028}b", r"a\u{2028}b"),
+        ];
+        for (hostile, expected) in cases {
+            assert_eq!(shown(hostile), expected, "{hostile:?}");
+            assert!(
+                !shown(hostile).chars().any(is_terminal_hazard),
+                "{hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_our_own_colors_pass_and_nothing_that_looks_like_them_does() {
+        // What `colored` writes into our messages.
+        for ours in [
+            "\u{1b}[32mgreen\u{1b}[0m",
+            "\u{1b}[1;32mbold green\u{1b}[0m",
+            "\u{1b}[2mdim\u{1b}[0m",
+            "\u{1b}[m",
+            "\u{1b}[38;2;10;20;30mtruecolor\u{1b}[0m",
+        ] {
+            assert_eq!(shown(ours), ours);
+        }
+        // Close, and not colors.
+        for (hostile, expected) in [
+            ("\u{1b}[2J", r"\u{1b}[2J"),
+            ("\u{1b}[?25l", r"\u{1b}[?25l"),
+            ("\u{1b}[31", r"\u{1b}[31"),
+            ("\u{1b}[3 1m", r"\u{1b}[3 1m"),
+            ("\u{1b}[38:2::1:2:3m", r"\u{1b}[38:2::1:2:3m"),
+            ("\u{1b}[", r"\u{1b}["),
+            ("\u{1b}", r"\u{1b}"),
+        ] {
+            assert_eq!(shown(hostile), expected, "{hostile:?}");
+        }
+        // Too long to be one.
+        let long = format!("\u{1b}[{}m", "1;".repeat(40));
+        assert!(shown(&long).starts_with(r"\u{1b}["), "{long:?}");
+        // A color beside a hostile sequence: only the color survives.
+        assert_eq!(
+            shown("\u{1b}[31mred\u{1b}[2J\u{1b}[0m"),
+            "\u{1b}[31mred\\u{1b}[2J\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn test_showing_text_twice_changes_nothing() {
+        for text in [
+            "a\u{1b}[2Jb",
+            "\u{1b}[32mok\u{1b}[0m \u{1b}[2J",
+            "n\nm",
+            "gnp.\u{202e}exe",
+        ] {
+            let once = shown(text).into_owned();
+            assert_eq!(shown(&once), once, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_every_helper_that_prints_a_message_shows_hostile_text() {
+        const ME: &str = "utils::tests::test_every_helper_that_prints_a_message_shows_hostile_text";
+        const TAGS: [&str; 10] = [
+            "section", "success", "warning", "error", "info", "skip", "plain", "note", "replay",
+            "confirm",
+        ];
+        // A message that is a file name, or quotes one. The newline is left out
+        // for `replay`, whose input is lines already.
+        let hostile = |tag: &str, newline: &str| {
+            format!("TAG-{tag} A\u{1b}[2JB\u{1b}]0;pwned\u{7}C{newline}    ✔ Freed 99 GB")
+        };
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                !stdout.contains('\u{1b}') && !stdout.contains('\u{7}'),
+                "an escape sequence reached the terminal:\n{stdout:?}"
+            );
+            assert!(
+                !stdout
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("✔ Freed 99 GB")),
+                "a name forged a line of ours:\n{stdout}"
+            );
+            for tag in TAGS {
+                let marker = format!("TAG-{tag} ");
+                let lines: Vec<&str> = stdout.lines().filter(|l| l.contains(&marker)).collect();
+                assert_eq!(lines.len(), 1, "{tag}: {lines:?}\n{stdout}");
+                assert!(
+                    lines[0].contains(r"\u{1b}[2J"),
+                    "{tag} did not show the escape: {}",
+                    lines[0]
+                );
+            }
+            return;
+        }
+        colored::control::set_override(false);
+        section(&hostile("section", "\n"));
+        success(&hostile("success", "\n"));
+        warning(&hostile("warning", "\n"));
+        error(&hostile("error", "\n"));
+        info(&hostile("info", "\n"));
+        skip(&hostile("skip", "\n"));
+        plain(&hostile("plain", "\n"));
+        note(&hostile("note", "\n"));
+        replay_stderr(hostile("replay", "").as_bytes());
+        // The child has no stdin, so the answer is no.
+        assert!(!confirm(&hostile("confirm", "\n")));
+        println!();
+        println!("CHILD-RAN");
     }
 
     // ── Failures ──

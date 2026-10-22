@@ -373,7 +373,11 @@ fn main() {
 
     // ── System info ── (suppressed in JSON mode: only the final object prints)
     if !cli.json {
-        println!("  {} {}", "System:".white().bold(), sys.pretty_name.cyan());
+        println!(
+            "  {} {}",
+            "System:".white().bold(),
+            utils::shown(&sys.pretty_name).cyan()
+        );
         println!(
             "  {} {} ({})",
             "Distro:".white().bold(),

@@ -365,6 +365,39 @@ fn test_failing_tool_replays_its_complaint_and_is_reported() {
     sb.cleanup();
 }
 
+#[test]
+fn test_a_tools_complaint_cannot_drive_the_terminal() {
+    // A tool quotes what it was given, and what it was given can be a file name,
+    // which may hold anything but a slash: "clear the screen", "retitle the
+    // window". The complaint is replayed under our failure line, so it is shown
+    // and not obeyed.
+    let sb = Sandbox::new("hostile_complaint");
+    let cache = sb.home.join(".cache/uv");
+    fill_cache(&cache);
+    let hostile = Behaviour {
+        stdout: "",
+        stderr: "uv: error: bad name \u{1b}[2J\u{1b}]0;pwned\u{7}",
+        exit: 2,
+    };
+    fake_uv(&sb, &cache, &hostile);
+
+    let out = sb.oxiclean(&["--dev", "--yes"]).output().unwrap();
+
+    // NO_COLOR is set, so oxiclean writes no escape sequence of its own: any ESC
+    // or BEL in its output came from the tool.
+    assert!(
+        !out.stdout.contains(&0x1b) && !out.stdout.contains(&0x07),
+        "an escape sequence reached the terminal:\n{}",
+        report(&out)
+    );
+    assert!(
+        text(&out.stdout).contains(r"uv: error: bad name \u{1b}[2J\u{1b}]0;pwned\u{7}"),
+        "the complaint should still be readable:\n{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
 // ── What the summary promises ──
 
 #[test]
