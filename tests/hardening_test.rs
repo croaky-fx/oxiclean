@@ -126,23 +126,29 @@ const WELL_BEHAVED: Behaviour = Behaviour {
     exit: 0,
 };
 
-/// A fake `uv`: logs every call, makes the noise `behaviour` asks for, and on
-/// `cache clean` empties `cache` the way the real one does, provided it
-/// succeeds. It pins its own PATH first because it needs `rm` whatever it was
-/// handed.
-fn fake_uv(sb: &Sandbox, cache: &Path, behaviour: &Behaviour) {
+/// A fake cleaner called `tool`: logs every call, makes the noise `behaviour`
+/// asks for, and on `clean_args` empties `cache` the way the real one does,
+/// provided it succeeds. It pins its own PATH first because it needs `rm`
+/// whatever it was handed.
+fn fake_cleaner(sb: &Sandbox, tool: &str, clean_args: &str, cache: &Path, behaviour: &Behaviour) {
     let script = "#!/bin/sh\nPATH=/usr/bin:/bin\n\
                   echo \"$*\" >> '@LOG@'\n\
                   [ -n '@OUT@' ] && echo '@OUT@'\n\
                   [ -n '@ERR@' ] && echo '@ERR@' >&2\n\
-                  if [ \"$*\" = 'cache clean' ] && [ @EXIT@ -eq 0 ]; then rm -rf '@CACHE@'/*; fi\n\
+                  if [ \"$*\" = '@ARGS@' ] && [ @EXIT@ -eq 0 ]; then rm -rf '@CACHE@'/*; fi\n\
                   exit @EXIT@\n"
         .replace("@LOG@", sb.log.to_str().unwrap())
         .replace("@OUT@", behaviour.stdout)
         .replace("@ERR@", behaviour.stderr)
         .replace("@EXIT@", &behaviour.exit.to_string())
+        .replace("@ARGS@", clean_args)
         .replace("@CACHE@", cache.to_str().unwrap());
-    write_exec(&sb.bin.join("uv"), &script);
+    write_exec(&sb.bin.join(tool), &script);
+}
+
+/// A fake `uv`, which cleans on `cache clean` (see [`fake_cleaner`]).
+fn fake_uv(sb: &Sandbox, cache: &Path, behaviour: &Behaviour) {
+    fake_cleaner(sb, "uv", "cache clean", cache, behaviour);
 }
 
 /// A fake `dotnet` standing in for a freshly installed SDK on its first run.
@@ -350,6 +356,12 @@ fn test_failing_tool_replays_its_complaint_and_is_reported() {
         1,
         "a failed cleanup must leave the cache alone"
     );
+    // The failure is the result; "Freed 0 B" beneath it would contradict it.
+    assert!(
+        !stdout.contains("Freed"),
+        "a failed cleanup closed with a success line:\n{}",
+        report(&out)
+    );
     sb.cleanup();
 }
 
@@ -409,6 +421,149 @@ fn test_the_deep_hint_is_advice_so_quiet_drops_it() {
         "{}",
         report(&quiet)
     );
+    sb.cleanup();
+}
+
+// ── Tools that are not there ──
+
+/// The caches only their own tool may clean: what `--dev` calls each one, the
+/// tool it needs, and where the tool keeps it by default. `go` and `dotnet`
+/// differ from the name of their cache, the case a message can get wrong.
+const TOOL_OWNED: [(&str, &str, &str); 6] = [
+    ("pnpm", "pnpm", ".local/share/pnpm/store"),
+    ("go modules", "go", "go/pkg/mod"),
+    ("conda", "conda", ".conda/pkgs"),
+    ("ccache", "ccache", ".cache/ccache"),
+    ("nuget", "dotnet", ".nuget/packages"),
+    ("composer", "composer", ".cache/composer"),
+];
+
+#[test]
+fn test_a_cache_whose_tool_is_missing_is_left_alone_and_is_not_a_failure() {
+    // A pnpm store left behind, or one this PATH does not reach, used to be
+    // listed as cleanable, counted in "Will clean now", and then to fail the
+    // whole run when pnpm could not be started.
+    for (name, tool, location) in TOOL_OWNED {
+        let sb = Sandbox::new("tool_missing");
+        let cache = sb.home.join(location);
+        fill_cache(&cache);
+        // Something that does get cleaned, so the run prints its summary.
+        let uv = sb.home.join(".cache/uv");
+        fill_cache(&uv);
+        fake_uv(&sb, &uv, &WELL_BEHAVED);
+
+        let out = sb.oxiclean(&["--dev", "--yes", "--deep"]).output().unwrap();
+        let stdout = text(&out.stdout);
+
+        assert!(out.status.success(), "{name}\n{}", report(&out));
+        assert_eq!(
+            entries(&cache),
+            1,
+            "{name}: the cache must be left alone\n{}",
+            report(&out)
+        );
+        assert!(
+            stdout.contains(&format!(
+                "{name}: found a cache, but `{tool}` is not in your PATH"
+            )),
+            "{name}: no word about the tool\n{}",
+            report(&out)
+        );
+        assert!(
+            !stdout.contains(&format!("\u{2022} {name}")),
+            "{name} was listed as cleanable\n{}",
+            report(&out)
+        );
+        assert_eq!(entries(&uv), 0, "the rest of the run still happens");
+        sb.cleanup();
+    }
+}
+
+#[test]
+fn test_a_machine_that_never_had_the_tool_hears_nothing_about_it() {
+    // No cache and no tool: nothing to leave alone, so nothing to say.
+    let sb = Sandbox::new("tool_never_had");
+    let uv = sb.home.join(".cache/uv");
+    fill_cache(&uv);
+    fake_uv(&sb, &uv, &WELL_BEHAVED);
+
+    let out = sb.oxiclean(&["--dev", "--yes", "--deep"]).output().unwrap();
+
+    assert!(out.status.success(), "{}", report(&out));
+    assert!(
+        !text(&out.stdout).contains("left alone"),
+        "{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_pnpm_prunes_its_store_when_it_is_there() {
+    let sb = Sandbox::new("pnpm_present");
+    let store = sb.home.join(".local/share/pnpm/store");
+    fill_cache(&store);
+    fake_cleaner(&sb, "pnpm", "store prune", &store, &WELL_BEHAVED);
+
+    let out = sb.oxiclean(&["--dev", "--yes"]).output().unwrap();
+
+    assert!(out.status.success(), "{}", report(&out));
+    assert!(
+        sb.calls().lines().any(|l| l == "store prune"),
+        "pnpm was never asked to prune\n{:?}\n{}",
+        sb.calls(),
+        report(&out)
+    );
+    assert_eq!(entries(&store), 0, "{}", report(&out));
+    assert!(text(&out.stdout).contains("Freed"), "{}", report(&out));
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_successful_cleanup_that_frees_nothing_still_says_so() {
+    // The other half of "no Freed line after a failure": a run where nothing
+    // went wrong states its result, even when the result is zero.
+    let sb = Sandbox::new("pnpm_nothing_to_prune");
+    let store = sb.home.join(".local/share/pnpm/store");
+    fill_cache(&store);
+    // Prunes, succeeds, and finds nothing to remove.
+    let elsewhere = sb.root.join("elsewhere");
+    fake_cleaner(&sb, "pnpm", "store prune", &elsewhere, &WELL_BEHAVED);
+
+    let out = sb.oxiclean(&["--dev", "--yes"]).output().unwrap();
+
+    assert!(out.status.success(), "{}", report(&out));
+    assert!(text(&out.stdout).contains("Freed 0 B"), "{}", report(&out));
+    sb.cleanup();
+}
+
+#[test]
+fn test_a_failed_pnpm_prune_is_a_failure_without_a_freed_line() {
+    let sb = Sandbox::new("pnpm_fails");
+    let store = sb.home.join(".local/share/pnpm/store");
+    fill_cache(&store);
+    let failing = Behaviour {
+        stdout: "",
+        stderr: "pnpm: ERR_DISK_ON_FIRE",
+        exit: 1,
+    };
+    fake_cleaner(&sb, "pnpm", "store prune", &store, &failing);
+
+    let out = sb.oxiclean(&["--dev", "--yes"]).output().unwrap();
+    let stdout = text(&out.stdout);
+
+    assert_eq!(out.status.code(), Some(1), "{}", report(&out));
+    assert!(
+        stdout.contains("`pnpm store prune` failed"),
+        "{}",
+        report(&out)
+    );
+    assert!(
+        !stdout.contains("Freed"),
+        "a failed prune closed with a success line:\n{}",
+        report(&out)
+    );
+    assert_eq!(entries(&store), 1, "a failed prune must leave the store");
     sb.cleanup();
 }
 

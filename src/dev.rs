@@ -331,6 +331,42 @@ fn scan_redownload(
     })
 }
 
+/// Whether `dir` has anything in it: the cheap question, for deciding that a
+/// cache is there to be mentioned without walking all of it.
+fn has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// Where a cache is when only its own tool can clean it, or `None` when that
+/// tool is not here.
+///
+/// `pnpm store prune` keeps every project's hard links valid, which deleting
+/// the store by hand does not, and `go clean -modcache` copes with the
+/// read-only files that defeat `rm`; the other tools listed with it are the
+/// same kind of case. Without the tool nothing can be done about the cache, and
+/// listing it anyway promised space that could not be freed ("Will clean now"
+/// counted it) and, for pnpm, then ended the run as a failure on a machine
+/// where nothing was wrong.
+///
+/// The tool is looked for first, so a machine that never had it pays nothing,
+/// and a cache left behind by a tool that is gone, or that this `$PATH` does
+/// not reach, is mentioned once, as left alone. A location the environment
+/// named and [`roots::check`] refused is reported only when the tool is there
+/// to act on it: without the tool nothing is run, so there is nothing to
+/// refuse.
+fn needs_tool(name: &str, tool: &str, root: Root) -> Option<PathBuf> {
+    if utils::which(tool) {
+        return reported(root);
+    }
+    let dir = root.dir()?;
+    if has_entries(&dir) {
+        utils::skip(&format!(
+            "{name}: found a cache, but `{tool}` is not in your PATH — left alone"
+        ));
+    }
+    None
+}
+
 /// Build the full list of dev-tool caches present on this system.
 /// Tools that aren't installed (or whose cache doesn't exist yet)
 /// are silently omitted.
@@ -350,7 +386,15 @@ pub fn scan_all() -> Vec<DevCache> {
     if let Some(c) = scan_simple("bun", home_join(".bun/install/cache"), "safe") {
         out.push(c);
     }
-    if let Some(c) = scan_simple("pnpm", pnpm_store_path(), "store prune") {
+    if let Some(c) = scan_simple(
+        "pnpm",
+        needs_tool(
+            "pnpm",
+            "pnpm",
+            pnpm_store_path().map_or(Root::Absent, Root::Dir),
+        ),
+        "store prune",
+    ) {
         out.push(c);
     }
     if let Some(c) = scan_simple("deno", reported(deno_dir_path()), "safe") {
@@ -375,17 +419,33 @@ pub fn scan_all() -> Vec<DevCache> {
     ) {
         out.push(c);
     }
-    if let Some(c) = scan_simple("conda", conda_cache_path(), "safe") {
+    if let Some(c) = scan_simple(
+        "conda",
+        needs_tool(
+            "conda",
+            "conda",
+            conda_cache_path().map_or(Root::Absent, Root::Dir),
+        ),
+        "safe",
+    ) {
         out.push(c);
     }
 
     // ── C/C++ ──
-    if let Some(c) = scan_simple("ccache", reported(ccache_dir_path()), "safe") {
+    if let Some(c) = scan_simple(
+        "ccache",
+        needs_tool("ccache", "ccache", ccache_dir_path()),
+        "safe",
+    ) {
         out.push(c);
     }
 
     // ── .NET ──
-    if let Some(c) = scan_simple("nuget", reported(nuget_cache_path()), "safe") {
+    if let Some(c) = scan_simple(
+        "nuget",
+        needs_tool("nuget", "dotnet", nuget_cache_path()),
+        "safe",
+    ) {
         out.push(c);
     }
 
@@ -422,7 +482,7 @@ pub fn scan_all() -> Vec<DevCache> {
     // ── Go ──
     if let Some(c) = scan_redownload(
         "go modules",
-        reported(go_modcache_path()),
+        needs_tool("go modules", "go", go_modcache_path()),
         "re-download on next build",
     ) {
         out.push(c);
@@ -442,20 +502,12 @@ pub fn scan_all() -> Vec<DevCache> {
     }
 
     // ── PHP ──
-    if utils::which("composer") {
-        if let Some(p) = reported(composer_cache_path()) {
-            if p.exists() {
-                let size = utils::dir_size(&p);
-                if size > 0 {
-                    out.push(DevCache {
-                        name: "composer",
-                        size,
-                        needs_redownload: false,
-                        note: "safe",
-                    });
-                }
-            }
-        }
+    if let Some(c) = scan_simple(
+        "composer",
+        needs_tool("composer", "composer", composer_cache_path()),
+        "safe",
+    ) {
+        out.push(c);
     }
 
     // ── JVM ──
@@ -630,6 +682,10 @@ fn report_cleaned(c: &DevCache, deep: bool, freed: u64) {
     }
 }
 
+/// Clean one cache. The caches only their own tool can clean were listed
+/// because that tool was found (see [`needs_tool`]), so their arms run it
+/// without asking again; one that has gone since is reported as the failure it
+/// is, not skipped in silence.
 fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
     if c.needs_redownload && !deep {
         return 0; // skipped \u2014 already reported in summary
@@ -758,7 +814,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // ── Go ──
         // Use the official command here because the module cache often
         // contains read-only files; direct deletion is less reliable.
-        "go modules" if utils::which("go") => {
+        "go modules" => {
             let before = c.size;
             run_tool(c, "go", &["clean", "-modcache"]);
             let after = go_modcache_path()
@@ -767,7 +823,6 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
                 .unwrap_or(0);
             before.saturating_sub(after)
         }
-        "go modules" => 0,
 
         // ── Ruby ──
         "ruby gems (old versions)" => {
@@ -784,7 +839,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         // ── PHP ──
         // Prefer Composer's own cache command when it exists instead of
         // blindly deleting the directory.
-        "composer" if utils::which("composer") => {
+        "composer" => {
             let before = c.size;
             run_tool(c, "composer", &["clear-cache", "--no-interaction"]);
             let after = composer_cache_path()
@@ -793,18 +848,16 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
                 .unwrap_or(0);
             before.saturating_sub(after)
         }
-        "composer" => 0,
 
-        "conda" if utils::which("conda") => {
+        "conda" => {
             let before = c.size;
             run_tool(c, "conda", &["clean", "--all", "--yes"]);
             let after = conda_cache_path().map(|p| utils::dir_size(&p)).unwrap_or(0);
             before.saturating_sub(after)
         }
-        "conda" => 0,
 
         // ── C/C++ ──
-        "ccache" if utils::which("ccache") => {
+        "ccache" => {
             let before = c.size;
             run_tool(c, "ccache", &["-C"]);
             let after = ccache_dir_path()
@@ -813,10 +866,9 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
                 .unwrap_or(0);
             before.saturating_sub(after)
         }
-        "ccache" => 0,
 
         // ── .NET ──
-        "nuget" if utils::which("dotnet") => {
+        "nuget" => {
             let before = c.size;
             run_tool(c, "dotnet", &["nuget", "locals", "all", "--clear"]);
             let after = nuget_cache_path()
@@ -825,7 +877,6 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
                 .unwrap_or(0);
             before.saturating_sub(after)
         }
-        "nuget" => 0,
 
         // ── JVM ──
         "gradle" => {
@@ -885,13 +936,14 @@ pub fn run(deep: bool, dry_run: bool, yes: bool) -> u64 {
         return 0;
     }
 
+    let mark = utils::failure_count();
     let mut freed = 0u64;
     for c in &caches {
         let f = clean_one(c, deep, dry_run);
         freed += f;
         report_cleaned(c, deep, f);
     }
-    utils::success(&format!("Freed {}", utils::format_size(freed).green()));
+    utils::say_freed(freed, mark);
     freed
 }
 
@@ -947,6 +999,18 @@ mod tests {
         fs::write(dir.join("a"), b"x").unwrap();
         let c = scan_redownload("redl", Some(dir.clone()), "re-download").expect("Some");
         assert!(c.needs_redownload);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_has_entries_sees_a_cache_without_measuring_it() {
+        let dir = std::env::temp_dir().join(format!("oxiclean_dev_entries_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!has_entries(&dir), "a directory that is not there is empty");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!has_entries(&dir), "so is one with nothing in it");
+        fs::write(dir.join("a"), b"x").unwrap();
+        assert!(has_entries(&dir));
         let _ = fs::remove_dir_all(&dir);
     }
 

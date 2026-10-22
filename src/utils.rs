@@ -1358,6 +1358,26 @@ pub fn success(msg: &str) {
     println!("    {} {}", "✔".green().bold(), msg);
 }
 
+/// Whether a cleanup that freed `freed` bytes ends with a "Freed …" line.
+///
+/// `failed` says that something went wrong on the way, and was reported then. A
+/// "Freed 0 B" beneath that red line reads as a success for work that did not
+/// happen, so the line is kept for what was actually freed, or for a step with
+/// nothing to complain about, where "0 B" is the honest result.
+fn freed_line_wanted(freed: u64, failed: bool) -> bool {
+    freed > 0 || !failed
+}
+
+/// Close a cleanup with what it freed, unless it freed nothing and failed (see
+/// [`freed_line_wanted`]). `mark` is a [`failure_count`] taken when the step
+/// began, which is how a step says "something failed" without having to track
+/// every call that could fail.
+pub fn say_freed(freed: u64, mark: usize) {
+    if freed_line_wanted(freed, failure_count() > mark) {
+        success(&format!("Freed {}", format_size(freed).green()));
+    }
+}
+
 pub fn warning(msg: &str) {
     if silent() {
         return;
@@ -1470,6 +1490,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    // ── The closing "Freed" line ──
+
+    #[test]
+    fn test_a_freed_line_needs_something_freed_or_nothing_wrong() {
+        // Done, and something to show for it.
+        assert!(freed_line_wanted(4096, false));
+        // Partly done: the failure has its own line, and the progress is real.
+        assert!(freed_line_wanted(4096, true));
+        // Nothing to free and nothing wrong: "0 B" is the answer.
+        assert!(freed_line_wanted(0, false));
+        // Nothing freed and a failure above it: no success line.
+        assert!(!freed_line_wanted(0, true));
+    }
 
     // ── CWE-426: untrusted search path ──
 

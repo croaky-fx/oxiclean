@@ -691,6 +691,7 @@ pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: 
         return 0;
     }
 
+    let mark = utils::failure_count();
     let mut emptied = utils::Emptied::default();
     for (path, size, is_dir) in &sized {
         emptied.add(path, *size, utils::remove_entry(path, *is_dir));
@@ -698,14 +699,7 @@ pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: 
     if let Some(complaint) = emptied.complaint(&cache) {
         utils::error(&complaint);
     }
-    // "Freed 0 B" on top of that would be a success line for work that did not
-    // happen.
-    if emptied.freed > 0 || emptied.failed == 0 {
-        utils::success(&format!(
-            "Freed {}",
-            utils::format_size(emptied.freed).green()
-        ));
-    }
+    utils::say_freed(emptied.freed, mark);
     emptied.freed
 }
 
@@ -1338,6 +1332,7 @@ fn clean_helper_at(
     deep: bool,
     yes: bool,
 ) -> u64 {
+    let mark = utils::failure_count();
     let size_before = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
 
     match h.clean {
@@ -1385,16 +1380,27 @@ fn clean_helper_at(
 
     let size_after = cache_dir.as_ref().map(|p| utils::dir_size(p)).unwrap_or(0);
     let freed = size_before.saturating_sub(size_after);
-    if freed > 0 {
-        utils::success(&format!(
-            "{} — freed {}",
-            h.bin,
-            utils::format_size(freed).green()
-        ));
-    } else {
-        utils::success(&format!("{} — already clean", h.bin));
+    if let Some(line) = helper_summary(h.bin, freed, utils::failure_count() > mark) {
+        utils::success(&line);
     }
     freed
+}
+
+/// The line a helper's cleanup ends with: what it freed, or that there was
+/// nothing to free. A cleanup that has just reported a failure says no more:
+/// "already clean" under a red line is not what happened (`paru -Sc` failing
+/// leaves the cache exactly as dirty as it was).
+fn helper_summary(bin: &str, freed: u64, failed: bool) -> Option<String> {
+    if freed > 0 {
+        Some(format!(
+            "{bin} — freed {}",
+            utils::format_size(freed).green()
+        ))
+    } else if failed {
+        None
+    } else {
+        Some(format!("{bin} — already clean"))
+    }
 }
 
 /// How `xbps-remove -O` / `-OO` went. `default_cache_exists` says whether
@@ -1817,7 +1823,7 @@ pub fn trash(dry_run: bool) -> u64 {
         return 0;
     }
 
-    let failures_before = utils::failure_count();
+    let mark = utils::failure_count();
     let mut freed = 0u64;
     for dir in &trash_dirs {
         if dir.exists() {
@@ -1825,11 +1831,8 @@ pub fn trash(dry_run: bool) -> u64 {
         }
     }
 
-    // `rm_contents` has reported what it could not remove; "Freed 0 B" on top of
-    // that would be a success line for work that did not happen.
-    if freed > 0 || utils::failure_count() == failures_before {
-        utils::success(&format!("Freed {}", utils::format_size(freed).green()));
-    }
+    // `rm_contents` has reported what it could not remove.
+    utils::say_freed(freed, mark);
     freed
 }
 
@@ -3097,6 +3100,21 @@ mod tests {
         assert!(!helper_launchable(&paru, &|_| false));
         // A helper cleaned by hand is never started, so where it is does not matter.
         assert!(helper_launchable(&aura, &|_| panic!("looked for aura")));
+    }
+
+    #[test]
+    fn test_a_helper_that_failed_is_not_called_already_clean() {
+        assert_eq!(
+            helper_summary("paru", 0, false).as_deref(),
+            Some("paru — already clean")
+        );
+        // The failure has its own line; nothing here may contradict it.
+        assert_eq!(helper_summary("paru", 0, true), None);
+        // Some of it went and some did not: say what did.
+        for failed in [false, true] {
+            let line = helper_summary("paru", 4096, failed).expect("a line");
+            assert!(line.contains("freed"), "{line}");
+        }
     }
 
     #[test]
