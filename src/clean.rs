@@ -1579,6 +1579,31 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
     freed
 }
 
+/// The disabled revisions in the output of `snap list --all`, as
+/// `(name, revision)`.
+///
+/// The table is `Name Version Rev Tracking Publisher Notes`, and a revision that
+/// has been replaced says `disabled` among its notes, which are one word or
+/// several joined by commas (`disabled`, `base,disabled`, `disabled,classic`).
+/// Only that last column decides. The word anywhere on the line is not enough:
+/// a snap called `disabled-notes`, or one whose publisher has it in its name, is
+/// an active revision, and removing a revision is exactly what is asked of snapd
+/// for each one found.
+fn disabled_revisions(listing: &str) -> Vec<(&str, &str)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // Fewer than the six columns is not a row of the table.
+            let notes = fields.last().filter(|_| fields.len() >= 6)?;
+            notes
+                .split(',')
+                .any(|note| note == "disabled")
+                .then(|| (fields[0], fields[2]))
+        })
+        .collect()
+}
+
 pub fn snap(dry_run: bool) -> u64 {
     utils::section("Snap");
 
@@ -1592,18 +1617,7 @@ pub fn snap(dry_run: bool) -> u64 {
         utils::Listing::Found(out) => out.as_str(),
         _ => "",
     };
-    let disabled: Vec<(&str, &str)> = out
-        .lines()
-        .filter(|l| l.contains("disabled"))
-        .filter_map(|l| {
-            let parts: Vec<&str> = l.split_whitespace().collect();
-            if parts.len() >= 3 {
-                Some((parts[0], parts[2]))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let disabled = disabled_revisions(out);
 
     if listing == utils::Listing::Failed {
         // Not "no disabled revisions": snapd could not be asked.
@@ -3149,6 +3163,45 @@ mod tests {
             assert!(tmp.join(kept).exists(), "{kept} was removed");
         }
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_only_the_notes_column_decides_what_is_a_disabled_revision() {
+        let listing = "\
+Name               Version       Rev    Tracking         Publisher     Notes
+chromium           98.0.4758.80  1899   latest/stable    canonical*    disabled
+chromium           99.0.4844.51  1927   latest/stable    canonical*    -
+code               d6ee99e4      87     latest/stable    vscode*       disabled,classic
+core18             20211028      2253   latest/stable    canonical*    base,disabled
+firefox            97.0.1-1      996    latest/stable/…  mozilla*      disabled
+firefox            98.0.2        1020   latest/stable/…  mozilla*      -
+disabled-notes     1.0           5      latest/stable    someone       -
+undisabled         2.0           6      latest/stable    disabled-dev  classic
+held-app           1.0           7      latest/stable    pub           held
+odd-notes          1.0           8      latest/stable    pub           redisabled
+";
+        assert_eq!(
+            disabled_revisions(listing),
+            [
+                ("chromium", "1899"),
+                ("code", "87"),
+                ("core18", "2253"),
+                ("firefox", "996"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_what_is_not_a_row_of_the_table_has_no_disabled_revision() {
+        for listing in [
+            "",
+            "No snaps are installed yet. Try 'snap install hello-world'.",
+            "error: cannot communicate with server: Post http://localhost/v2/login",
+            "disabled",
+            "name 1 2 disabled",
+        ] {
+            assert!(disabled_revisions(listing).is_empty(), "{listing:?}");
+        }
     }
 
     #[test]
