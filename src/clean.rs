@@ -1484,6 +1484,28 @@ fn flatpak_ref_count() -> usize {
         .unwrap_or(0)
 }
 
+/// The `find` that removes flatpak's leftovers from `tmp`: the
+/// `flatpak-cache-XXXXXX` directories it makes directly in it.
+///
+/// Only directly in it. `/var/tmp` is where everyone keeps things that must
+/// survive a reboot, and without `-maxdepth 1` this ran as root over all of it,
+/// taking with it a directory called `flatpak-cache-notes` that somebody's
+/// project happened to have.
+fn flatpak_leftovers_args(tmp: &str) -> Vec<&str> {
+    vec![
+        tmp,
+        "-maxdepth",
+        "1",
+        "-name",
+        "flatpak-cache-*",
+        "-exec",
+        "rm",
+        "-rf",
+        "{}",
+        "+",
+    ]
+}
+
 pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
     utils::section("Flatpak");
 
@@ -1534,19 +1556,7 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
         }
     }
 
-    if !utils::sudo_quiet(
-        "find",
-        &[
-            "/var/tmp",
-            "-name",
-            "flatpak-cache-*",
-            "-exec",
-            "rm",
-            "-rf",
-            "{}",
-            "+",
-        ],
-    ) {
+    if !utils::sudo_quiet("find", &flatpak_leftovers_args("/var/tmp")) {
         utils::error("Could not remove flatpak's leftovers from /var/tmp");
     }
 
@@ -3100,6 +3110,45 @@ mod tests {
         assert!(!helper_launchable(&paru, &|_| false));
         // A helper cleaned by hand is never started, so where it is does not matter.
         assert!(helper_launchable(&aura, &|_| panic!("looked for aura")));
+    }
+
+    #[test]
+    fn test_flatpaks_leftovers_are_swept_from_the_top_of_tmp_and_not_below_it() {
+        use std::fs;
+        use std::process::Command;
+        let tmp = cache_scratch("flatpak-sweep");
+        let touch = |path: &str| {
+            let path = tmp.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        };
+        // Flatpak's own: directly in tmp, as a directory with a tree in it and
+        // as a file.
+        touch("flatpak-cache-AbC123/objects/ab/cd");
+        touch("flatpak-cache-file");
+        // Not flatpak's: the same name further down, and names that only look
+        // like it.
+        touch("project/flatpak-cache-notes/todo.txt");
+        touch("project/flatpak-cache-other");
+        touch("flatpak-cache");
+        touch("not-flatpak-cache-x");
+
+        // The real `find`, on a directory of ours instead of /var/tmp.
+        let args = flatpak_leftovers_args(tmp.to_str().unwrap());
+        let status = Command::new("find").args(&args).status().unwrap();
+
+        assert!(status.success());
+        assert!(!tmp.join("flatpak-cache-AbC123").exists());
+        assert!(!tmp.join("flatpak-cache-file").exists());
+        for kept in [
+            "project/flatpak-cache-notes/todo.txt",
+            "project/flatpak-cache-other",
+            "flatpak-cache",
+            "not-flatpak-cache-x",
+        ] {
+            assert!(tmp.join(kept).exists(), "{kept} was removed");
+        }
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
