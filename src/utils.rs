@@ -380,6 +380,42 @@ pub fn sudo_quiet(cmd: &str, args: &[&str]) -> bool {
     elevate_quiet(current_privilege(), cmd, args)
 }
 
+/// How a command ended and what it printed, for a caller whose question is
+/// answered by more than "did it succeed".
+#[derive(Debug)]
+pub struct Captured {
+    /// The exit status; `None` when a signal ended the command.
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// [`elevate_quiet`] for a read-only question that the exit status alone does not
+/// answer. `pgrep` exits 1 for "none found", and so does `sudo` for "I refused",
+/// so a `bool` cannot tell a clean "no" from a question that was never put.
+///
+/// Resolved and run exactly as [`elevate`] runs a command. `None` is "not
+/// started", and has been said, as there.
+#[must_use = "None means the command never ran, and nothing was learnt"]
+pub fn elevate_capture(privilege: Privilege, cmd: &str, args: &[&str]) -> Option<Captured> {
+    let Some((program, argv)) = escalation(privilege, cmd, args, &resolve_trusted) else {
+        explain_unavailable(privilege, cmd);
+        return None;
+    };
+    let out = match harden_env(Command::new(&program).args(&argv)).output() {
+        Ok(out) => out,
+        Err(e) => {
+            note(&format!("not run: {cmd} could not be started ({e})"));
+            return None;
+        }
+    };
+    Some(Captured {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
 // ══════════════════════════════════════════════════
 //  Privilege Escalation
 // ══════════════════════════════════════════════════
@@ -2329,6 +2365,50 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(&out).unwrap(), trusted_path());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── A question put to a command: its status is part of the answer ──
+
+    #[test]
+    fn test_elevate_capture_hands_back_the_status_and_both_streams() {
+        let c = elevate_capture(
+            Privilege::Root,
+            "sh",
+            &["-c", "printf 0; printf 'sudo: no' >&2; exit 1"],
+        )
+        .expect("sh is in a trusted directory");
+        assert_eq!(c.code, Some(1));
+        assert_eq!(c.stdout, "0");
+        assert_eq!(c.stderr, "sudo: no");
+    }
+
+    #[test]
+    fn test_elevate_capture_of_a_command_a_signal_ended_has_no_status() {
+        let c = elevate_capture(Privilege::Root, "sh", &["-c", "kill -9 $$"]).unwrap();
+        assert_eq!(c.code, None);
+    }
+
+    #[test]
+    fn test_elevate_capture_runs_nothing_it_may_not() {
+        let dir = scratch("capture_refused");
+        let marker = dir.join("ran");
+        let marker = marker.to_str().unwrap();
+        let script = "touch \"$0\"";
+        // No escalation tool exists.
+        assert!(elevate_capture(Privilege::None, "sh", &["-c", script, marker]).is_none());
+        // A command outside the trusted directories, by name or by path.
+        assert!(
+            elevate_capture(Privilege::Root, "oxiclean_no_such_binary_xyz", &[marker]).is_none()
+        );
+        assert!(elevate_capture(Privilege::Root, "./sh", &["-c", script, marker]).is_none());
+        assert!(!Path::new(marker).exists(), "something ran");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_elevate_capture_gives_the_child_the_trusted_path() {
+        let c = elevate_capture(Privilege::Root, "sh", &["-c", "printf %s \"$PATH\""]).unwrap();
+        assert_eq!(c.stdout, trusted_path());
     }
 
     #[test]

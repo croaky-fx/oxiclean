@@ -2,7 +2,7 @@ use colored::Colorize;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::detect::{AurHelper, Distro};
+use crate::detect::{AurHelper, Distro, Privilege};
 use crate::roots;
 use crate::utils;
 
@@ -169,61 +169,157 @@ fn portage_dir_is_safe(dir: &Path) -> bool {
     dir.file_name().map(|n| n == "portage").unwrap_or(false) && dir.components().count() >= 3
 }
 
-/// True when an `emerge` build is in progress. Deleting `/var/tmp/portage`
-/// mid-build corrupts the running compile, so this is a hard guard. Uses
-/// `pgrep -f emerge`: run without a shell, the only cmdlines containing
-/// "emerge" are real emerge processes (pgrep excludes its own PID). Fails
-/// *closed* — if we can't tell, we assume a build is running and skip.
+/// What is known about `emerge` builds in progress.
+#[derive(Debug, PartialEq, Eq)]
+enum Builds {
+    /// A process whose command line mentions emerge exists.
+    Running,
+    /// Root looked, and there is none.
+    Idle,
+    /// The question went unanswered. The words say how, for the person to read.
+    Unknown(String),
+}
+
+/// What `pgrep -f` is given to look for: `emerge`, spelled so that the pattern
+/// does not match the command line it is part of. `pgrep` leaves out only
+/// itself; a shell, `sudo` or `doas` that runs it carries the pattern in their own
+/// command line, and with a plain `emerge` every check made through them found
+/// a build, namely theirs.
 ///
-/// Resolved through a trusted system path, not `$PATH`: a shadowed `pgrep` that
-/// exits non-zero would report "no build running" and hand this function's
-/// safety guarantee to whoever planted it — the sweep would then delete a live
-/// build tree. A `pgrep` we cannot vouch for is treated as unavailable, which
-/// fails closed.
-fn emerge_running() -> bool {
-    let Some(pgrep) = utils::resolve_trusted("pgrep") else {
-        return true; // can't verify → assume a build is running
+/// Deliberately wide: any command line that mentions emerge counts, an editor
+/// open on its log included. Too many matches only leave a tree alone.
+const EMERGE_PATTERN: &str = "[e]merge";
+
+/// Whether an `emerge` is running, as root says. Deleting `/var/tmp/portage`
+/// under a running build corrupts it, so the sweep stands on this answer, and
+/// the tree counts as idle only when it was *told* so ([`look_for`]).
+///
+/// Root is asked, not the user we run as. With `/proc` mounted `hidepid=1`, `2`
+/// or `4`, a `pgrep` run by an ordinary user cannot see another user's
+/// processes, and emerge runs as root: it prints `0` and exits 1, which is the
+/// very answer for "nothing is running" (reproduced in a container). Root sees
+/// every process, whatever hides them from us. The helper asked is the one the
+/// sweep deletes with, so nothing is requested that the deletion does not need.
+///
+/// `pgrep` and the helper are resolved through the trusted directories, not
+/// `$PATH`: a shadowed `pgrep` that exits 1 would report "no build running" and
+/// hand this guard to whoever planted it. One that cannot be vouched for is no
+/// answer, and no answer is not "idle".
+fn emerge_builds(privilege: Privilege) -> Builds {
+    look_for(privilege, EMERGE_PATTERN)
+}
+
+/// Ask `privilege` whether a process whose command line matches `pattern` exists.
+///
+/// `-c` makes pgrep *say* how many there are, `0` included, and that is what
+/// lets "none" be an answer. The exit status cannot be one on its own: 1 is
+/// also what `sudo` exits with when it refuses, and what a pgrep that does not
+/// know `-c` (busybox's) exits with for the option.
+fn look_for(privilege: Privilege, pattern: &str) -> Builds {
+    builds_from(utils::elevate_capture(
+        privilege,
+        "pgrep",
+        &["-c", "-f", pattern],
+    ))
+}
+
+/// What a finished `pgrep -c` means for "is a build running?".
+///
+/// Two things are an answer: a count above 0 with status 0 (it found some), and
+/// a printed `0` with status 1 (it looked, and found none). Everything else is
+/// no answer: status 2 and 3 are pgrep's own errors (a bad pattern, no `/proc`),
+/// and a refused `sudo`, a signal and a count that makes no sense leave nothing
+/// to go on. No answer is treated like a build under way, never like an idle
+/// tree.
+fn builds_from(answer: Option<utils::Captured>) -> Builds {
+    let Some(answer) = answer else {
+        return Builds::Unknown("pgrep could not be run".to_string());
     };
-    match std::process::Command::new(pgrep)
-        .args(["-f", "emerge"])
-        .env("PATH", utils::trusted_path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(s) => s.success(), // exit 0 = at least one match
-        Err(_) => true,       // pgrep missing / failed → assume unsafe
+    match (answer.code, answer.stdout.trim().parse::<u64>()) {
+        (Some(0), Ok(found)) if found > 0 => Builds::Running,
+        (Some(1), Ok(0)) => Builds::Idle,
+        (code, _) => Builds::Unknown(unanswered(code, &answer.stdout, &answer.stderr)),
     }
+}
+
+/// What pgrep did when it gave no answer, as one line: how it ended, what it
+/// printed, and the last thing it complained about. The last, because what
+/// comes first is often not the complaint: `sudo` opens with its lecture, and
+/// closes with why it refused.
+fn unanswered(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    let status = match code {
+        Some(code) => format!("status {code}"),
+        None => "ended by a signal".to_string(),
+    };
+    let printed = match stdout.trim() {
+        "" => "nothing printed".to_string(),
+        text => format!("printed {text:?}"),
+    };
+    let complaint = match stderr.lines().map(str::trim).rev().find(|l| !l.is_empty()) {
+        Some(line) => format!("; {line}"),
+        None => String::new(),
+    };
+    format!("pgrep: {status}, {printed}{complaint}")
 }
 
 /// Remove failed-build leftovers under the portage build tree. These are the
 /// half-unpacked/half-compiled remnants of interrupted or failed `emerge` runs
 /// — pure garbage that portage does not reuse. We only ever delete the
 /// *contents*, never the `portage` dir itself, and only after four guards pass:
-/// the dir exists, no emerge is running, the path resolves under a real
-/// tmpdir, and it ends in `/portage`.
+/// the dir exists, root says no emerge is running, the path resolves under a
+/// real tmpdir, and it ends in `/portage`.
 fn clean_portage_tmp(dry_run: bool) -> u64 {
-    let build_dir = portage_build_dir();
+    clear_build_leftovers(
+        &portage_build_dir(),
+        dry_run,
+        &|| emerge_builds(utils::current_privilege()),
+        &|dir| utils::sudo_quiet("find", &[dir, "-mindepth", "1", "-delete"]),
+    )
+}
 
-    if !build_dir.exists() || !portage_dir_is_safe(&build_dir) {
+/// The sweep behind [`clean_portage_tmp`], with the two things it asks of the
+/// machine handed in — whether a build is running, and the removal — so that a
+/// test can answer for them.
+fn clear_build_leftovers(
+    build_dir: &Path,
+    dry_run: bool,
+    builds: &dyn Fn() -> Builds,
+    remove: &dyn Fn(&str) -> bool,
+) -> u64 {
+    if !build_dir.exists() || !portage_dir_is_safe(build_dir) {
         return 0;
     }
-    if emerge_running() {
-        utils::skip("emerge is running — leaving build tmp untouched");
-        return 0;
-    }
-
-    let size = utils::dir_size(&build_dir);
+    // Before anyone is asked anything: an empty tree needs no answer, and a
+    // machine that cannot give one should not complain about a tree with
+    // nothing in it.
+    let size = utils::dir_size(build_dir);
     if size == 0 {
         return 0;
     }
     if dry_run {
+        // Not asked either: a dry run needs no privileges.
         utils::info(&format!(
-            "[DRY RUN] Would clear failed-build leftovers in {} ({})",
+            "[DRY RUN] Would clear failed-build leftovers in {} ({}), unless emerge is running",
             build_dir.display(),
             utils::format_size(size)
         ));
         return 0;
+    }
+    match builds() {
+        Builds::Idle => {}
+        Builds::Running => {
+            utils::skip(
+                "emerge seems to be running (`pgrep -af emerge` shows what matched) — leaving build tmp untouched",
+            );
+            return 0;
+        }
+        Builds::Unknown(why) => {
+            utils::warning(&format!(
+                "Cannot tell whether emerge is running ({why}) — leaving {} untouched",
+                build_dir.display()
+            ));
+            return 0;
+        }
     }
 
     // The contents are root-owned (built via sudo emerge), so delete through
@@ -231,8 +327,8 @@ fn clean_portage_tmp(dry_run: bool) -> u64 {
     // nested trees. What was freed is what is gone afterwards: a `find` that
     // failed may have removed some of it, and a build started meanwhile adds to it.
     let target = build_dir.to_string_lossy().into_owned();
-    let removed = utils::sudo_quiet("find", &[&target, "-mindepth", "1", "-delete"]);
-    let freed = size.saturating_sub(utils::dir_size(&build_dir));
+    let removed = remove(&target);
+    let freed = size.saturating_sub(utils::dir_size(build_dir));
     if removed {
         utils::success(&format!(
             "Cleared portage build leftovers ({})",
@@ -2886,6 +2982,258 @@ mod tests {
         assert_eq!(freed, before, "freed bytes must match what was there");
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // ── Whether an emerge is running: only an answer counts ──
+
+    fn pgrep_said(code: Option<i32>, stdout: &str, stderr: &str) -> Builds {
+        builds_from(Some(utils::Captured {
+            code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }))
+    }
+
+    #[test]
+    fn test_a_build_is_running_when_pgrep_counted_some() {
+        assert_eq!(pgrep_said(Some(0), "1\n", ""), Builds::Running);
+        assert_eq!(pgrep_said(Some(0), "12\n", ""), Builds::Running);
+    }
+
+    #[test]
+    fn test_the_tree_is_idle_only_when_pgrep_printed_a_count_of_none() {
+        assert_eq!(pgrep_said(Some(1), "0\n", ""), Builds::Idle);
+        // What else the command complained about does not make "none" less of
+        // an answer: sudo says so on a machine whose hostname does not resolve,
+        // and goes on to run the command.
+        assert_eq!(
+            pgrep_said(Some(1), "0\n", "sudo: unable to resolve host box\n"),
+            Builds::Idle
+        );
+    }
+
+    #[test]
+    fn test_no_answer_is_never_idle() {
+        // What happened, status, stdout, stderr.
+        let cases = [
+            // The one the old check took for "none": pgrep's own errors.
+            ("a bad pattern", Some(2), "", "pgrep: regex error\n"),
+            ("no /proc", Some(3), "", "Error: /proc must be mounted\n"),
+            (
+                "a refused sudo",
+                Some(1),
+                "",
+                "sudo: a password is required\n",
+            ),
+            (
+                "no -c (busybox)",
+                Some(1),
+                "",
+                "pgrep: unrecognized option: c\n",
+            ),
+            ("a signal", None, "", ""),
+            ("status 0, nothing printed", Some(0), "", ""),
+            ("status 0 and a count of none", Some(0), "0\n", ""),
+            ("status 1 and a count of some", Some(1), "2\n", ""),
+            ("a count that is not a number", Some(1), "none\n", ""),
+            ("a count below zero", Some(1), "-1\n", ""),
+        ];
+        for (what, code, stdout, stderr) in cases {
+            match pgrep_said(code, stdout, stderr) {
+                Builds::Unknown(_) => {}
+                other => panic!("{what}: expected no answer, got {other:?}"),
+            }
+        }
+        // A pgrep that could not even be started.
+        assert!(matches!(builds_from(None), Builds::Unknown(_)));
+    }
+
+    #[test]
+    fn test_no_answer_says_what_pgrep_did() {
+        let Builds::Unknown(why) = pgrep_said(Some(2), "", "pgrep: regex error\n") else {
+            panic!("expected no answer");
+        };
+        assert!(
+            why.contains("status 2") && why.contains("nothing printed"),
+            "{why}"
+        );
+        assert!(why.contains("pgrep: regex error"), "{why}");
+
+        // sudo's lecture comes before the reason it refused, which is what the
+        // person needs; it is the last line that is shown.
+        let lecture = "We trust you have received the usual lecture from the local System\n\
+                       Administrator. It usually boils down to these three things:\n\n\
+                       Sorry, user box is not allowed to execute '/usr/bin/pgrep' as root\n";
+        let Builds::Unknown(why) = pgrep_said(Some(1), "", lecture) else {
+            panic!("expected no answer");
+        };
+        assert!(why.contains("Sorry, user box is not allowed"), "{why}");
+        assert!(!why.contains("We trust you"), "{why}");
+
+        let Builds::Unknown(why) = pgrep_said(None, "", "") else {
+            panic!("expected no answer");
+        };
+        assert!(why.contains("signal"), "{why}");
+
+        let Builds::Unknown(why) = pgrep_said(Some(1), "none\n", "") else {
+            panic!("expected no answer");
+        };
+        assert!(why.contains("\"none\""), "{why}");
+
+        let Builds::Unknown(why) = builds_from(None) else {
+            panic!("expected no answer");
+        };
+        assert!(why.contains("could not be run"), "{why}");
+    }
+
+    #[test]
+    fn test_the_emerge_pattern_cannot_match_the_command_line_it_is_part_of() {
+        // `pgrep -f` leaves out only itself. A shell, sudo or doas that runs it
+        // carries the pattern in their own command line, so a pattern that
+        // contains the word it looks for finds them.
+        assert!(!EMERGE_PATTERN.contains("emerge"));
+        // And it still finds emerge: a bracket expression of one letter is that
+        // letter.
+        assert_eq!(EMERGE_PATTERN, "[e]merge");
+    }
+
+    #[test]
+    fn test_look_for_finds_a_process_by_its_command_line_and_not_itself() {
+        // The real pgrep and a real process.
+        let id = std::process::id();
+        let tag = format!("oxiclean_probe_{id}");
+        let pattern = format!("[o]xiclean_probe_{id}");
+
+        // Only where pgrep can count; busybox's cannot, and `look_for` rightly
+        // calls that no answer. Asked directly, so that a wrong argument of
+        // `look_for`'s own is not mistaken for a pgrep that cannot count.
+        let probe = utils::elevate_capture(Privilege::Root, "pgrep", &["-c", "-f", &pattern]);
+        if !probe.is_some_and(|p| p.code == Some(1) && p.stdout.trim() == "0") {
+            eprintln!("skipped: this pgrep cannot count");
+            return;
+        }
+        assert_eq!(
+            look_for(Privilege::Root, &pattern),
+            Builds::Idle,
+            "nothing carries {tag} yet, and pgrep must not match itself"
+        );
+        // `sh` waiting for input, with the tag in its command line.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read line", &tag])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let seen = look_for(Privilege::Root, &pattern);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(seen, Builds::Running);
+        assert_eq!(look_for(Privilege::Root, &pattern), Builds::Idle);
+    }
+
+    // ── The sweep deletes only when told that nothing is building ──
+
+    /// A build tree with something in it, and the directory above it, which is
+    /// what a test removes afterwards.
+    fn leftovers(name: &str) -> (PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("oxiclean_sweep_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let build = base.join("portage");
+        std::fs::create_dir_all(build.join("sys-devel/gcc-13/work")).unwrap();
+        std::fs::write(build.join("sys-devel/gcc-13/work/a.o"), vec![0u8; 4096]).unwrap();
+        (base, build)
+    }
+
+    #[test]
+    fn test_the_sweep_deletes_once_root_says_no_build_is_running() {
+        let (base, build) = leftovers("idle");
+        let asked = std::cell::Cell::new(0);
+        let removed = std::cell::RefCell::new(Vec::new());
+        clear_build_leftovers(
+            &build,
+            false,
+            &|| {
+                asked.set(asked.get() + 1);
+                Builds::Idle
+            },
+            &|dir| {
+                removed.borrow_mut().push(dir.to_string());
+                true
+            },
+        );
+        assert_eq!(asked.get(), 1);
+        assert_eq!(*removed.borrow(), vec![build.to_str().unwrap().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_the_sweep_leaves_the_tree_alone_while_a_build_is_running() {
+        let (base, build) = leftovers("running");
+        let freed = clear_build_leftovers(&build, false, &|| Builds::Running, &|_| {
+            panic!("deleted under a running build")
+        });
+        assert_eq!(freed, 0);
+        assert!(build.join("sys-devel/gcc-13/work/a.o").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_the_sweep_leaves_the_tree_alone_when_nobody_can_say() {
+        let (base, build) = leftovers("unknown");
+        let freed = clear_build_leftovers(
+            &build,
+            false,
+            &|| Builds::Unknown("pgrep: status 2, nothing printed".to_string()),
+            &|_| panic!("deleted without knowing whether a build is running"),
+        );
+        assert_eq!(freed, 0);
+        assert!(build.join("sys-devel/gcc-13/work/a.o").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_the_sweep_asks_nothing_of_a_tree_with_nothing_in_it() {
+        let base =
+            std::env::temp_dir().join(format!("oxiclean_sweep_{}_empty", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let build = base.join("portage");
+        std::fs::create_dir_all(&build).unwrap();
+        let freed = clear_build_leftovers(
+            &build,
+            false,
+            &|| panic!("asked about a tree with nothing in it"),
+            &|_| panic!("deleted from a tree with nothing in it"),
+        );
+        assert_eq!(freed, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_a_dry_run_asks_nobody_and_deletes_nothing() {
+        let (base, build) = leftovers("dry");
+        let freed =
+            clear_build_leftovers(&build, true, &|| panic!("a dry run asked root"), &|_| {
+                panic!("a dry run deleted")
+            });
+        assert_eq!(freed, 0);
+        assert!(build.join("sys-devel/gcc-13/work/a.o").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_the_sweep_only_aims_at_a_portage_directory() {
+        let (base, build) = leftovers("aim");
+        // Same contents, wrong name.
+        let elsewhere = base.join("tmp");
+        std::fs::rename(&build, &elsewhere).unwrap();
+        let freed = clear_build_leftovers(
+            &elsewhere,
+            false,
+            &|| panic!("asked about a directory that is not a portage tree"),
+            &|_| panic!("deleted a directory that is not a portage tree"),
+        );
+        assert_eq!(freed, 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── Cache base: XDG_CACHE_HOME is checked before anything is emptied ──
