@@ -218,24 +218,23 @@ fn conda_cache_path() -> Option<PathBuf> {
     home_join(".conda/pkgs")
 }
 
-/// Extract the first string in the JSON `"pkgs_dirs": [ ... ]` array, without
-/// pulling in a JSON dependency for this single field. Returns `None` if the
-/// key is missing or the array is empty — the caller then falls back. The
-/// search for the opening quote is bounded by the array's closing `]` so an
-/// empty `[]` can't accidentally match the next key's quote.
+/// The first entry of `pkgs_dirs` in the JSON that `conda info --json` prints,
+/// or `None` when it is missing, empty or not a string, and the caller falls
+/// back.
+///
+/// Read as JSON, not searched for between quotes: conda is Python, and Python's
+/// `json.dumps` writes every non-ASCII character as an escape unless told not
+/// to (`/home/محمد/.conda/pkgs` for a home directory in
+/// Arabic), so what lay between the quotes was text that is not the path. Only
+/// the first value is read, so whatever a wrapper prints after it is not held
+/// against it.
 fn parse_conda_pkgs_dir(json: &str) -> Option<String> {
-    let start = json.find("\"pkgs_dirs\"")?;
-    let open = start + json[start..].find('[')?;
-    let close = open + json[open..].find(']')?;
-    let array = &json[open + 1..close]; // contents between [ and ]
-    let q1 = array.find('"')?;
-    let q2 = q1 + 1 + array[q1 + 1..].find('"')?;
-    let path = &array[q1 + 1..q2];
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.to_string())
-    }
+    let info: serde_json::Value = serde_json::Deserializer::from_str(json)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    let first = info.get("pkgs_dirs")?.as_array()?.first()?.as_str()?;
+    (!first.is_empty()).then(|| first.to_owned())
 }
 
 /// ccache cache directory. Reads `CCACHE_DIR` env var, falls back to `~/.cache/ccache`.
@@ -1135,9 +1134,8 @@ mod tests {
         }
     }
 
-    /// The hand-rolled `pkgs_dirs` parser must read the first array entry, and
-    /// must return `None` (so the caller falls back) for an empty array or a
-    /// missing key — never the quote of the following JSON key.
+    /// The `pkgs_dirs` parser must read the first array entry, and must return
+    /// `None` (so the caller falls back) for an empty array or a missing key.
     #[test]
     fn test_parse_conda_pkgs_dir() {
         let json = r#"{"pkgs_dirs": ["/home/u/.conda/pkgs", "/opt/conda/pkgs"], "envs_dirs": ["/home/u/.conda/envs"]}"#;
@@ -1152,6 +1150,44 @@ mod tests {
 
         // Missing key.
         assert_eq!(parse_conda_pkgs_dir(r#"{"envs_dirs": []}"#), None);
+    }
+
+    #[test]
+    fn test_conda_paths_are_read_the_way_json_writes_them() {
+        // Python escapes what is not ASCII: the path is what the escapes say.
+        let arabic = r#"{"pkgs_dirs": ["/home/محمد/.conda/pkgs"]}"#;
+        assert_eq!(
+            parse_conda_pkgs_dir(arabic).as_deref(),
+            Some("/home/محمد/.conda/pkgs")
+        );
+        // Quotes and backslashes in a name.
+        let odd = r#"{"pkgs_dirs": ["/home/we\"ird\\dir/pkgs"]}"#;
+        assert_eq!(
+            parse_conda_pkgs_dir(odd).as_deref(),
+            Some(r#"/home/we"ird\dir/pkgs"#)
+        );
+        // The key's name inside another value is not the key.
+        let decoy = r#"{"note": "\"pkgs_dirs\": [\"/decoy\"]", "pkgs_dirs": ["/real"]}"#;
+        assert_eq!(parse_conda_pkgs_dir(decoy).as_deref(), Some("/real"));
+        // What comes after the document is not read.
+        let trailing = "{\"pkgs_dirs\": [\"/a\"]}\nsome wrapper's goodbye";
+        assert_eq!(parse_conda_pkgs_dir(trailing).as_deref(), Some("/a"));
+    }
+
+    #[test]
+    fn test_what_is_not_a_package_directory_falls_back() {
+        for json in [
+            "",
+            "not json",
+            "WARNING first {\"pkgs_dirs\": [\"/a\"]}",
+            r#"{"pkgs_dirs": [""]}"#,
+            r#"{"pkgs_dirs": [1, "/a"]}"#,
+            r#"{"pkgs_dirs": "/a"}"#,
+            r#"{"pkgs_dirs": null}"#,
+            r#"["pkgs_dirs", ["/a"]]"#,
+        ] {
+            assert_eq!(parse_conda_pkgs_dir(json), None, "{json:?}");
+        }
     }
 
     /// ccache is a pure compiler cache — fully safe to wipe. Just guard that
