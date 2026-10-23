@@ -472,7 +472,7 @@ fn main() {
 
     if ops.packages {
         run.step("packages", || {
-            let mut f = clean::pkg_cache(&sys.distro, cli.deep, cli.dry_run, yes);
+            let mut f = clean::pkg_cache(&sys.distro, cli.deep, cli.dry_run, yes, sys.disk_type);
 
             // Nix can be installed on *any* distro (not just NixOS). Run its GC
             // alongside the native package-cache step when /nix/store is present.

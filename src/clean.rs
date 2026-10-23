@@ -703,7 +703,13 @@ pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: 
     emptied.freed
 }
 
-pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
+pub fn pkg_cache(
+    distro: &Distro,
+    deep: bool,
+    dry_run: bool,
+    yes: bool,
+    disk_type: crate::detect::DiskType,
+) -> u64 {
     utils::section("Package Cache");
 
     // Atomic / OSTree systems (Fedora Silverblue, Kinoite, Bazzite, …) report as
@@ -871,12 +877,7 @@ pub fn pkg_cache(distro: &Distro, deep: bool, dry_run: bool, yes: bool) -> u64 {
                     Some(system_ok),
                 ));
 
-                utils::info("Optimizing Nix store (may take a while)...");
-                if nix_optimise(true) {
-                    utils::success("Nix store optimized");
-                } else {
-                    utils::error("nix-store --optimise failed");
-                }
+                optimise_nix_store(true, disk_type);
             }
         }
 
@@ -2054,7 +2055,13 @@ fn nix_gc_verdicts(
     out
 }
 
-/// `nix-store --optimise`: hard-link identical files in the store.
+/// `nix-store --optimise`: hard-link identical files in the store, unless the
+/// disk makes that unreasonable.
+///
+/// The command walks the entire store, which on a spinning disk takes hours, so
+/// there it is left for the user to start. Both ways of reaching it (NixOS, and
+/// Nix on another distribution) come through here, and the command is written
+/// nowhere else, so neither can run it on a disk the other skips.
 ///
 /// A store that a daemon owns takes root. In a single-user install the store is
 /// the user's own and the tool lives in the user's profile, which root's
@@ -2063,11 +2070,30 @@ fn nix_gc_verdicts(
 /// `nix store --optimise`, which this used to run, is not a command: the flag
 /// is spelled `nix store optimise` in the new CLI and `nix-store --optimise` in
 /// the classic one (checked against Nix 2.35).
-fn nix_optimise(multiuser: bool) -> bool {
-    if multiuser {
-        utils::sudo("nix-store", &["--optimise"])
+fn optimise_nix_store(multiuser: bool, disk_type: crate::detect::DiskType) {
+    optimise_nix_store_with(disk_type, || {
+        if multiuser {
+            utils::sudo("nix-store", &["--optimise"])
+        } else {
+            utils::run_user("nix-store", &["--optimise"])
+        }
+    });
+}
+
+/// [`optimise_nix_store`] with the command passed in, so that a test can see
+/// whether it is run.
+fn optimise_nix_store_with(disk_type: crate::detect::DiskType, optimise: impl FnOnce() -> bool) {
+    if disk_type == crate::detect::DiskType::HDD {
+        utils::info(
+            "Skipping store optimise on HDD (too slow). Run manually: nix-store --optimise",
+        );
+        return;
+    }
+    utils::info("Optimising Nix store (hard-linking identical files)...");
+    if optimise() {
+        utils::success("Store optimised");
     } else {
-        utils::run_user("nix-store", &["--optimise"])
+        utils::error("nix-store --optimise failed");
     }
 }
 
@@ -2150,20 +2176,7 @@ pub fn nix_gc(deep: bool, dry_run: bool, yes: bool, disk_type: crate::detect::Di
             let _ = utils::run_user("nix", &["profile", "wipe-history"]);
         }
 
-        // `nix-store --optimise` walks the entire store and hard-links
-        // identical files. On a spinning disk that can take *hours*.
-        if disk_type == crate::detect::DiskType::HDD {
-            utils::info(
-                "Skipping store optimise on HDD (too slow). Run manually: nix-store --optimise",
-            );
-        } else {
-            utils::info("Optimising Nix store (hard-linking identical files)...");
-            if nix_optimise(multiuser) {
-                utils::success("Store optimised");
-            } else {
-                utils::error("nix-store --optimise failed");
-            }
-        }
+        optimise_nix_store(multiuser, disk_type);
     }
 
     if freed > 0 {
@@ -3202,6 +3215,26 @@ odd-notes          1.0           8      latest/stable    pub           redisable
         ] {
             assert!(disabled_revisions(listing).is_empty(), "{listing:?}");
         }
+    }
+
+    #[test]
+    fn test_the_nix_store_is_not_optimised_on_a_spinning_disk() {
+        use crate::detect::DiskType;
+        // Only the paths that do not report a failure, which is global state
+        // that tests running side by side would see.
+        let ran = |disk| {
+            let mut ran = false;
+            optimise_nix_store_with(disk, || {
+                ran = true;
+                true
+            });
+            ran
+        };
+        assert!(!ran(DiskType::HDD));
+        assert!(ran(DiskType::SSD));
+        assert!(ran(DiskType::NVMe));
+        // Not knowing is not a reason to skip it, as in the other path.
+        assert!(ran(DiskType::Unknown));
     }
 
     #[test]
