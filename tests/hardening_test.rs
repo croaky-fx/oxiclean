@@ -600,6 +600,41 @@ fn test_a_failed_pnpm_prune_is_a_failure_without_a_freed_line() {
     sb.cleanup();
 }
 
+#[test]
+fn test_quiet_drops_the_description_of_the_machine_and_keeps_the_warnings() {
+    // `--help` promises "no banner sub-lines" under --quiet. What the run is going
+    // to do is not one: a dry run, or a deep one, has to say so however quiet it is.
+    let sb = Sandbox::new("quiet_banner");
+
+    let loud = sb
+        .oxiclean(&["--cache", "--dry-run", "--deep"])
+        .output()
+        .unwrap();
+    let said = text(&loud.stdout);
+    assert!(
+        said.contains("System:") && said.contains("Distro:"),
+        "{}",
+        report(&loud)
+    );
+
+    let quiet = sb
+        .oxiclean(&["--cache", "--dry-run", "--deep", "--quiet"])
+        .output()
+        .unwrap();
+    let said = text(&quiet.stdout);
+    assert!(
+        !said.contains("System:") && !said.contains("Distro:"),
+        "{}",
+        report(&quiet)
+    );
+    assert!(
+        said.contains("DRY RUN MODE") && said.contains("DEEP CLEAN MODE"),
+        "{}",
+        report(&quiet)
+    );
+    sb.cleanup();
+}
+
 // ── --json: exactly one document on stdout ──
 
 #[test]

@@ -371,8 +371,10 @@ fn main() {
     // that's the available escalator.
     utils::set_privilege(sys.privilege);
 
-    // ── System info ── (suppressed in JSON mode: only the final object prints)
-    if !cli.json {
+    // ── System info ── Nothing is printed in JSON mode: only the final object
+    // is. `--quiet` drops the description of the machine, as `--help` says it
+    // does, and keeps the warnings after it, which say what this run will do.
+    if !cli.json && !cli.quiet {
         println!(
             "  {} {}",
             "System:".white().bold(),
@@ -408,7 +410,9 @@ fn main() {
                 "HDD detected — cleanup may take longer".yellow()
             );
         }
+    }
 
+    if !cli.json {
         if cli.dry_run {
             println!();
             println!(
