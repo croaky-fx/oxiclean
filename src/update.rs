@@ -2363,6 +2363,64 @@ QWB3lB28Rlqbw8YxEaH8xtlW2WEE6Z+KYzefvA3vlrrZwVuc1l4hUsI8GtC1krZdGHOIXZFzbIyUgWBV
         }
     }
 
+    /// Whether a server answered. What it said (a body, a 404, a rate limit) is
+    /// another matter: that it said anything means a connection was made and,
+    /// over https, that the client accepted the server's certificate. A refused
+    /// connection, a handshake that failed and a certificate that was not accepted
+    /// are not answers.
+    fn the_server_answered(got: &Result<Vec<u8>, FetchError>) -> bool {
+        match got {
+            Ok(_) | Err(FetchError::NotFound) => true,
+            Err(FetchError::Failed(why)) => why.starts_with("http status"),
+        }
+    }
+
+    #[test]
+    fn test_an_answer_is_told_from_a_failure_to_get_one() {
+        let server = Server::start(vec![
+            ("/fine", Reply::Raw(response("200 OK", &[], b"x"))),
+            ("/gone", Reply::Raw(response("404 Not Found", &[], b"x"))),
+            (
+                "/denied",
+                Reply::Raw(response("403 Forbidden", &[], b"rate limit")),
+            ),
+        ]);
+        let client = local_client();
+        for path in ["/fine", "/gone", "/denied"] {
+            let got = client.get(&server.url(path), "*/*", 1024, SECS_5);
+            assert!(the_server_answered(&got), "{path}: {got:?}");
+        }
+        // Nothing is listening: no connection was made, so nothing answered.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let got = client.get(&format!("http://127.0.0.1:{port}/"), "*/*", 1024, SECS_5);
+        assert!(!the_server_answered(&got), "{got:?}");
+    }
+
+    #[test]
+    #[ignore = "needs the network: run by the release workflow, which must not ship a build that cannot verify the hosts it updates from"]
+    fn release_builds_must_verify_the_hosts_they_update_from() {
+        // Every other test of the client talks plain http to localhost, so nothing
+        // else puts its TLS stack, and the certificate roots this build carries
+        // (Mozilla's, compiled in), in front of a real server. A build whose roots
+        // do not cover GitHub could never update itself, and so never be updated
+        // to a fixed one.
+        //
+        // The two addresses are the ones `--update` uses: the API, and a file of
+        // the latest release, whose download GitHub sends on to another host. A 404
+        // (there is no release yet) and a rate limit are answers; a certificate the
+        // client does not accept is not.
+        let net = Http::new(true);
+        let release_file = format!("https://github.com/{REPO}/releases/latest/download/SHA256SUMS");
+        for url in [API_LATEST, release_file.as_str()] {
+            let got = net.get(url, "*/*", 256 * 1024, Duration::from_secs(30));
+            assert!(the_server_answered(&got), "{url}: {got:?}");
+        }
+    }
+
     #[test]
     fn test_http_keeps_at_most_the_limit_and_refuses_more() {
         let body = vec![b'z'; 100];

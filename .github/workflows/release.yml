@@ -36,6 +36,11 @@ jobs:
           fi
       - name: minisign.pub holds a signing key
         run: cargo test --locked release_builds_must_ship_an_update_key -- --ignored
+      - name: The build can verify the hosts it updates from
+        # Every other test talks plain http to localhost. A build whose
+        # certificate roots do not cover GitHub could never update itself, nor be
+        # updated to a fixed release.
+        run: cargo test --locked release_builds_must_verify_the_hosts -- --ignored
 
   build:
     name: Build ${{ matrix.name }}
