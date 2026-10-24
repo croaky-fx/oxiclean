@@ -5,8 +5,12 @@ on:
     tags:
       - 'v*'
 
+# The build jobs run other people's code: the build script of every dependency,
+# and third-party actions. The token they hold can read and nothing else. The one
+# job that has to write, the one that creates the draft release, asks for that
+# itself.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # A release has to be able to update itself, and --update refuses to run
@@ -17,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Tag matches Cargo.toml
         # The updater runs the downloaded binary with --version and insists on
@@ -48,6 +54,8 @@ jobs:
             name: oxiclean-aarch64-linux-musl
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -59,7 +67,9 @@ jobs:
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }}
+      # --locked: the release is built from the dependency versions that were
+      # reviewed and tested, never from a fresh resolution.
+      - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/oxiclean ${{ matrix.name }}
       - name: Record the checksum
         # What scripts/sign-release.sh asks the maintainer to compare with.
@@ -72,8 +82,12 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
