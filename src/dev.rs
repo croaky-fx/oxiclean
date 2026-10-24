@@ -489,7 +489,7 @@ pub fn scan_all() -> Vec<DevCache> {
 
     // ── Ruby ──
     if utils::which("gem") {
-        // gem cleanup doesn't operate on a fixed directory \u2014 it walks
+        // gem cleanup doesn't operate on a fixed directory — it walks
         // GEM_PATH and removes old versions. We can't pre-measure it
         // accurately, but we still want to advertise it.
         out.push(DevCache {
@@ -514,7 +514,7 @@ pub fn scan_all() -> Vec<DevCache> {
     if let Some(c) = scan_simple("gradle", home_join(".gradle/caches"), "safe") {
         out.push(c);
     }
-    // Maven local repo \u2014 will re-download. Often huge.
+    // Maven local repo — will re-download. Often huge.
     if let Some(c) = scan_redownload(
         "maven (.m2)",
         home_join(".m2/repository"),
@@ -687,7 +687,7 @@ fn report_cleaned(c: &DevCache, deep: bool, freed: u64) {
 /// is, not skipped in silence.
 fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
     if c.needs_redownload && !deep {
-        return 0; // skipped \u2014 already reported in summary
+        return 0; // skipped — already reported in summary
     }
     if dry_run {
         return 0;
@@ -712,7 +712,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
             .map(clean_dir_contents)
             .unwrap_or(0),
 
-        // pnpm: hard-linked store \u2014 NEVER touch directly.
+        // pnpm: hard-linked store — NEVER touch directly.
         //
         // Every command-driven cleaner below takes its "before" size from
         // `c.size`, which scan_all already measured. Re-walking here doubled the
@@ -825,7 +825,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
 
         // ── Ruby ──
         "ruby gems (old versions)" => {
-            // `gem cleanup` removes old versions only \u2014 it never touches
+            // `gem cleanup` removes old versions only — it never touches
             // currently required gems. Safe by design.
             if run_tool(c, "gem", &["cleanup"]) {
                 // The one line this cache gets: it has no size to report, and a
@@ -1040,8 +1040,8 @@ mod tests {
 
     /// `clean_dir_contents_except` is the helper we'd reach for if we
     /// ever wanted to clean a parent directory of a protected child.
-    /// We don't actually need it for the current tool set \u2014 every cleaner
-    /// targets a leaf cache directory \u2014 but the property test makes the
+    /// We don't actually need it for the current tool set — every cleaner
+    /// targets a leaf cache directory — but the property test makes the
     /// guarantee explicit.
     #[test]
     fn test_clean_dir_contents_except_preserves_listed() {
@@ -1064,7 +1064,7 @@ mod tests {
 
     /// Cargo's `bin/` directory holds user-installed binaries like
     /// `cargo-watch` and `rustfmt`. None of the cargo entries in our
-    /// scanner list targets `~/.cargo` itself \u2014 they all target
+    /// scanner list targets `~/.cargo` itself — they all target
     /// subdirectories that do *not* contain `bin/`. This test is a
     /// regression guard: if anyone ever adds a `~/.cargo` entry, the
     /// assertion below makes it loud.
@@ -1085,7 +1085,7 @@ mod tests {
         }
     }
 
-    /// Poetry virtualenvs live in `~/.cache/pypoetry/virtualenvs/` \u2014 they
+    /// Poetry virtualenvs live in `~/.cache/pypoetry/virtualenvs/` — they
     /// are NOT a cache and must never be touched. Our poetry entry
     /// explicitly targets the `cache/` sibling.
     #[test]

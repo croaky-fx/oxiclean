@@ -631,8 +631,6 @@ fn partition_cache_entries(cache_dir: &Path, protected: &[String]) -> (Vec<PathB
 
 /// Size of a cache entry: follows the same symlink/dir/file rules as
 /// `utils::rm_contents` so the "freed" tally matches what's actually removed.
-/// Size of a cache entry: follows the same symlink/dir/file rules as
-/// `utils::rm_contents` so the "freed" tally matches what's actually removed.
 ///
 /// One `symlink_metadata` call answers all three questions (symlink? dir? size?).
 /// The `is_symlink()`/`is_dir()`/`metadata()` chain it replaced re-resolved the

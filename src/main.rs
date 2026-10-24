@@ -402,7 +402,7 @@ fn main() {
         }
 
         // HDD warning: cleanup on a spinning disk can take noticeably longer,
-        // and `nix store --optimise` in particular can take hours.
+        // and `nix-store --optimise` in particular can take hours.
         if sys.disk_type == DiskType::HDD {
             println!(
                 "  {} {}",
