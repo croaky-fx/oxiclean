@@ -69,8 +69,12 @@ fetch() {
 	url="$1"
 	out="$2"
 	if need curl; then
-		curl -fsSL "$url" -o "$out"
+		# https only, redirects included: GitHub hands the download on to another
+		# host, and a hop to plain http is refused, not followed. TLS 1.2 or newer.
+		curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$out"
 	elif need wget; then
+		# wget cannot be told to refuse a redirect to plain http: --https-only
+		# only applies to recursive downloads. Hence curl is tried first.
 		wget -qO "$out" "$url"
 	else
 		die "need curl or wget to download"
