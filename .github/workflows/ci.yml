@@ -43,3 +43,20 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq minisign
           scripts/test-sign-release.sh
+
+  msrv:
+    name: Oldest supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The number lives in one place, rust-version in Cargo.toml: raising it
+      # moves this job along, and a dependency that starts to need a newer
+      # compiler fails here, not on someone who builds from source.
+      - name: Build with the version Cargo.toml promises
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" build --locked --all-targets

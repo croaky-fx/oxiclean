@@ -132,7 +132,7 @@ chmod +x oxiclean-x86_64-linux-gnu
 sudo install -Dm755 oxiclean-x86_64-linux-gnu /usr/local/bin/oxiclean
 ```
 
-Requires: Linux, and sudo or doas. Building from source needs Rust 1.70+.
+Requires: Linux, and sudo or doas. Building from source needs Rust 1.85+.
 
 ---
 
