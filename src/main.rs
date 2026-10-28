@@ -338,9 +338,11 @@ fn main() {
         }
     };
 
-    // --json implies non-interactive: destructive prompts must never block on
-    // stdin, so treat them like --yes (they're still gated by --deep for the
-    // truly aggressive ones via should_deep).
+    // --json implies non-interactive: prompts must never block on stdin, so
+    // they are answered as --yes answers them (the truly aggressive ones are
+    // still gated by --deep, via should_deep). Removing something that a person
+    // would have been asked about is another matter: that takes `--yes` itself
+    // (`cli.yes`), as a moved cache and orphaned packages do.
     let yes = cli.yes || cli.json;
 
     if !ops.any() {
@@ -491,7 +493,9 @@ fn main() {
     }
 
     if ops.orphans {
-        run.step("orphans", || clean::orphans(&sys.distro, cli.dry_run, yes));
+        run.step("orphans", || {
+            clean::orphans(&sys.distro, cli.dry_run, cli.yes)
+        });
     }
 
     if ops.aur {

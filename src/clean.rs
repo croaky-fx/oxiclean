@@ -1143,6 +1143,49 @@ pub fn pkg_cache(
     freed
 }
 
+/// What may be done about the orphaned packages that were listed.
+#[derive(Debug, PartialEq, Eq)]
+enum Consent {
+    /// Go ahead: `--yes`, or a person said so.
+    Given,
+    /// A person was asked, and said no.
+    Refused,
+    /// There was no one to ask.
+    NoOneToAsk,
+}
+
+/// Whether orphaned packages may be removed. `--yes` is the answer for
+/// unattended runs. `--json` has no one to ask, so it needs `--yes` too, as a
+/// moved cache does (see `relocated_cache_allowed`): the format of the output
+/// is no reason to remove packages. Otherwise a person is asked.
+fn orphans_consent(yes: bool, json: bool, ask: impl FnOnce() -> bool) -> Consent {
+    if yes {
+        Consent::Given
+    } else if json {
+        Consent::NoOneToAsk
+    } else if ask() {
+        Consent::Given
+    } else {
+        Consent::Refused
+    }
+}
+
+/// [`orphans_consent`] for a run: asks on the terminal, and says so when there
+/// was no one to ask, which is a step that was not done.
+fn may_remove_orphans(yes: bool) -> bool {
+    let consent = orphans_consent(yes, utils::is_json(), || {
+        utils::confirm("Remove orphaned packages? [y/N]:")
+    });
+    match consent {
+        Consent::Given => true,
+        Consent::Refused => false,
+        Consent::NoOneToAsk => {
+            utils::error("Orphaned packages not removed without --yes (--json cannot ask)");
+            false
+        }
+    }
+}
+
 pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
     utils::section("Orphaned Packages");
 
@@ -1189,7 +1232,7 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
                 utils::info("[DRY RUN] Would remove above packages");
                 return 0;
             }
-            if yes || utils::confirm("Remove orphaned packages? [y/N]:") {
+            if may_remove_orphans(yes) {
                 let mut args: Vec<&str> = vec!["-Rns", "--noconfirm"];
                 args.extend(&pkgs);
                 if utils::sudo("pacman", &args) {
@@ -1278,7 +1321,7 @@ pub fn orphans(distro: &Distro, dry_run: bool, yes: bool) -> u64 {
                 utils::info("[DRY RUN] Would remove above packages");
                 return 0;
             }
-            if yes || utils::confirm("Remove orphaned packages? [y/N]:") {
+            if may_remove_orphans(yes) {
                 let pkg_refs: Vec<&str> = pkgs.iter().map(|s| s.as_str()).collect();
                 let mut args: Vec<&str> = vec!["remove", "-y", "--clean-deps"];
                 args.extend(&pkg_refs);
@@ -3699,6 +3742,91 @@ odd-notes          1.0           8      latest/stable    pub           redisable
         assert_eq!(entry_size(&base.join("twin"), &none), 0);
         assert_eq!(entry_size(&base.join("missing"), &none), 0);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Re-run the test `name` in a child process with `mode` in `OXI_CHILD` and
+    /// `stdin` on its standard input, and return the markers it wrote to stderr
+    /// (report modules print to stdout only through the helpers in utils).
+    /// Whether the output is JSON is a switch that can be set once per process.
+    fn run_child(name: &str, mode: &str, stdin: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env("OXI_CHILD", mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+        assert!(stderr.contains("CHILD-RAN"), "child never ran:\n{stderr}");
+        stderr.into_owned()
+    }
+
+    #[test]
+    fn test_orphans_are_asked_about_on_a_terminal_and_json_is_not_taken_for_a_yes() {
+        const ME: &str = "clean::tests::test_orphans_are_asked_about_on_a_terminal_and_json_is_not_taken_for_a_yes";
+        match std::env::var("OXI_CHILD").as_deref() {
+            Err(_) => {
+                // On a terminal a person is asked, and what they say is the answer;
+                // `--yes` is not asked about.
+                let plain = run_child(ME, "plain", "n\ny\n");
+                assert!(plain.contains("SAID-NO=false SAID-YES=true"), "{plain}");
+                assert!(plain.contains("WITH-YES=true FAILURES=0"), "{plain}");
+                // With `--json` there is no one to ask, whatever is on the input:
+                // without `--yes` nothing is removed, and that is said as a failure.
+                let json = run_child(ME, "json", "y\ny\n");
+                assert!(json.contains("WITHOUT-YES=false FAILURES=1"), "{json}");
+                assert!(json.contains("WITH-YES=true"), "{json}");
+            }
+            Ok("plain") => {
+                let said_no = may_remove_orphans(false);
+                let said_yes = may_remove_orphans(false);
+                let before = utils::failure_count();
+                let with_yes = may_remove_orphans(true);
+                eprintln!("SAID-NO={said_no} SAID-YES={said_yes}");
+                eprintln!(
+                    "WITH-YES={with_yes} FAILURES={}",
+                    utils::failure_count() - before
+                );
+                eprintln!("CHILD-RAN");
+            }
+            Ok("json") => {
+                utils::set_json(true);
+                let before = utils::failure_count();
+                let without_yes = may_remove_orphans(false);
+                eprintln!(
+                    "WITHOUT-YES={without_yes} FAILURES={}",
+                    utils::failure_count() - before
+                );
+                eprintln!("WITH-YES={}", may_remove_orphans(true));
+                eprintln!("CHILD-RAN");
+            }
+            Ok(other) => panic!("unknown mode {other}"),
+        }
+    }
+
+    #[test]
+    fn test_orphans_are_removed_on_a_yes_or_an_answer_and_never_on_json_alone() {
+        let nobody = || -> bool { panic!("there is no one to ask") };
+        // --yes is the answer, whatever the output looks like.
+        assert_eq!(orphans_consent(true, false, nobody), Consent::Given);
+        assert_eq!(orphans_consent(true, true, nobody), Consent::Given);
+        // --json alone has no one to ask, and is not a yes.
+        assert_eq!(orphans_consent(false, true, nobody), Consent::NoOneToAsk);
+        // Otherwise a person is asked, and what they say is the answer.
+        assert_eq!(orphans_consent(false, false, || true), Consent::Given);
+        assert_eq!(orphans_consent(false, false, || false), Consent::Refused);
     }
 
     #[test]
