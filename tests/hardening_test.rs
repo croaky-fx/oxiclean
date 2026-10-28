@@ -9,9 +9,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -2040,4 +2040,280 @@ fn test_a_cache_is_left_alone_when_the_mounts_cannot_be_listed() {
         "{shown}"
     );
     remove_unmounted(&work);
+}
+
+// ── A machine of our own ──
+//
+// What oxiclean does for a distribution rests on two things a test cannot hand
+// to a child process: /etc/os-release says which distribution it is, and the
+// system tools come from /usr/bin and the directories beside it, never from
+// `$PATH` (`utils::resolve_trusted`). In a user and mount namespace of the
+// test's own both can be made up. /usr/bin becomes a directory that holds only
+// the tools the test wants to exist, /etc/os-release says what the test wants,
+// and the child is "root" there, which is the developer's own user and nothing
+// more. The machine itself is not touched, and the mounts are gone with the
+// child. Where a user is not given a namespace (a hardened kernel, some
+// containers) these skip, and so they do on an image-based system, whose /usr
+// cannot be made writable for the run and which oxiclean leaves alone anyway.
+
+/// Run before oxiclean starts, by `sh`: `$1` is the program, `$2` the machine's
+/// directory and the rest is for the program. The directories that are not
+/// links hold tools of the real machine and are covered by an empty file system
+/// (on a merged-/usr system they are links to /usr/bin, the made-up one).
+const MACHINE_PRELUDE: &str = r#"
+set -eu
+BIN=$1; W=$2; shift 2
+M=$W/tools/mount
+"$M" --bind "$W/bin" /usr/bin
+"$M" --bind "$W/os-release" /etc/os-release
+for d in /bin /sbin /usr/sbin /usr/local/bin /usr/local/sbin; do
+  if [ -d "$d" ] && [ ! -L "$d" ]; then "$M" -t tmpfs tmpfs "$d"; fi
+done
+"$M" -t tmpfs tmpfs /run
+export HOME="$W/home" PATH=/usr/bin LC_ALL=C NO_COLOR=1 TERM=dumb FAKE_LOG="$W/calls.log"
+exec "$BIN" "$@"
+"#;
+
+/// The real tool called `name`, from where a system keeps its tools.
+fn real_tool(name: &str) -> Option<PathBuf> {
+    ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| path.is_file())
+}
+
+/// Whether the file system `/usr` is on is read-only, as `/proc/mounts` says.
+fn usr_is_read_only() -> bool {
+    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().skip(1);
+            let (at, _kind, options) = (fields.next()?, fields.next()?, fields.next()?);
+            let holds_usr = at == "/" || at == "/usr" || "/usr".starts_with(&format!("{at}/"));
+            holds_usr.then_some((at.len(), options))
+        })
+        .max_by_key(|(len, _)| *len)
+        .is_some_and(|(_, options)| options.split(',').any(|o| o == "ro"))
+}
+
+/// A directory that stands in for the system, and what to run on it.
+struct Machine {
+    dir: PathBuf,
+}
+
+impl Machine {
+    /// A machine whose /etc/os-release says `os_release`. It has `sh`, and so
+    /// whatever script a tool of the test's own is made of, and nothing else.
+    fn new(name: &str, os_release: &str) -> Machine {
+        let dir = fs::canonicalize(scratch(name)).unwrap();
+        for sub in ["bin", "tools", "home"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        fs::write(dir.join("os-release"), os_release).unwrap();
+        fs::write(dir.join("calls.log"), "").unwrap();
+        // The mount tool is copied out of reach of the /usr/bin that gets covered.
+        if let Some(mount) = real_tool("mount") {
+            fs::copy(mount, dir.join("tools/mount")).unwrap();
+        }
+        let machine = Machine { dir };
+        machine.take_from_the_real_one(&["sh"]);
+        machine
+    }
+
+    /// Copies of real tools, as the machine's own.
+    fn take_from_the_real_one(&self, names: &[&str]) {
+        for name in names {
+            let real = real_tool(name).unwrap_or_else(|| panic!("this machine has no {name}"));
+            fs::copy(real, self.dir.join("bin").join(name)).unwrap();
+        }
+    }
+
+    /// A tool of the test's own: a script for the machine's `sh`. What it should
+    /// leave behind it writes to `$FAKE_LOG`, which `calls` reads.
+    fn tool(&self, name: &str, body: &str) {
+        write_exec(
+            &self.dir.join("bin").join(name),
+            &format!("#!/usr/bin/sh\n{body}"),
+        );
+    }
+
+    /// What the machine's tools were asked, in order, one line each.
+    fn calls(&self) -> Vec<String> {
+        let log = fs::read_to_string(self.dir.join("calls.log")).unwrap();
+        log.lines().map(String::from).collect()
+    }
+
+    /// `program` run on this machine with `stdin` on its input.
+    fn start(&self, program: &Path, args: &[&str], stdin: &str) -> std::io::Result<Output> {
+        let mut child = Command::new("unshare")
+            .args(["-Urm", "sh", "-c", MACHINE_PRELUDE, "sh"])
+            .arg(program)
+            .arg(&self.dir)
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut input = child.stdin.take().unwrap();
+        let _ = input.write_all(stdin.as_bytes());
+        drop(input);
+        child.wait_with_output()
+    }
+
+    /// oxiclean on this machine, or `None` where one cannot be made.
+    fn run(&self, args: &[&str], stdin: &str) -> Option<Output> {
+        if !machines_can_be_made() {
+            eprintln!("skipped: this machine cannot make one of its own to run on");
+            return None;
+        }
+        let exe = Path::new(env!("CARGO_BIN_EXE_oxiclean"));
+        Some(self.start(exe, args, stdin).unwrap())
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        remove_unmounted(&self.dir);
+    }
+}
+
+/// Whether a machine can be made here: told once, by making a bare one.
+fn machines_can_be_made() -> bool {
+    static CAN: OnceLock<bool> = OnceLock::new();
+    *CAN.get_or_init(|| {
+        if usr_is_read_only() {
+            return false;
+        }
+        let bare = Machine::new("machine_probe", "ID=probe\n");
+        let sh = bare.dir.join("bin/sh");
+        bare.start(&sh, &["-c", "exit 0"], "")
+            .is_ok_and(|out| out.status.success())
+    })
+}
+
+// What a distribution's orphaned packages are asked about, run on a made-up
+// one: the question, `--yes`, and `--json`, which has no one to ask.
+
+/// A pacman that knows two orphans and writes down what it is asked.
+const ARCH_PACMAN: &str = r#"echo "pacman $*" >> "$FAKE_LOG"
+case "$1" in -Qdtq) printf 'foo\nbar\n' ;; esac
+"#;
+
+/// A zypper that knows two orphans and writes down what it is asked.
+const SUSE_ZYPPER: &str = r#"echo "zypper $*" >> "$FAKE_LOG"
+case "$1" in
+  packages) printf 'S | Repository | Name | Version | Arch\n--+------------+------+---------+-------\ni | repo | foo | 1.0 | x86_64\ni | repo | bar | 2.0 | x86_64\n' ;;
+esac
+"#;
+
+const ARCH_REMOVAL: &str = "pacman -Rns --noconfirm foo bar";
+const SUSE_REMOVAL: &str = "zypper remove -y --clean-deps foo bar";
+
+fn arch_machine(name: &str) -> Machine {
+    let machine = Machine::new(name, "ID=arch\nPRETTY_NAME=\"Arch Linux\"\n");
+    machine.tool("pacman", ARCH_PACMAN);
+    machine
+}
+
+fn suse_machine(name: &str) -> Machine {
+    let machine = Machine::new(
+        name,
+        "ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\nPRETTY_NAME=\"openSUSE Tumbleweed\"\n",
+    );
+    machine.tool("zypper", SUSE_ZYPPER);
+    machine
+}
+
+/// `--json` with nothing to say yes with: not removed, and said as a failure.
+fn assert_not_removed_for_want_of_a_yes(out: &Output, machine: &Machine, listing: &str) {
+    let shown = report(out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    let doc = one_document(out);
+    assert_eq!(doc["status"], "error", "{shown}");
+    let message = doc["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("--yes"), "{shown}");
+    assert_eq!(machine.calls(), [listing], "nothing is removed:\n{shown}");
+}
+
+#[test]
+fn test_json_alone_removes_no_orphans_and_says_so() {
+    // Whatever is on the input: there is no one to ask.
+    let machine = arch_machine("orphans_arch_json");
+    let Some(out) = machine.run(&["--orphans", "--json"], "y\ny\n") else {
+        return;
+    };
+    assert_not_removed_for_want_of_a_yes(&out, &machine, "pacman -Qdtq");
+
+    let machine = suse_machine("orphans_suse_json");
+    let Some(out) = machine.run(&["--orphans", "--json"], "y\ny\n") else {
+        return;
+    };
+    assert_not_removed_for_want_of_a_yes(&out, &machine, "zypper packages --orphaned");
+}
+
+#[test]
+fn test_yes_removes_the_orphans_with_json_or_without() {
+    for (flags, name) in [
+        (&["--orphans", "--yes"][..], "orphans_yes"),
+        (&["--orphans", "--yes", "--json"][..], "orphans_yes_json"),
+    ] {
+        let machine = arch_machine(name);
+        let Some(out) = machine.run(flags, "") else {
+            return;
+        };
+        assert!(out.status.success(), "{flags:?}: {}", report(&out));
+        assert_eq!(
+            machine.calls(),
+            ["pacman -Qdtq", ARCH_REMOVAL],
+            "{flags:?}: {}",
+            report(&out)
+        );
+
+        let machine = suse_machine(&format!("{name}_suse"));
+        let Some(out) = machine.run(flags, "") else {
+            return;
+        };
+        assert!(out.status.success(), "{flags:?}: {}", report(&out));
+        assert_eq!(
+            machine.calls(),
+            ["zypper packages --orphaned", SUSE_REMOVAL],
+            "{flags:?}: {}",
+            report(&out)
+        );
+    }
+}
+
+#[test]
+fn test_a_person_asked_about_orphans_decides() {
+    for (answer, removed) in [("y\n", true), ("yes\n", true), ("n\n", false), ("", false)] {
+        let machine = arch_machine("orphans_asked");
+        let Some(out) = machine.run(&["--orphans"], answer) else {
+            return;
+        };
+        let shown = report(&out);
+        assert!(out.status.success(), "{answer:?}: {shown}");
+        let removals = machine
+            .calls()
+            .iter()
+            .filter(|c| *c == ARCH_REMOVAL)
+            .count();
+        assert_eq!(removals, usize::from(removed), "{answer:?}: {shown}");
+        assert!(
+            text(&out.stdout).contains("Remove orphaned packages?"),
+            "{shown}"
+        );
+    }
+}
+
+#[test]
+fn test_a_dry_run_asks_nothing_and_removes_nothing() {
+    let machine = arch_machine("orphans_dry_run");
+    let Some(out) = machine.run(&["--orphans", "--dry-run", "--json"], "") else {
+        return;
+    };
+    assert!(out.status.success(), "{}", report(&out));
+    assert_eq!(machine.calls(), ["pacman -Qdtq"], "{}", report(&out));
 }
