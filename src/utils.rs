@@ -1477,6 +1477,94 @@ fn rm_contents_with(path: &Path, mounts: io::Result<Mounts>) -> u64 {
     }
 }
 
+/// What [`sudo_sweep`] removes from a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// Every regular file below it. The directories stay.
+    Files,
+    /// All that is in it, directories too. The directory itself stays.
+    Contents,
+}
+
+/// The `find` that makes a sweep, for the real path of the directory.
+///
+/// `-xdev` comes first, as a global option: GNU find warns about one that
+/// follows a test. It keeps `find` out of another file system mounted inside the
+/// tree. `find` empties what it goes into: with a tmpfs mounted inside, both
+/// `-mindepth 1 -delete` and `-type f -delete` removed what was in it (GNU find
+/// 4.11, and BusyBox's).
+fn sweep_args(dir: &str, what: Sweep) -> Vec<&str> {
+    let mut args = vec![dir, "-xdev"];
+    match what {
+        Sweep::Files => args.extend(["-type", "f"]),
+        Sweep::Contents => args.extend(["-mindepth", "1"]),
+    }
+    args.push("-delete");
+    args
+}
+
+/// Empty a directory that only root may, as `find` run through [`sudo_quiet`]
+/// does: `true` when it was done.
+///
+/// Not when another file system is mounted inside the directory, which is left
+/// alone and said to be: what is not mounted is not worth the chance of what is.
+/// `-xdev` keeps `find` out of a file system of its own, but a bind mount is the
+/// same file system on both sides of it, and only the kernel's list shows it (see
+/// [`Mounts`]). A list that cannot be read is no answer, and the directory is
+/// left alone then too. The directory itself being a mount point is ordinary
+/// (`/var/tmp/portage` on a tmpfs): it is what is mounted inside it that counts.
+///
+/// `find` is given the real path, the one that list uses. A link as the place
+/// to start from is not followed by `find`, which then removes nothing and says
+/// that it did.
+pub fn sudo_sweep(dir: &str, what: Sweep) -> bool {
+    sweep_with(dir, what, Mounts::read(), &|args| sudo_quiet("find", args))
+}
+
+/// [`sudo_sweep`] with the list of mounts and the `find` handed in, so that a
+/// test can say what is mounted where and see what would be run.
+fn sweep_with(
+    dir: &str,
+    what: Sweep,
+    mounts: io::Result<Mounts>,
+    find: &dyn Fn(&[&str]) -> bool,
+) -> bool {
+    let real = match fs::canonicalize(dir) {
+        Ok(real) => real,
+        // Nothing there, nothing to empty.
+        Err(why) if why.kind() == io::ErrorKind::NotFound => return true,
+        Err(why) => {
+            warning(&format!(
+                "Could not resolve {dir} ({why}), so it was left alone"
+            ));
+            return false;
+        }
+    };
+    let mounts = match mounts {
+        Ok(mounts) => mounts,
+        Err(why) => {
+            warning(&format!(
+                "Could not read the list of mounts ({why}), so {dir} was left alone"
+            ));
+            return false;
+        }
+    };
+    if let Some(inside) = mounts.below(&real).next() {
+        warning(&format!(
+            "Left {dir} alone: another file system is mounted at {}",
+            inside.display()
+        ));
+        return false;
+    }
+    let Some(real) = real.to_str() else {
+        warning(&format!(
+            "{dir} is not a name that can be passed on, so it was left alone"
+        ));
+        return false;
+    };
+    find(&sweep_args(real, what))
+}
+
 /// Format bytes to human-readable string
 pub fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
@@ -4243,5 +4331,168 @@ mod tests {
         );
         fs::remove_dir_all(&base).unwrap();
         println!("CHILD-RAN");
+    }
+
+    // ── Sweeps: what root empties with `find` ──
+
+    /// What `sweep_with` ran, one entry per call, and what it answered when the
+    /// `find` it was handed answered `outcome`.
+    fn sweep_run(
+        dir: &Path,
+        what: Sweep,
+        mounts: io::Result<Mounts>,
+        outcome: bool,
+    ) -> (bool, Vec<Vec<String>>) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let done = sweep_with(dir.to_str().unwrap(), what, mounts, &|args| {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+            outcome
+        });
+        (done, calls.into_inner())
+    }
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn test_a_sweep_is_find_on_the_real_path_that_stays_in_its_file_system() {
+        use std::os::unix::fs::symlink;
+        let base = real_scratch("sweep_args");
+        fs::create_dir_all(base.join("real/sub")).unwrap();
+        symlink(base.join("real"), base.join("link")).unwrap();
+        let real = base.join("real");
+        let real = real.to_str().unwrap();
+        for (what, tail) in [
+            (Sweep::Contents, ["-mindepth", "1"]),
+            (Sweep::Files, ["-type", "f"]),
+        ] {
+            // Asked for by the link; `find` does not follow one to start with.
+            for outcome in [true, false] {
+                let (done, calls) =
+                    sweep_run(&base.join("link"), what, Ok(Mounts::default()), outcome);
+                assert_eq!(done, outcome, "the answer is find's");
+                assert_eq!(
+                    calls,
+                    [words(&[real, "-xdev", tail[0], tail[1], "-delete"])]
+                );
+            }
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_directory_with_a_file_system_mounted_inside_it_is_not_swept() {
+        let base = real_scratch("sweep_inside");
+        fs::create_dir_all(base.join("tree/deep/mnt")).unwrap();
+        fs::create_dir_all(base.join("tree2")).unwrap();
+        let (tree, deep, tree2) = (
+            base.join("tree"),
+            base.join("tree/deep/mnt"),
+            base.join("tree2"),
+        );
+        for what in [Sweep::Files, Sweep::Contents] {
+            let (done, calls) = sweep_run(&tree, what, Ok(Mounts::of(&[&deep])), true);
+            assert!(!done && calls.is_empty(), "{what:?}: {calls:?}");
+        }
+        // The directory itself being a mount point is ordinary, and a neighbour whose
+        // name begins the same is not inside it.
+        let (done, calls) = sweep_run(
+            &tree,
+            Sweep::Contents,
+            Ok(Mounts::of(&[&tree, &tree2])),
+            true,
+        );
+        assert!(done && calls.len() == 1, "{calls:?}");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_sweep_needs_the_list_of_mounts_but_not_for_what_is_not_there() {
+        let base = real_scratch("sweep_edge");
+        fs::create_dir_all(base.join("tree")).unwrap();
+        let no_list = || Err(io::Error::other("no /proc here"));
+        // No list is no answer: nothing is run, and it was not done.
+        let (done, calls) = sweep_run(&base.join("tree"), Sweep::Files, no_list(), true);
+        assert!(!done && calls.is_empty(), "{calls:?}");
+        // Nothing there: nothing to empty, and no list or `find` is needed for that.
+        let (done, calls) = sweep_run(&base.join("gone"), Sweep::Files, no_list(), false);
+        assert!(done && calls.is_empty(), "{calls:?}");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_directory_whose_real_name_cannot_be_passed_on_is_not_swept() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+        let base = real_scratch("sweep_name");
+        let odd = base.join(std::ffi::OsString::from_vec(b"odd-\xff".to_vec()));
+        fs::create_dir_all(&odd).unwrap();
+        symlink(&odd, base.join("link")).unwrap();
+        let (done, calls) = sweep_run(
+            &base.join("link"),
+            Sweep::Files,
+            Ok(Mounts::default()),
+            true,
+        );
+        assert!(!done && calls.is_empty(), "{calls:?}");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Whether a real file system can be mounted here, in a namespace that goes
+    /// with the child: what it takes to try `find` on one without touching the
+    /// machine.
+    fn can_mount_privately(dir: &Path) -> bool {
+        Command::new("unshare")
+            .args(["-Urm", "sh", "-c", "mount -t tmpfs tmpfs \"$0\""])
+            .arg(dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[test]
+    fn test_find_with_these_arguments_stays_out_of_another_file_system() {
+        let base = real_scratch("sweep_real_find");
+        if !can_mount_privately(&base) {
+            eprintln!("skipped: this machine gives no private mount namespace");
+            fs::remove_dir_all(&base).unwrap();
+            return;
+        }
+        // A tmpfs is mounted inside the tree, with what must survive in it. Run as
+        // the arguments say, `find` empties the rest and leaves what is mounted.
+        const SCRIPT: &str = r#"
+            T=$1
+            mkdir -p "$T/sub" "$T/mnt"
+            echo a > "$T/f1"; echo b > "$T/sub/f2"
+            mount -t tmpfs tmpfs "$T/mnt" || exit 90
+            echo precious > "$T/mnt/precious"
+            find "$@" > /dev/null 2>&1
+            find "$T" -mindepth 1 | sort
+        "#;
+        let tree = base.join("tree");
+        let tree = tree.to_str().unwrap();
+        for (what, left) in [
+            (Sweep::Contents, vec!["/mnt", "/mnt/precious"]),
+            (Sweep::Files, vec!["/mnt", "/mnt/precious", "/sub"]),
+        ] {
+            let out = Command::new("unshare")
+                .args(["-Urm", "sh", "-c", SCRIPT, "sh"])
+                .args(sweep_args(tree, what))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            let shown = String::from_utf8_lossy(&out.stdout).into_owned();
+            let want: Vec<String> = left.iter().map(|rest| format!("{tree}{rest}")).collect();
+            assert_eq!(shown.lines().collect::<Vec<_>>(), want, "{what:?}: {out:?}");
+            // The mount was made in the child's namespace, so none of it is here.
+            let _ = fs::remove_dir_all(tree);
+        }
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -274,7 +274,7 @@ fn clean_portage_tmp(dry_run: bool) -> u64 {
         &portage_build_dir(),
         dry_run,
         &|| emerge_builds(utils::current_privilege()),
-        &|dir| utils::sudo_quiet("find", &[dir, "-mindepth", "1", "-delete"]),
+        &|dir| utils::sudo_sweep(dir, utils::Sweep::Contents),
     )
 }
 
@@ -324,9 +324,11 @@ fn clear_build_leftovers(
     }
 
     // The contents are root-owned (built via sudo emerge), so delete through
-    // sudo. `-mindepth 1` keeps the `portage` dir itself; `-delete` handles the
-    // nested trees. What was freed is what is gone afterwards: a `find` that
-    // failed may have removed some of it, and a build started meanwhile adds to it.
+    // sudo. The `portage` dir itself stays, and so does a file system mounted
+    // inside it, which is not emptied but turns the sweep down (see
+    // `utils::sudo_sweep`). What was freed is what is gone afterwards: a `find`
+    // that failed may have removed some of it, and a build started meanwhile
+    // adds to it.
     let target = build_dir.to_string_lossy().into_owned();
     let removed = remove(&target);
     let freed = size.saturating_sub(utils::dir_size(build_dir));
@@ -1054,7 +1056,7 @@ pub fn pkg_cache(
                  (they re-download on next install) [y/N]:",
             );
             let purged = (purge && Path::new("/var/cache/apk").is_dir())
-                .then(|| utils::sudo_quiet("find", &["/var/cache/apk", "-type", "f", "-delete"]));
+                .then(|| utils::sudo_sweep("/var/cache/apk", utils::Sweep::Files));
             say(apk_verdicts(cleaned, purge, purged));
         }
 
@@ -1083,7 +1085,7 @@ pub fn pkg_cache(
                 // rather than panic on unwrap.
                 if let Some(path) = distfiles.to_str() {
                     if distfiles.is_dir() {
-                        if utils::sudo_quiet("find", &[path, "-type", "f", "-delete"]) {
+                        if utils::sudo_sweep(path, utils::Sweep::Files) {
                             utils::success("Distfiles cleaned");
                         } else {
                             utils::error(&format!("Could not clear {path}"));
@@ -1687,10 +1689,7 @@ pub fn flatpak(deep: bool, dry_run: bool) -> u64 {
 
     let sys_fp_tmp = PathBuf::from("/var/lib/flatpak/repo/tmp");
     if sys_fp_tmp.exists()
-        && !utils::sudo_quiet(
-            "find",
-            &["/var/lib/flatpak/repo/tmp", "-mindepth", "1", "-delete"],
-        )
+        && !utils::sudo_sweep("/var/lib/flatpak/repo/tmp", utils::Sweep::Contents)
     {
         utils::error("Could not clear /var/lib/flatpak/repo/tmp");
     }
@@ -1766,8 +1765,7 @@ pub fn snap(dry_run: bool) -> u64 {
     if snap_cache.exists() {
         let size = utils::dir_size(&snap_cache);
         if size > 0 {
-            let removed =
-                utils::sudo_quiet("find", &["/var/lib/snapd/cache", "-type", "f", "-delete"]);
+            let removed = utils::sudo_sweep("/var/lib/snapd/cache", utils::Sweep::Files);
             let got = size.saturating_sub(utils::dir_size(&snap_cache));
             freed += got;
             if removed {
@@ -2037,10 +2035,7 @@ pub fn coredumps(dry_run: bool) -> u64 {
         } else {
             // Direct file removal — the only portable method. `coredumpctl`
             // has no `delete` verb on current systemd, so it can't be relied on.
-            let removed = utils::sudo_quiet(
-                "find",
-                &["/var/lib/systemd/coredump", "-type", "f", "-delete"],
-            );
+            let removed = utils::sudo_sweep("/var/lib/systemd/coredump", utils::Sweep::Files);
             let after = utils::dir_size(&sd_dir);
             let got = size.saturating_sub(after);
             freed += got;
