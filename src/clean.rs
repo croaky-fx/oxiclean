@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::detect::{AurHelper, Distro, Privilege};
+use crate::mounts::Mounts;
 use crate::roots;
 use crate::utils;
 
@@ -630,14 +631,17 @@ fn partition_cache_entries(cache_dir: &Path, protected: &[String]) -> (Vec<PathB
 }
 
 /// Size of a cache entry: follows the same symlink/dir/file rules as
-/// `utils::rm_contents` so the "freed" tally matches what's actually removed.
+/// `utils::rm_contents` so the "freed" tally matches what's actually removed,
+/// which leaves out what is mounted inside it.
 ///
 /// One `symlink_metadata` call answers all three questions (symlink? dir? size?).
 /// The `is_symlink()`/`is_dir()`/`metadata()` chain it replaced re-resolved the
 /// path three times per entry.
-fn entry_size(p: &Path) -> u64 {
+fn entry_size(p: &Path, mounts: &Mounts) -> u64 {
     match std::fs::symlink_metadata(p) {
-        Ok(md) if md.is_dir() => utils::dir_size(p),
+        // Left as it is, so nothing of it is freed (see `utils::remove_entry`).
+        Ok(_) if mounts.is_mount_point(p) => 0,
+        Ok(md) if md.is_dir() => utils::dir_size_in(p, mounts),
         Ok(md) => utils::footprint_of(&md),
         Err(_) => 0,
     }
@@ -716,13 +720,38 @@ pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: 
         }
     };
 
+    // What is mounted inside the cache is not part of it, and the kernel lists
+    // mounts by their real paths: the cache is looked at by its real path too
+    // (`/home` is `/var/home` on Fedora Silverblue).
+    let real_cache = match std::fs::canonicalize(&cache) {
+        Ok(real) => real,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => {
+            utils::info("No cache directory found");
+            return 0;
+        }
+        Err(why) => {
+            utils::error(&format!("Cannot read {}: {why}", cache.display()));
+            return 0;
+        }
+    };
+    let mounts = match Mounts::read() {
+        Ok(mounts) => mounts,
+        Err(why) => {
+            utils::error(&format!(
+                "Could not read the list of mounts ({why}), so {} was left alone",
+                cache.display()
+            ));
+            return 0;
+        }
+    };
+
     // Instead of wiping ~/.cache wholesale, spare the expensive/irreplaceable
     // caches: model weights that cost gigabytes to re-download (HuggingFace,
     // torch) and dev-tool caches that `--dev` manages deliberately with the
     // right per-tool commands. A blanket wipe here would silently destroy a
     // 40 GB model download — those belong to `--dev`, not `--cache`.
     let protected = protected_cache_names(&cache, helpers, aur_running);
-    let (to_clean, skipped) = partition_cache_entries(&cache, &protected);
+    let (to_clean, skipped) = partition_cache_entries(&real_cache, &protected);
 
     // Only announce the skip when a dev-tool cache was actually spared, and
     // point the user at the flag that *can* clean it. Model caches (HuggingFace,
@@ -756,7 +785,7 @@ pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: 
                 .as_ref()
                 .map(|m| m.is_dir() && !m.is_symlink())
                 .unwrap_or(false);
-            let size = entry_size(&p);
+            let size = entry_size(&p, &mounts);
             (p, size, is_real_dir)
         })
         .collect();
@@ -788,8 +817,9 @@ pub fn user_cache(dry_run: bool, yes: bool, helpers: &[AurHelper], aur_running: 
     let mark = utils::failure_count();
     let mut emptied = utils::Emptied::default();
     for (path, size, is_dir) in &sized {
-        emptied.add(path, *size, utils::remove_entry(path, *is_dir));
+        emptied.add(path, *size, utils::remove_entry(path, *is_dir, &mounts));
     }
+    emptied.mention_left();
     if let Some(complaint) = emptied.complaint(&cache) {
         utils::error(&complaint);
     }
@@ -3645,33 +3675,60 @@ odd-notes          1.0           8      latest/stable    pub           redisable
                 .collect()
         };
         let md = |p: &Path| fs::symlink_metadata(p).unwrap();
+        let none = Mounts::default();
 
         // A file: its blocks, which is not its length.
         fs::write(base.join("file"), data(70_000)).unwrap();
         let file = utils::allocated(&md(&base.join("file")));
-        assert_eq!(entry_size(&base.join("file")), file);
+        assert_eq!(entry_size(&base.join("file"), &none), file);
         assert_ne!(file, 70_000);
 
         // A directory: what is in it, and nothing for itself.
         fs::create_dir_all(base.join("dir/sub")).unwrap();
         fs::write(base.join("dir/sub/inner"), data(70_000)).unwrap();
         assert_eq!(
-            entry_size(&base.join("dir")),
+            entry_size(&base.join("dir"), &none),
             utils::allocated(&md(&base.join("dir/sub/inner")))
         );
 
         // A link frees its own entry, never what it leads to.
         symlink(base.join("file"), base.join("link")).unwrap();
         assert_eq!(
-            entry_size(&base.join("link")),
+            entry_size(&base.join("link"), &none),
             utils::allocated(&md(&base.join("link")))
         );
-        assert!(entry_size(&base.join("link")) < 70_000);
+        assert!(entry_size(&base.join("link"), &none) < 70_000);
 
         // A file with another name stays on disk when this one goes.
         fs::hard_link(base.join("file"), base.join("twin")).unwrap();
-        assert_eq!(entry_size(&base.join("twin")), 0);
-        assert_eq!(entry_size(&base.join("missing")), 0);
+        assert_eq!(entry_size(&base.join("twin"), &none), 0);
+        assert_eq!(entry_size(&base.join("missing"), &none), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_an_entry_frees_nothing_of_what_is_mounted_in_it() {
+        use std::fs;
+        let base = cache_scratch("entry-size-mounts");
+        let put = |name: &str, len: usize| {
+            let path = base.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, vec![1u8; len]).unwrap();
+            utils::allocated(&fs::symlink_metadata(&path).unwrap())
+        };
+        let own = put("tree/own", 70_000);
+        put("tree/mnt/theirs", 90_000);
+        put("alone/theirs", 90_000);
+        let (mnt, alone) = (base.join("tree/mnt"), base.join("alone"));
+        let mounts = Mounts::of(&[&mnt, &alone]);
+
+        // Mounted inside: not counted, because it is not removed with the tree.
+        assert_eq!(entry_size(&base.join("tree"), &mounts), own);
+        // Mounted on the entry itself: all of it stays.
+        assert_eq!(entry_size(&alone, &mounts), 0);
+        // The same trees with nothing mounted are counted whole.
+        assert!(entry_size(&base.join("tree"), &Mounts::default()) > own);
+        assert!(entry_size(&alone, &Mounts::default()) > 0);
         let _ = fs::remove_dir_all(&base);
     }
 

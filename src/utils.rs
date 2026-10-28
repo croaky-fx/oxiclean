@@ -10,6 +10,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::detect::Privilege;
+use crate::mounts::Mounts;
 
 // ═══════════════════════════════════════════════════
 //  Command Execution
@@ -1062,7 +1063,11 @@ pub fn footprint_of(md: &fs::Metadata) -> u64 {
 /// What removing `path` frees: the disk space ([`allocated`]) of the files in
 /// it, skipping symlinks, with the rule for files that have other names (see
 /// [`Footprint`]). Directories are not counted, so a tree of empty directories
-/// is 0, as "nothing to clean" needs.
+/// is 0, as "nothing to clean" needs. Neither is what is on another file system
+/// mounted inside the tree: it is not removed with the tree (see
+/// [`remove_entry`]), so it is not freed either.
+///
+/// `path` is spelled the way the mounts are, a real path; [`dir_size`] takes any.
 ///
 /// Reads type and size from the `DirEntry` the directory scan already produced.
 /// The `is_symlink()` / `is_dir()` / `metadata()` chain this replaced re-resolved
@@ -1071,7 +1076,7 @@ pub fn footprint_of(md: &fs::Metadata) -> u64 {
 /// syscall count is the runtime.
 ///
 /// Iterative so a deep tree cannot overflow the stack.
-pub fn dir_size(path: &Path) -> u64 {
+pub fn dir_size_in(path: &Path, mounts: &Mounts) -> u64 {
     let Ok(top) = fs::symlink_metadata(path) else {
         return 0;
     };
@@ -1084,6 +1089,9 @@ pub fn dir_size(path: &Path) -> u64 {
         return footprint.total();
     }
 
+    // Almost no tree has a mount inside it, and then there is nothing to compare
+    // each entry with. In path order, which is how `below` hands them over.
+    let apart: Vec<&Path> = mounts.below(path).collect();
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -1096,6 +1104,11 @@ pub fn dir_size(path: &Path) -> u64 {
             if ft.is_symlink() {
                 continue;
             }
+            // A mount point is left as it is, a file too: a file can be
+            // bind-mounted over a file.
+            if !apart.is_empty() && apart.binary_search(&entry.path().as_path()).is_ok() {
+                continue;
+            }
             if ft.is_dir() {
                 stack.push(entry.path());
             } else if let Ok(md) = entry.metadata() {
@@ -1104,6 +1117,24 @@ pub fn dir_size(path: &Path) -> u64 {
         }
     }
     footprint.total()
+}
+
+/// [`dir_size_in`] for a path spelled any way, against the mounts there are now.
+/// A list of mounts that cannot be read leaves the figure as it would be
+/// without mounts: it only says what a run would free, and a run does not go on
+/// without the list.
+pub fn dir_size(path: &Path) -> u64 {
+    dir_size_against(path, &Mounts::read().unwrap_or_default())
+}
+
+/// [`dir_size`] with the mounts handed in, so that a test can say what is mounted where.
+fn dir_size_against(path: &Path, mounts: &Mounts) -> u64 {
+    // A link is not followed (see `dir_size_in`), so it is looked at before it is resolved.
+    if fs::symlink_metadata(path).is_ok_and(|md| md.is_symlink()) {
+        return 0;
+    }
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    dir_size_in(&real, mounts)
 }
 
 /// What emptying a directory came to.
@@ -1116,16 +1147,24 @@ pub struct Emptied {
     pub failed: usize,
     /// The first that is still there, and why.
     pub first_failure: Option<String>,
+    /// Mount points that were not entered, and are as they were: another file
+    /// system is not part of a cache, whatever it is mounted on.
+    pub left: Vec<PathBuf>,
 }
 
 impl Emptied {
     /// Note what became of one entry of `size` bytes (see [`remove_entry`]).
-    pub fn add(&mut self, path: &Path, size: u64, result: io::Result<bool>) {
+    pub fn add(&mut self, path: &Path, size: u64, result: io::Result<Removal>) {
         self.tried += 1;
         match result {
-            Ok(true) => self.freed += size,
-            // Gone before we got to it: nothing of ours was freed, nothing is left.
-            Ok(false) => {}
+            Ok(removal) => {
+                // What was gone before we got to it freed nothing of ours, and
+                // left nothing behind.
+                if removal.removed {
+                    self.freed += size;
+                }
+                self.left.extend(removal.left);
+            }
             Err(why) => {
                 self.failed += 1;
                 if self.first_failure.is_none() {
@@ -1133,6 +1172,30 @@ impl Emptied {
                 }
             }
         }
+    }
+
+    /// Say which mount points were left alone, and why. Not a failure: leaving
+    /// them is the job, but a directory that does not end up empty deserves
+    /// its explanation.
+    pub fn mention_left(&self) {
+        for note in self.left_notes() {
+            warning(&note);
+        }
+    }
+
+    /// One line for each mount point that was left, in the order of the paths and
+    /// not of the directory listings they came from.
+    fn left_notes(&self) -> Vec<String> {
+        let mut left: Vec<&PathBuf> = self.left.iter().collect();
+        left.sort();
+        left.into_iter()
+            .map(|mount| {
+                format!(
+                    "Kept {}: another file system is mounted there",
+                    mount.display()
+                )
+            })
+            .collect()
     }
 
     /// The error to report for emptying `dir`, when anything is still there.
@@ -1147,9 +1210,20 @@ impl Emptied {
     }
 }
 
+/// What became of one entry of a cache directory (see [`remove_entry`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Removal {
+    /// Whether it was removed or, for a tree with a mount point inside it, all
+    /// of it that is not on another file system. False when it was gone before
+    /// we got to it, and when it is a mount point itself.
+    pub removed: bool,
+    /// The mount points that were not entered, and are as they were.
+    pub left: Vec<PathBuf>,
+}
+
 /// Remove one entry of a cache directory: a file, a symlink (the link, never
-/// what it points to) or a directory tree. `Ok(true)` when it was removed,
-/// `Ok(false)` when it was already gone, which is as good.
+/// what it points to) or a directory tree. [`Removal::removed`] is false when it
+/// was already gone, which is as good.
 ///
 /// What most often stops an owner from removing a tree is a directory that has
 /// lost its write bit. Go makes its module cache read-only on purpose; an AUR
@@ -1158,9 +1232,24 @@ impl Emptied {
 /// trash the same way. `rm -rf` fails on it too. Giving the owner back access to
 /// the tree's directories and trying once more is the `chmod -R u+w` that
 /// clearing it by hand takes, and it only touches what is being deleted. What
-/// still cannot be removed after that — another user's files, a mount point —
-/// comes back as the error, for the caller to report.
-pub fn remove_entry(path: &Path, is_real_dir: bool) -> io::Result<bool> {
+/// still cannot be removed after that — another user's files — comes back as
+/// the error, for the caller to report.
+///
+/// A mount point is neither removed nor entered: another file system is not part
+/// of a cache, whatever it is mounted on, and `remove_dir_all` would go in and
+/// empty it. A tree with one inside it is removed around it, and the directories
+/// on the way to it stay. `path` is spelled the way the mounts are (see
+/// [`Mounts`]).
+pub fn remove_entry(path: &Path, is_real_dir: bool, mounts: &Mounts) -> io::Result<Removal> {
+    if mounts.is_mount_point(path) {
+        return Ok(Removal {
+            removed: false,
+            left: vec![path.to_path_buf()],
+        });
+    }
+    if is_real_dir && mounts.below(path).next().is_some() {
+        return remove_around_mounts(path, mounts);
+    }
     let attempt = || -> io::Result<bool> {
         let removed = if is_real_dir {
             fs::remove_dir_all(path)
@@ -1173,12 +1262,63 @@ pub fn remove_entry(path: &Path, is_real_dir: bool) -> io::Result<bool> {
             Err(why) => Err(why),
         }
     };
-    match attempt() {
+    let removed = match attempt() {
         Err(why) if is_real_dir && why.kind() == io::ErrorKind::PermissionDenied => {
             make_dirs_accessible(path);
             attempt()
         }
         outcome => outcome,
+    }?;
+    Ok(Removal {
+        removed,
+        left: Vec::new(),
+    })
+}
+
+/// Remove what is in `dir` and not on another file system: mount points are
+/// left as they are, and so are the directories on the way to them. What cannot
+/// be removed does not stop the rest, and the first such error is the one
+/// returned.
+fn remove_around_mounts(dir: &Path, mounts: &Mounts) -> io::Result<Removal> {
+    // A directory that cannot be listed is not one that can be opened either, so
+    // there is no access to give back: it is reported (see `grant_if_unchanged`).
+    let entries = match fs::read_dir(dir) {
+        Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(Removal::default()),
+        other => other?,
+    };
+    let mut removal = Removal {
+        removed: true,
+        left: Vec::new(),
+    };
+    let mut first_error = None;
+    for entry in entries {
+        let outcome = entry.and_then(|entry| {
+            let path = entry.path();
+            let is_real_dir = match entry.metadata() {
+                Ok(md) => md.is_dir() && !md.is_symlink(),
+                Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(Removal::default()),
+                Err(why) => return Err(why),
+            };
+            let mut outcome = remove_entry(&path, is_real_dir, mounts);
+            // `dir` stays, so it is given back no more than the write access
+            // that taking something out of it needs, and only when that was the
+            // reason it could not be done.
+            if matches!(&outcome, Err(why) if why.kind() == io::ErrorKind::PermissionDenied) {
+                grant_owner_access(dir);
+                outcome = remove_entry(&path, is_real_dir, mounts);
+            }
+            outcome
+        });
+        match outcome {
+            Ok(inner) => removal.left.extend(inner.left),
+            Err(why) => {
+                first_error.get_or_insert(why);
+            }
+        }
+    }
+    match first_error {
+        Some(why) => Err(why),
+        None => Ok(removal),
     }
 }
 
@@ -1246,8 +1386,10 @@ fn is_same_directory(seen: &fs::Metadata, opened: &fs::Metadata) -> bool {
 }
 
 /// Empty a directory, keeping the directory itself. `Err` only when it exists
-/// and cannot be read; what could not be removed is in the [`Emptied`].
-fn empty_dir(path: &Path) -> io::Result<Emptied> {
+/// and cannot be read; what could not be removed is in the [`Emptied`], and so
+/// are the mount points that were left alone. `path` is spelled the way the
+/// mounts are (see [`Mounts`]).
+fn empty_dir(path: &Path, mounts: &Mounts) -> io::Result<Emptied> {
     let mut emptied = Emptied::default();
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
@@ -1273,12 +1415,14 @@ fn empty_dir(path: &Path) -> io::Result<Emptied> {
             }
         };
         let is_real_dir = md.is_dir() && !md.is_symlink();
-        let size = if is_real_dir {
-            dir_size(&p)
+        let size = if mounts.is_mount_point(&p) {
+            0
+        } else if is_real_dir {
+            dir_size_in(&p, mounts)
         } else {
             footprint_of(&md)
         };
-        emptied.add(&p, size, remove_entry(&p, is_real_dir));
+        emptied.add(&p, size, remove_entry(&p, is_real_dir, mounts));
     }
     Ok(emptied)
 }
@@ -1286,10 +1430,41 @@ fn empty_dir(path: &Path) -> io::Result<Emptied> {
 /// Remove all contents inside a directory (keeps the dir itself).
 /// Returns total bytes freed. What could not be removed is reported as an error,
 /// once for the directory: a "freed" figure that quietly leaves out what stayed
-/// behind is how a cache that never shrinks goes unnoticed.
+/// behind is how a cache that never shrinks goes unnoticed. What is mounted
+/// inside the directory is left as it is, with a note, and is not an error.
 pub fn rm_contents(path: &Path) -> u64 {
-    match empty_dir(path) {
+    rm_contents_with(path, Mounts::read())
+}
+
+/// [`rm_contents`] with the list of mounts handed in, so that a test can say
+/// what is mounted where.
+fn rm_contents_with(path: &Path, mounts: io::Result<Mounts>) -> u64 {
+    // The mounts are listed by their real paths, so the paths below must be real
+    // too: `/home` is a link to `/var/home` on Fedora Silverblue.
+    let root = match fs::canonicalize(path) {
+        Ok(root) => root,
+        // Nothing there, nothing to empty.
+        Err(why) if why.kind() == io::ErrorKind::NotFound => return 0,
+        Err(why) => {
+            error(&format!("Could not read {}: {why}", path.display()));
+            return 0;
+        }
+    };
+    let mounts = match mounts {
+        Ok(mounts) => mounts,
+        Err(why) => {
+            // Emptying a tree without knowing what is mounted in it is how a
+            // cache run empties something that is not a cache.
+            error(&format!(
+                "Could not read the list of mounts ({why}), so {} was left alone",
+                path.display()
+            ));
+            return 0;
+        }
+    };
+    match empty_dir(&root, &mounts) {
         Ok(emptied) => {
+            emptied.mention_left();
             if let Some(complaint) = emptied.complaint(path) {
                 error(&complaint);
             }
@@ -2442,6 +2617,12 @@ mod tests {
         dir
     }
 
+    /// `remove_entry` with nothing mounted anywhere, answering as it did before
+    /// mounts were looked at: whether the entry was removed.
+    fn remove_plain(path: &Path, is_real_dir: bool) -> io::Result<bool> {
+        remove_entry(path, is_real_dir, &Mounts::default()).map(|removal| removal.removed)
+    }
+
     /// Put a tool called `name` in `dir`: a symlink that behaves like `sh`.
     fn sh_as(dir: &Path, name: &str) -> PathBuf {
         let link = dir.join(name);
@@ -3457,7 +3638,7 @@ mod tests {
             assert!(fs::remove_dir_all(&tree).is_err());
             assert!(tree.join("a/b/c/file").exists());
         }
-        let removed = remove_entry(&tree, true);
+        let removed = remove_plain(&tree, true);
         assert!(matches!(removed, Ok(true)), "{removed:?}");
         assert!(!tree.exists());
         fs::remove_dir_all(&base).unwrap();
@@ -3538,8 +3719,8 @@ mod tests {
     #[test]
     fn test_an_entry_that_is_already_gone_is_not_an_error() {
         let base = scratch("gone");
-        assert!(matches!(remove_entry(&base.join("nope"), false), Ok(false)));
-        assert!(matches!(remove_entry(&base.join("nope"), true), Ok(false)));
+        assert!(matches!(remove_plain(&base.join("nope"), false), Ok(false)));
+        assert!(matches!(remove_plain(&base.join("nope"), true), Ok(false)));
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -3559,7 +3740,7 @@ mod tests {
         symlink(outside.join("keep"), tree.join("a/link_to_file")).unwrap();
         read_only_tree(&tree);
 
-        let removed = remove_entry(&tree, true);
+        let removed = remove_plain(&tree, true);
         assert!(matches!(removed, Ok(true)), "{removed:?}");
         assert!(!tree.exists());
         // Neither the directory a link points to nor anything inside it.
@@ -3574,7 +3755,7 @@ mod tests {
         // A link handed in directly is removed as the link it is.
         let link = base.join("direct");
         symlink(&outside, &link).unwrap();
-        assert!(matches!(remove_entry(&link, false), Ok(true)));
+        assert!(matches!(remove_plain(&link, false), Ok(true)));
         assert!(outside.join("keep").is_file());
         chmod(&outside, 0o755);
         chmod(&outside_sub, 0o755);
@@ -3621,8 +3802,8 @@ mod tests {
         fs::write(parent.join("file"), b"x").unwrap();
         // The entries of `parent` cannot be unlinked, whatever is done to them.
         chmod(&parent, 0o555);
-        let file = remove_entry(&parent.join("file"), false);
-        let tree = remove_entry(&parent.join("tree"), true);
+        let file = remove_plain(&parent.join("file"), false);
+        let tree = remove_plain(&parent.join("tree"), true);
         chmod(&parent, 0o755);
         assert_eq!(file.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(tree.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
@@ -3636,20 +3817,23 @@ mod tests {
         fs::write(base.join("a"), vec![0u8; 100]).unwrap();
         fs::create_dir_all(base.join("d")).unwrap();
         fs::write(base.join("d/b"), vec![0u8; 200]).unwrap();
-        let emptied = empty_dir(&base).unwrap();
+        let emptied = empty_dir(&base, &Mounts::default()).unwrap();
         assert_eq!((emptied.tried, emptied.failed), (2, 0));
         assert!(emptied.freed >= 300, "{emptied:?}");
         assert!(emptied.complaint(&base).is_none());
         assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
 
         // A directory that is not there has nothing to empty.
-        assert_eq!(empty_dir(&base.join("nope")).unwrap(), Emptied::default());
+        assert_eq!(
+            empty_dir(&base.join("nope"), &Mounts::default()).unwrap(),
+            Emptied::default()
+        );
 
         if !is_root() {
             fs::write(base.join("x"), b"1").unwrap();
             fs::write(base.join("y"), b"2").unwrap();
             chmod(&base, 0o555);
-            let emptied = empty_dir(&base);
+            let emptied = empty_dir(&base, &Mounts::default());
             chmod(&base, 0o755);
             let emptied = emptied.unwrap();
             assert_eq!((emptied.freed, emptied.tried, emptied.failed), (0, 2, 2));
@@ -3662,7 +3846,7 @@ mod tests {
 
             // One that exists and cannot be read is an error of its own.
             chmod(&base, 0o000);
-            let unreadable = empty_dir(&base);
+            let unreadable = empty_dir(&base, &Mounts::default());
             chmod(&base, 0o755);
             assert!(unreadable.is_err());
         }
@@ -3672,14 +3856,21 @@ mod tests {
     #[test]
     fn test_the_complaint_names_the_count_the_first_entry_and_the_reason() {
         let mut emptied = Emptied::default();
-        emptied.add(Path::new("/c/a"), 10, Ok(true));
+        emptied.add(
+            Path::new("/c/a"),
+            10,
+            Ok(Removal {
+                removed: true,
+                left: Vec::new(),
+            }),
+        );
         emptied.add(
             Path::new("/c/b"),
             20,
             Err(io::Error::from(io::ErrorKind::PermissionDenied)),
         );
         emptied.add(Path::new("/c/c"), 30, Err(io::Error::other("busy")));
-        emptied.add(Path::new("/c/d"), 40, Ok(false));
+        emptied.add(Path::new("/c/d"), 40, Ok(Removal::default()));
         assert_eq!((emptied.freed, emptied.tried, emptied.failed), (10, 4, 2));
         assert_eq!(
             emptied.complaint(Path::new("/c")).unwrap(),
@@ -3719,6 +3910,337 @@ mod tests {
         chmod(&stuck, 0o755);
         chmod(&locked, 0o755);
         println!("FREED={freed} NEW-FAILURES={}", failure_count() - before);
+        fs::remove_dir_all(&base).unwrap();
+        println!("CHILD-RAN");
+    }
+
+    // ── Mounts: another file system is not part of the tree that holds it ──
+    //
+    // Nothing here mounts anything: a directory a test calls a mount point is an
+    // ordinary directory that the list of mounts it hands over names. If the
+    // code went in anyway, it would remove what is in it, and the test would see.
+
+    /// A scratch directory spelled the way the kernel lists mounts: a real path.
+    fn real_scratch(name: &str) -> PathBuf {
+        fs::canonicalize(scratch(name)).unwrap()
+    }
+
+    /// Write `len` bytes to `path`, making its directories.
+    fn put(path: &Path, len: usize) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, vec![1u8; len]).unwrap();
+    }
+
+    /// A tree with ordinary files and two directories that count as mount points,
+    /// `m1` straight in it and `d/inner/m2` further down, each with a file or two.
+    fn tree_with_two_mounts(root: &Path) -> Mounts {
+        put(&root.join("f"), 5000);
+        put(&root.join("d/g"), 5000);
+        put(&root.join("d/inner/j"), 5000);
+        put(&root.join("m1/keep1"), 70_000);
+        put(&root.join("m1/sub/more"), 5000);
+        put(&root.join("d/inner/m2/keep2"), 90_000);
+        let (m1, m2) = (root.join("m1"), root.join("d/inner/m2"));
+        Mounts::of(&[&m1, &m2])
+    }
+
+    #[test]
+    fn test_what_is_mounted_inside_a_tree_is_not_counted_in_it() {
+        let base = real_scratch("mount_size");
+        let mounts = tree_with_two_mounts(&base);
+        let outside = on_disk(&base.join("f"))
+            + on_disk(&base.join("d/g"))
+            + on_disk(&base.join("d/inner/j"));
+        let inside = on_disk(&base.join("m1/keep1"))
+            + on_disk(&base.join("m1/sub/more"))
+            + on_disk(&base.join("d/inner/m2/keep2"));
+        assert_eq!(dir_size_in(&base, &mounts), outside);
+        assert_eq!(
+            dir_size_in(&base, &Mounts::default()),
+            outside + inside,
+            "with nothing mounted it is all of it"
+        );
+        // Asked for by its own name, a mounted tree is counted: whoever asks wants it.
+        assert_eq!(
+            dir_size_in(&base.join("m1"), &mounts),
+            on_disk(&base.join("m1/keep1")) + on_disk(&base.join("m1/sub/more"))
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_tree_reached_through_a_link_is_measured_around_its_mounts() {
+        use std::os::unix::fs::symlink;
+        let base = real_scratch("mount_size_link");
+        put(&base.join("real/cache/own"), 5000);
+        put(&base.join("real/cache/mnt/theirs"), 90_000);
+        symlink(base.join("real"), base.join("link")).unwrap();
+        // The kernel lists the real path, the tree is asked for by the link.
+        let mnt = base.join("real/cache/mnt");
+        let mounts = Mounts::of(&[&mnt]);
+        let own = on_disk(&base.join("real/cache/own"));
+        assert_eq!(dir_size_against(&base.join("link/cache"), &mounts), own);
+        // A link itself is not followed: nothing is counted for it.
+        assert_eq!(dir_size_against(&base.join("link"), &mounts), 0);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_file_mounted_over_a_file_is_left_and_not_counted_either() {
+        let base = real_scratch("mount_file");
+        put(&base.join("plain"), 5000);
+        put(&base.join("sub/bound"), 70_000);
+        let bound = base.join("sub/bound");
+        let mounts = Mounts::of(&[&bound]);
+        let plain = on_disk(&base.join("plain"));
+        assert_eq!(dir_size_in(&base, &mounts), plain);
+        let emptied = empty_dir(&base, &mounts).unwrap();
+        assert_eq!(emptied.freed, plain, "{emptied:?}");
+        assert_eq!(emptied.left, vec![bound.clone()]);
+        assert_eq!(emptied.failed, 0, "{emptied:?}");
+        assert!(bound.is_file() && !base.join("plain").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_mount_point_is_neither_removed_nor_entered() {
+        let base = real_scratch("mount_entry");
+        let mounts = tree_with_two_mounts(&base);
+        let m1 = base.join("m1");
+        let removal = remove_entry(&m1, true, &mounts).unwrap();
+        assert_eq!(
+            removal,
+            Removal {
+                removed: false,
+                left: vec![m1.clone()]
+            }
+        );
+        assert!(m1.join("keep1").is_file() && m1.join("sub/more").is_file());
+
+        // A file can be one: a bind mount over a file.
+        let file = base.join("f");
+        let removal = remove_entry(&file, false, &Mounts::of(&[&file])).unwrap();
+        assert!(!removal.removed);
+        assert_eq!(removal.left, vec![file.clone()]);
+        assert!(file.is_file());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_tree_is_removed_around_the_mounts_inside_it() {
+        let base = real_scratch("mount_around");
+        let mounts = tree_with_two_mounts(&base);
+        let removal = remove_entry(&base.join("d"), true, &mounts).unwrap();
+        assert!(removal.removed);
+        assert_eq!(removal.left, vec![base.join("d/inner/m2")]);
+        assert!(!base.join("d/g").exists() && !base.join("d/inner/j").exists());
+        assert!(
+            base.join("d/inner/m2/keep2").is_file(),
+            "what is mounted is as it was"
+        );
+        // The directories on the way to it stay, and so does everything else.
+        assert!(base.join("d/inner").is_dir());
+        assert!(base.join("f").is_file() && base.join("m1/keep1").is_file());
+
+        // The whole tree as one entry, both mounts inside it.
+        let removal = remove_entry(&base, true, &mounts).unwrap();
+        let mut left = removal.left;
+        left.sort();
+        assert_eq!(left, vec![base.join("d/inner/m2"), base.join("m1")]);
+        assert!(!base.join("f").exists());
+        assert!(base.join("m1/keep1").is_file() && base.join("m1/sub/more").is_file());
+        assert!(base.join("d/inner/m2/keep2").is_file());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_only_what_was_removed_counts_as_freed_and_what_failed_is_counted() {
+        let mut emptied = Emptied::default();
+        // Gone before we got to it: it freed nothing of ours, and nothing is left.
+        emptied.add(Path::new("/c/gone"), 500, Ok(Removal::default()));
+        // A mount point: left as it is, so nothing is freed either.
+        let mnt = PathBuf::from("/c/mnt");
+        let kept = Removal {
+            removed: false,
+            left: vec![mnt.clone()],
+        };
+        emptied.add(&mnt, 900, Ok(kept));
+        emptied.add(
+            Path::new("/c/file"),
+            700,
+            Ok(Removal {
+                removed: true,
+                left: Vec::new(),
+            }),
+        );
+        assert_eq!(emptied.freed, 700, "{emptied:?}");
+        assert_eq!((emptied.tried, emptied.failed), (3, 0), "{emptied:?}");
+        assert_eq!(emptied.left, vec![mnt]);
+        assert!(emptied.complaint(Path::new("/c")).is_none());
+
+        emptied.add(
+            Path::new("/c/stuck"),
+            100,
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        );
+        assert_eq!((emptied.tried, emptied.failed, emptied.freed), (4, 1, 700));
+        let complaint = emptied.complaint(Path::new("/c")).unwrap();
+        assert!(
+            complaint.starts_with("Could not remove 1 of 4 item(s) in /c: /c/stuck: "),
+            "{complaint}"
+        );
+    }
+
+    #[test]
+    fn test_the_mounts_that_were_left_are_named_in_the_order_of_their_paths() {
+        let emptied = Emptied {
+            left: vec![
+                PathBuf::from("/c/m"),
+                PathBuf::from("/a/z"),
+                PathBuf::from("/a/b/c"),
+            ],
+            ..Emptied::default()
+        };
+        assert_eq!(
+            emptied.left_notes(),
+            [
+                "Kept /a/b/c: another file system is mounted there",
+                "Kept /a/z: another file system is mounted there",
+                "Kept /c/m: another file system is mounted there",
+            ]
+        );
+        assert!(Emptied::default().left_notes().is_empty());
+    }
+
+    #[test]
+    fn test_a_name_that_begins_like_a_mount_point_is_not_one() {
+        let base = real_scratch("mount_prefix");
+        put(&base.join("m/keep"), 5000);
+        put(&base.join("mm/x"), 5000);
+        put(&base.join("m.c"), 5000);
+        let m = base.join("m");
+        let emptied = empty_dir(&base, &Mounts::of(&[&m])).unwrap();
+        assert_eq!(emptied.left, vec![m.clone()]);
+        assert_eq!(emptied.failed, 0, "{emptied:?}");
+        assert!(m.join("keep").is_file());
+        assert!(!base.join("mm").exists() && !base.join("m.c").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_emptying_around_mounts_frees_what_the_preview_said() {
+        let base = real_scratch("mount_empty");
+        let mounts = tree_with_two_mounts(&base);
+        let preview = dir_size_in(&base, &mounts);
+        assert!(preview > 0);
+        let emptied = empty_dir(&base, &mounts).unwrap();
+        assert_eq!(emptied.freed, preview, "{emptied:?}");
+        // Leaving a mount alone is the job, not a failure.
+        assert_eq!((emptied.tried, emptied.failed), (3, 0), "{emptied:?}");
+        assert!(emptied.complaint(&base).is_none());
+        let mut left = emptied.left.clone();
+        left.sort();
+        assert_eq!(left, vec![base.join("d/inner/m2"), base.join("m1")]);
+        let mut remaining: Vec<String> = fs::read_dir(&base)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, ["d", "m1"]);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_cache_reached_through_a_link_is_still_emptied_around_its_mounts() {
+        use std::os::unix::fs::symlink;
+        let base = real_scratch("mount_link");
+        put(&base.join("real/cache/file"), 5000);
+        put(&base.join("real/cache/mnt/keep"), 5000);
+        symlink(base.join("real"), base.join("link")).unwrap();
+        // The kernel lists the real path; the cache is asked for by the link, as
+        // `/home/me/.cache` is on a system where `/home` is `/var/home`.
+        let mnt = base.join("real/cache/mnt");
+        let freed = rm_contents_with(&base.join("link/cache"), Ok(Mounts::of(&[&mnt])));
+        assert!(freed > 0);
+        assert!(!base.join("real/cache/file").exists());
+        assert!(base.join("real/cache/mnt/keep").is_file());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_a_directory_on_the_way_to_a_mount_is_opened_just_enough_to_empty_it() {
+        if is_root() {
+            return; // root can remove anything
+        }
+        let base = real_scratch("mount_perm");
+        put(&base.join("top/f"), 5000);
+        put(&base.join("top/m/keep"), 5000);
+        let m = base.join("top/m");
+        chmod(&base.join("top"), 0o555);
+        let removal = remove_entry(&base.join("top"), true, &Mounts::of(&[&m]));
+        let mode = mode_of(&base.join("top"));
+        chmod(&base.join("top"), 0o755);
+        let removal = removal.unwrap();
+        assert!(removal.removed);
+        assert!(!base.join("top/f").exists());
+        assert!(base.join("top/m/keep").is_file());
+        // It stays, so it got the owner's write access back and nothing else.
+        assert_eq!(mode, 0o755);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_without_the_list_of_mounts_nothing_is_removed() {
+        const ME: &str = "utils::tests::test_without_the_list_of_mounts_nothing_is_removed";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                stdout.contains("Could not read the list of mounts (no /proc here), so "),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("FREED=0 STILL-THERE=true NEW-FAILURES=1"),
+                "{stdout}"
+            );
+            return;
+        }
+        let base = real_scratch("mount_nolist");
+        put(&base.join("cache/file"), 5000);
+        let before = failure_count();
+        let freed = rm_contents_with(&base.join("cache"), Err(io::Error::other("no /proc here")));
+        println!(
+            "FREED={freed} STILL-THERE={} NEW-FAILURES={}",
+            base.join("cache/file").exists(),
+            failure_count() - before
+        );
+        fs::remove_dir_all(&base).unwrap();
+        println!("CHILD-RAN");
+    }
+
+    #[test]
+    fn test_what_is_left_alone_is_said_and_is_not_a_failure() {
+        const ME: &str = "utils::tests::test_what_is_left_alone_is_said_and_is_not_a_failure";
+        if env::var_os(CHILD_ENV).is_none() {
+            let stdout = child_stdout(ME);
+            assert!(
+                stdout.contains("another file system is mounted there"),
+                "{stdout}"
+            );
+            assert!(stdout.contains("/cache/mnt"), "{stdout}");
+            assert!(stdout.contains("NEW-FAILURES=0"), "{stdout}");
+            return;
+        }
+        let base = real_scratch("mount_said");
+        put(&base.join("cache/file"), 5000);
+        put(&base.join("cache/mnt/keep"), 5000);
+        let before = failure_count();
+        let mnt = base.join("cache/mnt");
+        let freed = rm_contents_with(&base.join("cache"), Ok(Mounts::of(&[&mnt])));
+        println!(
+            "FREED={} NEW-FAILURES={}",
+            freed > 0,
+            failure_count() - before
+        );
         fs::remove_dir_all(&base).unwrap();
         println!("CHILD-RAN");
     }

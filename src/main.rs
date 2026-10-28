@@ -1,6 +1,7 @@
 mod clean;
 mod detect;
 mod dev;
+mod mounts;
 mod roots;
 mod update;
 mod utils;

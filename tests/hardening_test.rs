@@ -1800,3 +1800,244 @@ fn test_a_pip_variable_that_names_home_is_refused_in_the_report() {
     assert_eq!(out.status.code(), Some(1), "{}", report(&out));
     sb.cleanup();
 }
+
+// ── A cache with another file system mounted inside it ──
+//
+// Real mounts, in a mount namespace of the test's own (`unshare -Urm`): nothing
+// is mounted on the developer's machine, and the mounts are gone with the
+// child. A machine that does not let a user have one (a hardened kernel, some
+// containers) skips these, and the unit tests, which hand over a made-up list
+// of mounts, are what is left of them there.
+
+/// Run `script` with `sh -c`, `args` being `$1`, `$2`, … in it, as the root of a
+/// user and mount namespace made for it. `None` when this machine does not
+/// allow that.
+fn in_private_mounts(script: &str, args: &[&Path]) -> Option<Output> {
+    let probe_dir = scratch("mount_probe");
+    let probe = Command::new("unshare")
+        .args(["-Urm", "sh", "-c", "mount -t tmpfs tmpfs \"$0\""])
+        .arg(&probe_dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .output();
+    remove_unmounted(&probe_dir);
+    if !probe.is_ok_and(|out| out.status.success()) {
+        eprintln!("skipped: this machine gives no private mount namespace");
+        return None;
+    }
+    Some(
+        Command::new("unshare")
+            .args(["-Urm", "sh", "-c", script, "sh"])
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap(),
+    )
+}
+
+/// Remove a scratch directory, unless this process can see something mounted in
+/// it: a test must not be able to empty what it has mounted, whatever went wrong.
+fn remove_unmounted(dir: &Path) {
+    let table = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    if !table.is_empty() && !table.contains(dir.to_str().unwrap()) {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// The part of a script's output that follows the line `@@ <name>`.
+fn section<'a>(output: &'a str, name: &str) -> &'a str {
+    let marker = format!("@@ {name}\n");
+    let start = output.find(&marker).map(|at| at + marker.len());
+    let rest = start.map(|at| &output[at..]).unwrap_or("");
+    rest.split("\n@@ ").next().unwrap_or("")
+}
+
+/// What `label` is followed by on the first line that has it, to the end of it.
+fn after(section: &str, label: &str) -> String {
+    section
+        .lines()
+        .find_map(|line| {
+            line.split_once(label)
+                .map(|(_, rest)| rest.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+const CACHE_WITH_MOUNTS: &str = r#"
+set -u
+BIN=$1; W=$2
+C=$W/real/home/u/.cache
+mkdir -p "$C/plain/sub" "$C/deep/inner/bound" "$C/mnt" "$W/source" "$W/empty"
+ln -s real "$W/link"
+head -c 300000 /dev/zero > "$C/plain/a"
+head -c 100000 /dev/zero > "$C/plain/sub/b"
+head -c 200000 /dev/zero > "$C/deep/f"
+mount -t tmpfs tmpfs "$C/mnt" || exit 90
+echo precious > "$C/mnt/precious"
+echo precious > "$W/source/precious"
+mount -o bind "$W/source" "$C/deep/inner/bound" || exit 91
+echo precious > "$W/source-file"
+: > "$C/deep/inner/file"
+mount -o bind "$W/source-file" "$C/deep/inner/file" || exit 92
+run() {
+  env -i HOME="$W/link/home/u" PATH="$W/empty" TERM=dumb NO_COLOR=1 "$BIN" "$@" 2>&1
+  echo "status=$?"
+}
+echo "@@ dry run"
+run --cache --dry-run
+echo "@@ run"
+run --cache --yes
+echo "@@ left"
+(cd "$C" && find . -mindepth 1 | sort)
+"#;
+
+#[test]
+fn test_a_cache_with_other_file_systems_mounted_in_it_keeps_them() {
+    let work = fs::canonicalize(scratch("mounted_cache")).unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_oxiclean"));
+    let Some(out) = in_private_mounts(CACHE_WITH_MOUNTS, &[exe, &work]) else {
+        remove_unmounted(&work);
+        return;
+    };
+    let shown = report(&out);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "the script itself failed:\n{shown}");
+    let (dry, real, left) = (
+        section(&stdout, "dry run"),
+        section(&stdout, "run"),
+        section(&stdout, "left"),
+    );
+
+    // The home directory is reached through a link, as /home is /var/home on
+    // Fedora Silverblue, and what the kernel lists is the real path.
+    let cache = work.join("real/home/u/.cache");
+    for kept in ["mnt", "deep/inner/bound", "deep/inner/file"] {
+        let line = format!(
+            "Kept {}: another file system is mounted there",
+            cache.join(kept).display()
+        );
+        assert!(real.contains(&line), "{line}\n{shown}");
+    }
+    // In the order of the paths, not of the directory listings.
+    let said: Vec<&str> = real.lines().filter(|l| l.contains("Kept ")).collect();
+    let mut sorted = said.clone();
+    sorted.sort();
+    assert_eq!((said.len(), said), (3, sorted), "{shown}");
+    // Leaving them is the job: nothing failed, and the preview was right.
+    assert!(real.contains("status=0"), "{shown}");
+    assert!(!real.contains("Could not"), "{shown}");
+    let (would, freed) = (after(dry, "Would free "), after(real, "Freed "));
+    assert!(
+        !freed.is_empty() && would == freed,
+        "{would:?} / {freed:?}\n{shown}"
+    );
+    assert!(dry.contains("status=0"), "{shown}");
+
+    // What is mounted there is as it was, and so is what it is mounted from.
+    assert_eq!(
+        left.lines().collect::<Vec<_>>(),
+        [
+            "./deep",
+            "./deep/inner",
+            "./deep/inner/bound",
+            "./deep/inner/bound/precious",
+            "./deep/inner/file",
+            "./mnt",
+            "./mnt/precious",
+        ],
+        "{shown}"
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("source/precious")).unwrap(),
+        "precious\n"
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("source-file")).unwrap(),
+        "precious\n"
+    );
+    remove_unmounted(&work);
+}
+
+const CACHE_THAT_IS_A_MOUNT: &str = r#"
+set -u
+BIN=$1; W=$2
+C=$W/home/.cache
+mkdir -p "$C" "$W/empty"
+mount -t tmpfs tmpfs "$C" || exit 90
+mkdir -p "$C/plain/sub"
+head -c 300000 /dev/zero > "$C/plain/sub/a"
+head -c 100000 /dev/zero > "$C/b"
+echo "@@ run"
+env -i HOME="$W/home" PATH="$W/empty" TERM=dumb NO_COLOR=1 "$BIN" --cache --yes 2>&1
+echo "status=$?"
+echo "@@ left"
+(cd "$C" && find . -mindepth 1 | sort)
+"#;
+
+#[test]
+fn test_a_cache_that_is_itself_a_mount_is_still_emptied() {
+    // ~/.cache on a file system of its own is ordinary; it is what is mounted
+    // *inside* it that is not part of it.
+    let work = fs::canonicalize(scratch("cache_is_mount")).unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_oxiclean"));
+    let Some(out) = in_private_mounts(CACHE_THAT_IS_A_MOUNT, &[exe, &work]) else {
+        remove_unmounted(&work);
+        return;
+    };
+    let shown = report(&out);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "the script itself failed:\n{shown}");
+    let (real, left) = (section(&stdout, "run"), section(&stdout, "left"));
+    assert!(real.contains("status=0"), "{shown}");
+    assert!(real.contains("Freed "), "{shown}");
+    assert!(
+        !real.contains("Kept") && !real.contains("Could not"),
+        "{shown}"
+    );
+    assert_eq!(left, "", "the cache is not empty:\n{shown}");
+    remove_unmounted(&work);
+}
+
+const CACHE_WITHOUT_THE_MOUNT_LIST: &str = r#"
+set -u
+BIN=$1; W=$2
+C=$W/home/.cache
+mkdir -p "$C/plain" "$W/empty"
+head -c 300000 /dev/zero > "$C/plain/a"
+mount -t tmpfs tmpfs /proc || exit 90
+echo "@@ run"
+env -i HOME="$W/home" PATH="$W/empty" TERM=dumb NO_COLOR=1 "$BIN" --cache --yes 2>&1
+echo "status=$?"
+echo "@@ left"
+(cd "$C" && find . -mindepth 1 | sort)
+"#;
+
+#[test]
+fn test_a_cache_is_left_alone_when_the_mounts_cannot_be_listed() {
+    // With /proc hidden there is no list of what is mounted where, and emptying
+    // a tree without it is how a cache run empties something that is not one.
+    let work = fs::canonicalize(scratch("cache_no_mount_list")).unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_oxiclean"));
+    let Some(out) = in_private_mounts(CACHE_WITHOUT_THE_MOUNT_LIST, &[exe, &work]) else {
+        remove_unmounted(&work);
+        return;
+    };
+    let shown = report(&out);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "the script itself failed:\n{shown}");
+    let (real, left) = (section(&stdout, "run"), section(&stdout, "left"));
+    assert!(real.contains("status=1"), "{shown}");
+    assert!(
+        real.contains("Could not read the list of mounts"),
+        "{shown}"
+    );
+    assert!(!real.contains("Freed "), "{shown}");
+    assert_eq!(
+        left.lines().collect::<Vec<_>>(),
+        ["./plain", "./plain/a"],
+        "{shown}"
+    );
+    remove_unmounted(&work);
+}
