@@ -416,6 +416,72 @@ fn parse_make_conf_var(make_conf: &str, key: &str) -> Option<String> {
     found
 }
 
+/// The question put to a person before every file in DISTDIR goes.
+fn distfiles_question(dir: &Path) -> String {
+    format!(
+        "Without eclean it is all or nothing: remove EVERY file in {}? (they \
+         download again, but not what was fetched by hand) [y/N]:",
+        dir.display()
+    )
+}
+
+/// Gentoo's distfiles when there is no `eclean`: they all go, or none do.
+///
+/// `eclean distfiles` keeps whatever an ebuild in the tree still wants, and
+/// `--fetch-restricted` what was downloaded by hand. Without it nothing tells
+/// the obsolete from the rest, and what is left is to empty DISTDIR. That costs a
+/// download for every file in it and loses the ones a `RESTRICT=fetch` package
+/// needs, which its user put there by hand. Like the Alpine cache purge, which
+/// costs a download too, it takes `--deep` or an answer: `may` is asked about
+/// the directory that would be emptied.
+///
+/// That directory is emptied as root, and portage reads DISTDIR from the
+/// environment before it reads make.conf (make.conf(5)), so it goes through
+/// [`roots::check`] as a root the environment can name does, and is looked at by
+/// its real path from there on. `sweep` empties it.
+fn distfiles_without_eclean(
+    ctx: &roots::Context,
+    distdir: &Path,
+    may: impl FnOnce(&Path) -> bool,
+    sweep: impl FnOnce(&str) -> bool,
+) -> Vec<Verdict> {
+    use roots::{Reject, Source};
+
+    let dir = match roots::check(ctx, distdir, Source::System) {
+        Ok(dir) => dir,
+        Err(Reject::Missing) => {
+            return vec![skipped(&format!(
+                "No distfiles directory ({}) — nothing to clean",
+                distdir.display()
+            ))];
+        }
+        Err(Reject::Unsafe(why)) => {
+            return vec![failed(&format!(
+                "Refusing to clean DISTDIR {} — {why}",
+                distdir.display()
+            ))];
+        }
+    };
+    if !may(dir.as_path()) {
+        return vec![skipped(&format!(
+            "Distfiles in {} left alone — without eclean they could only all go, which --deep does",
+            dir.display()
+        ))];
+    }
+    // The directory is handed over as text, which a name need not be.
+    let Some(path) = dir.to_str() else {
+        return vec![failed(&format!(
+            "Cannot clear {}: its name is not text",
+            dir.display()
+        ))];
+    };
+    if sweep(path) {
+        vec![done(&format!("Distfiles cleared ({path})"))]
+    } else {
+        vec![failed(&format!("Could not clear {path}"))]
+    }
+}
+
 fn pkg_cache_dir(distro: &Distro) -> Option<PathBuf> {
     match distro {
         Distro::Arch => Some(PathBuf::from("/var/cache/pacman/pkg")),
@@ -1080,18 +1146,12 @@ pub fn pkg_cache(
                 }
             } else {
                 utils::warning("eclean not found — install app-portage/gentoolkit");
-                let distfiles = gentoo_distdir();
-                // A non-UTF-8 DISTDIR can't be passed as a &str arg; skip
-                // rather than panic on unwrap.
-                if let Some(path) = distfiles.to_str() {
-                    if distfiles.is_dir() {
-                        if utils::sudo_sweep(path, utils::Sweep::Files) {
-                            utils::success("Distfiles cleaned");
-                        } else {
-                            utils::error(&format!("Could not clear {path}"));
-                        }
-                    }
-                }
+                say(distfiles_without_eclean(
+                    &roots::Context::from_env(),
+                    &gentoo_distdir(),
+                    |dir| should_deep(deep, yes, &distfiles_question(dir)),
+                    |path| utils::sudo_sweep(path, utils::Sweep::Files),
+                ));
             }
             // Also sweep failed-build leftovers under $PORTAGE_TMPDIR/portage —
             // interrupted/failed emerges leave gigabytes of half-built trees
@@ -3326,6 +3386,7 @@ mod tests {
             named: Vec::new(),
             system_dirs: Vec::new(),
             system_trees: Vec::new(),
+            cache_places: Vec::new(),
         }
     }
 
@@ -3918,5 +3979,181 @@ odd-notes          1.0           8      latest/stable    pub           redisable
         ]);
         eprintln!("NEW-FAILURES={}", utils::failure_count() - before);
         eprintln!("CHILD-RAN");
+    }
+
+    // ── Gentoo's distfiles without eclean ──
+
+    /// A machine with nothing the rules know of, so a scratch directory is fair
+    /// game.
+    fn bare_machine() -> roots::Context {
+        roots::Context {
+            home: None,
+            ids: None,
+            named: Vec::new(),
+            system_dirs: Vec::new(),
+            system_trees: Vec::new(),
+            cache_places: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_distfiles_without_eclean_need_the_directory_to_be_there() {
+        let base = cache_scratch("distfiles-missing");
+        let missing = base.join("distfiles");
+        let verdicts = distfiles_without_eclean(
+            &bare_machine(),
+            &missing,
+            |_| panic!("no one is asked about nothing"),
+            |_| panic!("there is nothing to sweep"),
+        );
+        match verdicts.as_slice() {
+            [Verdict::Skipped(said)] => {
+                assert!(said.contains("nothing to clean"), "{said}");
+                assert!(said.contains(&missing.display().to_string()), "{said}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_a_distdir_that_must_not_be_emptied_is_refused_before_anyone_is_asked() {
+        let base = cache_scratch("distfiles-refused");
+        let mut machine = bare_machine();
+        machine.system_dirs = vec![base.clone()];
+        let verdicts = distfiles_without_eclean(
+            &machine,
+            &base,
+            |_| panic!("no one is asked about what may not go"),
+            |_| panic!("it may not go"),
+        );
+        match verdicts.as_slice() {
+            [Verdict::Failed(said)] => {
+                assert!(said.starts_with("Refusing to clean DISTDIR"), "{said}");
+                assert!(said.contains("system directory"), "{said}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_distfiles_stay_unless_the_answer_is_yes_and_it_is_asked_at_the_real_path() {
+        use std::os::unix::fs::symlink;
+        let base = cache_scratch("distfiles-no");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("distfiles");
+        symlink(&real, &link).unwrap();
+
+        let mut asked = None;
+        let verdicts = distfiles_without_eclean(
+            &bare_machine(),
+            &link,
+            |dir| {
+                asked = Some(dir.to_path_buf());
+                false
+            },
+            |_| panic!("nothing is swept on a no"),
+        );
+        assert_eq!(asked.as_deref(), Some(real.as_path()));
+        match verdicts.as_slice() {
+            [Verdict::Skipped(said)] => {
+                assert!(said.contains("--deep"), "{said}");
+                assert!(said.contains(&real.display().to_string()), "{said}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_distfiles_are_swept_at_the_real_path_and_a_failed_sweep_is_a_failure() {
+        use std::os::unix::fs::symlink;
+        let base = cache_scratch("distfiles-yes");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("distfiles");
+        symlink(&real, &link).unwrap();
+
+        let mut swept = None;
+        let verdicts = distfiles_without_eclean(
+            &bare_machine(),
+            &link,
+            |_| true,
+            |path| {
+                swept = Some(path.to_string());
+                true
+            },
+        );
+        assert_eq!(swept.as_deref(), real.to_str());
+        match verdicts.as_slice() {
+            [Verdict::Done(said)] => assert!(said.contains(&real.display().to_string()), "{said}"),
+            other => panic!("{other:?}"),
+        }
+
+        let verdicts = distfiles_without_eclean(&bare_machine(), &real, |_| true, |_| false);
+        match verdicts.as_slice() {
+            [Verdict::Failed(said)] => {
+                assert!(said.starts_with("Could not clear"), "{said}");
+                assert!(said.contains(&real.display().to_string()), "{said}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_a_distdir_whose_name_is_not_text_is_not_swept() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = cache_scratch("distfiles-bytes");
+        let odd = base.join(OsStr::from_bytes(b"dist\xff"));
+        std::fs::create_dir_all(&odd).unwrap();
+        let verdicts = distfiles_without_eclean(
+            &bare_machine(),
+            &odd,
+            |_| true,
+            |_| panic!("a name that is not text cannot be handed over"),
+        );
+        match verdicts.as_slice() {
+            [Verdict::Failed(said)] => assert!(said.contains("not text"), "{said}"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_distfiles_where_portage_used_to_keep_them_inside_usr_are_still_cleaned() {
+        // /usr/portage/distfiles, with /usr a system tree: a system's own cache,
+        // which a root from the environment would not be allowed to be.
+        let base = cache_scratch("distfiles-legacy");
+        let usr = base.join("usr");
+        let distfiles = usr.join("portage/distfiles");
+        std::fs::create_dir_all(&distfiles).unwrap();
+        let mut machine = bare_machine();
+        machine.system_trees = vec![usr.clone()];
+        machine.cache_places = vec![usr.join("portage")];
+
+        let verdicts = distfiles_without_eclean(&machine, &distfiles, |_| true, |_| true);
+        assert!(
+            matches!(verdicts.as_slice(), [Verdict::Done(_)]),
+            "{verdicts:?}"
+        );
+        // Not the tree around it.
+        let verdicts = distfiles_without_eclean(&machine, &usr.join("portage"), |_| true, |_| true);
+        assert!(
+            matches!(verdicts.as_slice(), [Verdict::Failed(_)]),
+            "{verdicts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_the_question_about_the_distfiles_names_the_directory_and_what_is_lost() {
+        let question = distfiles_question(Path::new("/srv/distfiles"));
+        assert!(question.contains("/srv/distfiles"), "{question}");
+        assert!(question.contains("eclean"), "{question}");
+        assert!(question.contains("fetched by hand"), "{question}");
+        assert!(question.ends_with("[y/N]:"), "{question}");
     }
 }

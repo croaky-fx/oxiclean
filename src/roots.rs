@@ -74,6 +74,12 @@ const SYSTEM_TREES: &[&str] = &[
     "/usr",
 ];
 
+/// Places inside a system tree where a system's own caches are known to live,
+/// which a root of [`Source::System`] may lie under. Portage kept its distfiles
+/// in `/usr/portage/distfiles` until 2.3.8 moved the default to
+/// `/var/cache/distfiles`, and plenty of installs still have them there.
+const SYSTEM_CACHE_PLACES: &[&str] = &["/usr/portage"];
+
 /// Places under `$HOME` that hold something other than a cache, with what to
 /// call them in a refusal. `XDG_CACHE_HOME=$HOME/.config`, a line copied from the
 /// wrong variable in a profile, is the mistake this list is for.
@@ -129,6 +135,12 @@ pub enum Source {
     Home,
     /// Supplied by an environment variable. Nothing about it is known.
     Env,
+    /// A cache the system keeps, which root empties: Gentoo's `DISTDIR`, which
+    /// portage takes from the environment before it takes it from make.conf. It
+    /// is held to the same floor, except that it may lie where a system's caches
+    /// are known to (`/usr/portage`), and whose it is is not asked: it is root's
+    /// and the portage group's, not the user's.
+    System,
 }
 
 /// Why a root was turned down.
@@ -159,6 +171,9 @@ pub struct Context {
     pub system_dirs: Vec<PathBuf>,
     /// Trees nothing below may be emptied.
     pub system_trees: Vec<PathBuf>,
+    /// Places inside a system tree that a system's caches may lie under, for a
+    /// root of [`Source::System`] only.
+    pub cache_places: Vec<PathBuf>,
 }
 
 impl Context {
@@ -181,6 +196,7 @@ impl Context {
             named,
             system_dirs: with_real_paths(SYSTEM_DIRS),
             system_trees: with_real_paths(SYSTEM_TREES),
+            cache_places: with_real_paths(SYSTEM_CACHE_PLACES),
         }
     }
 }
@@ -219,7 +235,9 @@ fn real_or_lexical(path: &Path) -> PathBuf {
 /// 1. absolute, present, and a directory;
 /// 2. not the home directory, a system directory, or a parent of either;
 /// 3. not where settings, data, state, keys or personal folders live;
-/// 4. not inside a system tree, unless the home directory is there;
+/// 4. not inside a system tree, unless the home directory is there or, for a
+///    [`Source::System`] root, a place where a system's caches live (below it,
+///    not the place itself);
 /// 5. for [`Source::Env`] only: owned by the user (or by the owner of the home
 ///    directory, for root running on someone's behalf), and writable by nobody
 ///    else.
@@ -238,7 +256,7 @@ pub fn check(ctx: &Context, candidate: &Path, source: Source) -> Result<PathBuf,
     }
 
     let home = ctx.home.as_deref().map(real_or_lexical);
-    if let Some(why) = off_limits(ctx, home.as_deref(), &root) {
+    if let Some(why) = off_limits(ctx, home.as_deref(), &root, source) {
         return Err(refuse(why));
     }
     if source == Source::Env {
@@ -250,7 +268,7 @@ pub fn check(ctx: &Context, candidate: &Path, source: Source) -> Result<PathBuf,
 }
 
 /// Rules 2 to 4: places that can never be a cache root, whoever asks.
-fn off_limits(ctx: &Context, home: Option<&Path>, root: &Path) -> Option<String> {
+fn off_limits(ctx: &Context, home: Option<&Path>, root: &Path, source: Source) -> Option<String> {
     let guarded = home.map(|h| (h, "your home directory")).into_iter().chain(
         ctx.system_dirs
             .iter()
@@ -281,7 +299,14 @@ fn off_limits(ctx: &Context, home: Option<&Path>, root: &Path) -> Option<String>
     // A home directory inside a system tree (a service account) is its owner's.
     // `/` as a home directory is not: everything would count as under it.
     let in_home = home.is_some_and(|h| h != Path::new("/") && root.starts_with(h));
-    if !in_home && ctx.system_trees.iter().any(|tree| root.starts_with(tree)) {
+    // Below such a place, not at it: `/usr/portage` is the tree, and the
+    // distfiles are what is in it.
+    let in_cache_place = source == Source::System
+        && ctx
+            .cache_places
+            .iter()
+            .any(|place| root != place && root.starts_with(place));
+    if !in_home && !in_cache_place && ctx.system_trees.iter().any(|tree| root.starts_with(tree)) {
         return Some("it is inside a system directory".to_string());
     }
     None
@@ -350,6 +375,7 @@ mod tests {
             named: Vec::new(),
             system_dirs: Vec::new(),
             system_trees: Vec::new(),
+            cache_places: Vec::new(),
         }
     }
 
@@ -360,7 +386,7 @@ mod tests {
         }
     }
 
-    const BOTH: [Source; 2] = [Source::Home, Source::Env];
+    const ALL: [Source; 3] = [Source::Home, Source::Env, Source::System];
 
     // ── who is running us ───────────────────────────────
 
@@ -402,7 +428,7 @@ mod tests {
     fn a_relative_path_is_never_a_root() {
         let d = scratch("relative");
         let c = context(Some(&d), Some(owner_of(&d)));
-        for source in BOTH {
+        for source in ALL {
             for path in ["cache", "./cache", "..", ""] {
                 assert!(
                     why(check(&c, Path::new(path), source)).contains("not an absolute path"),
@@ -416,7 +442,7 @@ mod tests {
     fn nothing_there_is_missing_not_unsafe() {
         let d = scratch("missing");
         let c = context(Some(&d), Some(owner_of(&d)));
-        for source in BOTH {
+        for source in ALL {
             assert_eq!(check(&c, &d.join("nope"), source), Err(Reject::Missing));
         }
     }
@@ -427,7 +453,7 @@ mod tests {
         let c = context(None, Some(owner_of(&d)));
         let file = d.join("plain");
         fs::write(&file, "x").unwrap();
-        for source in BOTH {
+        for source in ALL {
             assert!(why(check(&c, &file, source)).contains("not a directory"));
         }
     }
@@ -439,7 +465,7 @@ mod tests {
         let d = scratch("home");
         let home = mkdir(d.join("a/b/home"));
         let c = context(Some(&home), Some(owner_of(&d)));
-        for source in BOTH {
+        for source in ALL {
             assert!(why(check(&c, &home, source)).contains("it is your home directory"));
             for parent in [home.parent().unwrap(), d.as_path()] {
                 assert!(
@@ -456,7 +482,7 @@ mod tests {
         let home = mkdir(d.join("home"));
         let cache = mkdir(home.join(".cache"));
         let c = context(Some(&home), Some(owner_of(&d)));
-        for source in BOTH {
+        for source in ALL {
             assert_eq!(check(&c, &cache, source), Ok(cache.clone()));
         }
     }
@@ -467,7 +493,7 @@ mod tests {
         let srv = mkdir(d.join("srv"));
         let mut c = context(None, Some(owner_of(&d)));
         c.system_dirs = vec![srv.clone()];
-        for source in BOTH {
+        for source in ALL {
             assert!(why(check(&c, &srv, source)).contains("it is a system directory"));
             assert!(why(check(&c, &d, source)).contains("contains a system directory"));
             // Only the directory itself is protected, not what is below it.
@@ -485,7 +511,7 @@ mod tests {
         let c = context(Some(&home), Some(owner_of(&d)));
         for (relative, what) in RESERVED_UNDER_HOME {
             let dir = mkdir(home.join(relative));
-            for source in BOTH {
+            for source in ALL {
                 let reason = why(check(&c, &dir, source));
                 assert!(reason.contains(what), "{relative}: {reason}");
             }
@@ -507,7 +533,7 @@ mod tests {
             ("XDG_RUNTIME_DIR", runtime.clone()),
             ("XDG_DATA_HOME", d.join("not-created")),
         ];
-        for source in BOTH {
+        for source in ALL {
             assert!(why(check(&c, &state, source)).contains("XDG_STATE_HOME"));
             assert!(why(check(&c, &runtime, source)).contains("XDG_RUNTIME_DIR"));
             assert_eq!(check(&c, &other, source), Ok(other.clone()));
@@ -525,7 +551,7 @@ mod tests {
         symlink(home.join("Documents"), home.join("docs")).unwrap();
         symlink(&d, home.join("up")).unwrap();
         let c = context(Some(&home), Some(owner_of(&d)));
-        for source in BOTH {
+        for source in ALL {
             assert!(why(check(&c, &home.join("alias"), source)).contains("your home directory"));
             assert!(why(check(&c, &home.join("docs"), source)).contains("Documents"));
             assert!(why(check(&c, &home.join("up"), source)).contains("contains your home"));
@@ -540,7 +566,7 @@ mod tests {
         let real = mkdir(home.join("dotfiles/config"));
         symlink(&real, home.join(".config")).unwrap();
         let c = context(Some(&home), Some(owner_of(&d)));
-        for source in BOTH {
+        for source in ALL {
             assert!(why(check(&c, &real, source)).contains("where your settings live"));
         }
     }
@@ -552,7 +578,7 @@ mod tests {
         let target = mkdir(d.join("elsewhere/cache"));
         symlink(&target, home.join(".cache")).unwrap();
         let c = context(Some(&home), Some(owner_of(&d)));
-        for source in BOTH {
+        for source in ALL {
             assert_eq!(check(&c, &home.join(".cache"), source), Ok(target.clone()));
         }
     }
@@ -566,7 +592,7 @@ mod tests {
         let share = mkdir(usr.join("share"));
         let mut c = context(None, Some(owner_of(&d)));
         c.system_trees = vec![usr.clone()];
-        for source in BOTH {
+        for source in ALL {
             for path in [&usr, &share] {
                 assert!(
                     why(check(&c, path, source)).contains("inside a system directory"),
@@ -586,7 +612,7 @@ mod tests {
         let share = mkdir(usr.join("share"));
         let mut c = context(Some(&home), Some(owner_of(&d)));
         c.system_trees = vec![usr.clone()];
-        for source in BOTH {
+        for source in ALL {
             assert_eq!(check(&c, &cache, source), Ok(cache.clone()));
             assert!(why(check(&c, &share, source)).contains("inside a system directory"));
         }
@@ -600,7 +626,7 @@ mod tests {
         let share = mkdir(usr.join("share"));
         let mut c = context(Some(Path::new("/")), Some(owner_of(&d)));
         c.system_trees = vec![usr];
-        for source in BOTH {
+        for source in ALL {
             assert!(why(check(&c, &share, source)).contains("inside a system directory"));
         }
     }
@@ -687,6 +713,70 @@ mod tests {
         assert_eq!(check(&c, &dir, Source::Home), Ok(dir.clone()));
     }
 
+    // ── roots the system keeps ──────────────────────────
+
+    #[test]
+    fn a_system_cache_is_not_asked_whose_it_is() {
+        // Gentoo's distfiles belong to root and the portage group.
+        let d = scratch("system-owner");
+        let dir = mkdir(d.join("distfiles"));
+        let me = owner_of(&d);
+        let stranger = Ids {
+            uid: me.uid + 1,
+            gid: me.gid + 1,
+        };
+        let c = context(None, Some(stranger));
+        for mode in [0o700, 0o775, 0o777] {
+            chmod(&dir, mode);
+            assert_eq!(check(&c, &dir, Source::System), Ok(dir.clone()), "{mode:o}");
+        }
+        // And it does not need to be known who is running us.
+        let nobody = context(None, None);
+        assert_eq!(check(&nobody, &dir, Source::System), Ok(dir.clone()));
+    }
+
+    #[test]
+    fn where_a_systems_caches_live_inside_a_system_tree_is_fine_for_a_system_root() {
+        // /usr/portage/distfiles, inside /usr.
+        let d = scratch("cache-places");
+        let usr = mkdir(d.join("usr"));
+        let portage = mkdir(usr.join("portage"));
+        let distfiles = mkdir(portage.join("distfiles"));
+        let share = mkdir(usr.join("share"));
+        let mut c = context(None, Some(owner_of(&d)));
+        c.system_trees = vec![usr.clone()];
+        c.cache_places = vec![portage.clone()];
+
+        assert_eq!(check(&c, &distfiles, Source::System), Ok(distfiles.clone()));
+        // Only for the system's own roots.
+        for source in [Source::Home, Source::Env] {
+            assert!(why(check(&c, &distfiles, source)).contains("inside a system directory"));
+        }
+        // What is below the place, not the place itself, and nothing else in the tree.
+        assert!(why(check(&c, &portage, Source::System)).contains("inside a system directory"));
+        assert!(why(check(&c, &share, Source::System)).contains("inside a system directory"));
+        assert!(why(check(&c, &usr, Source::System)).contains("inside a system directory"));
+    }
+
+    #[test]
+    fn a_link_into_a_systems_caches_is_judged_by_where_it_leads() {
+        let d = scratch("cache-places-link");
+        let usr = mkdir(d.join("usr"));
+        let portage = mkdir(usr.join("portage"));
+        let distfiles = mkdir(portage.join("distfiles"));
+        let share = mkdir(usr.join("share"));
+        let outside = d.join("distfiles-link");
+        symlink(&distfiles, &outside).unwrap();
+        let into_share = d.join("share-link");
+        symlink(&share, &into_share).unwrap();
+        let mut c = context(None, Some(owner_of(&d)));
+        c.system_trees = vec![usr];
+        c.cache_places = vec![portage];
+
+        assert_eq!(check(&c, &outside, Source::System), Ok(distfiles));
+        assert!(why(check(&c, &into_share, Source::System)).contains("inside a system directory"));
+    }
+
     // ── the real machine ────────────────────────────────
 
     #[test]
@@ -759,7 +849,7 @@ mod tests {
         }
 
         // And the lists do what they say, where the directory is there to ask.
-        for source in BOTH {
+        for source in ALL {
             for path in dirs.into_iter().chain(["/usr/lib", "/usr/share"]) {
                 if Path::new(path).is_dir() {
                     assert!(
@@ -769,6 +859,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_real_lists_name_where_a_systems_caches_may_lie_inside_a_system_tree() {
+        let c = Context::from_env();
+        let portage = Path::new("/usr/portage");
+        assert!(c.cache_places.iter().any(|place| place == portage));
+        // That is the point of the list: it is inside /usr, which is a tree.
+        assert!(c.system_trees.iter().any(|tree| portage.starts_with(tree)));
     }
 
     #[test]

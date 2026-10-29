@@ -2070,6 +2070,7 @@ for d in /bin /sbin /usr/sbin /usr/local/bin /usr/local/sbin; do
   if [ -d "$d" ] && [ ! -L "$d" ]; then "$M" -t tmpfs tmpfs "$d"; fi
 done
 "$M" -t tmpfs tmpfs /run
+. "$W/extra.sh"
 export HOME="$W/home" PATH=/usr/bin LC_ALL=C NO_COLOR=1 TERM=dumb FAKE_LOG="$W/calls.log"
 exec "$BIN" "$@"
 "#;
@@ -2111,6 +2112,7 @@ impl Machine {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         fs::write(dir.join("os-release"), os_release).unwrap();
+        fs::write(dir.join("extra.sh"), "").unwrap();
         fs::write(dir.join("calls.log"), "").unwrap();
         // The mount tool is copied out of reach of the /usr/bin that gets covered.
         if let Some(mount) = real_tool("mount") {
@@ -2136,6 +2138,12 @@ impl Machine {
             &self.dir.join("bin").join(name),
             &format!("#!/usr/bin/sh\n{body}"),
         );
+    }
+
+    /// Shell to run in the machine before oxiclean starts, with `$M` the mount
+    /// tool: more for it to find.
+    fn also(&self, script: &str) {
+        fs::write(self.dir.join("extra.sh"), script).unwrap();
     }
 
     /// What the machine's tools were asked, in order, one line each.
@@ -2316,4 +2324,171 @@ fn test_a_dry_run_asks_nothing_and_removes_nothing() {
     };
     assert!(out.status.success(), "{}", report(&out));
     assert_eq!(machine.calls(), ["pacman -Qdtq"], "{}", report(&out));
+}
+
+// What Gentoo's distfiles are asked about when eclean is not installed. `eclean
+// distfiles` keeps what an ebuild in the tree still wants; without it there is
+// no telling the obsolete from the rest, and what is left is to remove them all,
+// which costs a re-download and loses what had to be fetched by hand.
+
+/// A made-up Gentoo with a portageq that says where DISTDIR is, and the `find`
+/// that clears it. Nothing is in DISTDIR, which is not even there, until a test
+/// puts something in it.
+fn gentoo_machine(name: &str) -> (Machine, PathBuf) {
+    let machine = Machine::new(name, "ID=gentoo\nPRETTY_NAME=\"Gentoo Linux\"\n");
+    machine.take_from_the_real_one(&["find"]);
+    let distdir = machine.dir.join("distfiles");
+    machine.tool("portageq", &format!("echo '{}'\n", distdir.display()));
+    (machine, distdir)
+}
+
+const DISTFILES: [&str; 3] = ["a-1.0.tar.gz", "b-2.1.tar.xz", "git3-src/c.pack"];
+
+fn stock_distfiles(dir: &Path) {
+    for name in DISTFILES {
+        let file = dir.join(name);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, vec![1u8; 40_000]).unwrap();
+    }
+}
+
+/// The files below `dir`, by their names from it, in order.
+fn files_below(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                walk(&path, base, out);
+            } else {
+                out.push(path.strip_prefix(base).unwrap().display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn test_without_eclean_the_distfiles_go_on_deep_or_on_a_yes_from_a_person() {
+    // What is run, what a person types, and whether all of DISTDIR goes.
+    let cases: [(&[&str], &str, bool); 8] = [
+        (&["--packages"], "n\n", false),
+        (&["--packages"], "", false),
+        (&["--packages"], "y\n", true),
+        (&["--packages", "--yes"], "y\n", false),
+        (&["--packages", "--json"], "y\n", false),
+        (&["--packages", "--deep"], "", true),
+        (&["--packages", "--deep", "--yes"], "", true),
+        (&["--packages", "--deep", "--json"], "", true),
+    ];
+    for (n, (args, typed, goes)) in cases.into_iter().enumerate() {
+        let (machine, distdir) = gentoo_machine(&format!("gentoo_gate_{n}"));
+        stock_distfiles(&distdir);
+        let Some(out) = machine.run(args, typed) else {
+            return;
+        };
+        let shown = format!("{args:?} with {typed:?} typed:\n{}", report(&out));
+        // Leaving them is a choice, not a failure.
+        assert!(out.status.success(), "{shown}");
+        let left = files_below(&distdir);
+        if goes {
+            assert_eq!(left, Vec::<String>::new(), "{shown}");
+            // Files, as before: the directories they were in stay.
+            assert!(distdir.join("git3-src").is_dir(), "{shown}");
+        } else {
+            assert_eq!(left, DISTFILES.map(String::from).to_vec(), "{shown}");
+        }
+        let said = text(&out.stdout);
+        if args.contains(&"--json") {
+            assert_eq!(one_document(&out)["status"], "ok", "{shown}");
+        } else if !goes {
+            assert!(said.contains("--deep"), "{shown}");
+        }
+        // The question names what it is about.
+        if args == ["--packages"] {
+            assert!(said.contains(&distdir.display().to_string()), "{shown}");
+        }
+    }
+}
+
+#[test]
+fn test_with_eclean_installed_the_distfiles_are_its_business() {
+    for (args, calls) in [
+        (&["--packages", "--json"][..], vec!["eclean distfiles"]),
+        (
+            &["--packages", "--deep"][..],
+            vec!["eclean distfiles", "eclean packages"],
+        ),
+    ] {
+        let (machine, distdir) = gentoo_machine("gentoo_with_eclean");
+        machine.tool("eclean", "echo \"eclean $*\" >> \"$FAKE_LOG\"\n");
+        stock_distfiles(&distdir);
+        let Some(out) = machine.run(args, "") else {
+            return;
+        };
+        let shown = format!("{args:?}:\n{}", report(&out));
+        assert!(out.status.success(), "{shown}");
+        assert_eq!(machine.calls(), calls, "{shown}");
+        assert_eq!(files_below(&distdir).len(), DISTFILES.len(), "{shown}");
+    }
+}
+
+#[test]
+fn test_a_distdir_that_is_a_system_directory_is_refused_and_left_alone() {
+    if !Path::new("/mnt").is_dir() {
+        eprintln!("skipped: this machine has no /mnt to stand in for a system directory");
+        return;
+    }
+    let machine = Machine::new("gentoo_refused", "ID=gentoo\n");
+    machine.take_from_the_real_one(&["find"]);
+    machine.tool("portageq", "echo /mnt\n");
+    // /mnt is covered by a directory of ours, so that whatever is emptied by
+    // mistake is a file of ours.
+    let covering = machine.dir.join("mnt");
+    fs::create_dir_all(&covering).unwrap();
+    fs::write(covering.join("canary"), "still here").unwrap();
+    machine.also(&format!("\"$M\" --bind '{}' /mnt\n", covering.display()));
+
+    let Some(out) = machine.run(&["--packages", "--deep", "--json"], "") else {
+        return;
+    };
+    let shown = report(&out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    let doc = one_document(&out);
+    let message = doc["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Refusing") && message.contains("/mnt"),
+        "{shown}"
+    );
+    assert!(covering.join("canary").exists(), "{shown}");
+}
+
+#[test]
+fn test_a_distdir_that_is_not_there_is_nothing_to_clean() {
+    let (machine, distdir) = gentoo_machine("gentoo_no_distdir");
+    let Some(out) = machine.run(&["--packages", "--deep", "--json"], "") else {
+        return;
+    };
+    assert!(out.status.success(), "{}", report(&out));
+    assert_eq!(one_document(&out)["status"], "ok", "{}", report(&out));
+    assert!(!distdir.exists());
+}
+
+#[test]
+fn test_a_distdir_that_is_a_link_is_cleared_where_it_leads() {
+    let (machine, distdir) = gentoo_machine("gentoo_linked_distdir");
+    let real = machine.dir.join("elsewhere");
+    stock_distfiles(&real);
+    std::os::unix::fs::symlink(&real, &distdir).unwrap();
+    let Some(out) = machine.run(&["--packages", "--deep", "--json"], "") else {
+        return;
+    };
+    assert!(out.status.success(), "{}", report(&out));
+    assert_eq!(files_below(&real), Vec::<String>::new(), "{}", report(&out));
+    assert!(fs::symlink_metadata(&distdir).unwrap().is_symlink());
 }
