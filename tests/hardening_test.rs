@@ -457,6 +457,104 @@ fn test_the_deep_hint_is_advice_so_quiet_drops_it() {
     sb.cleanup();
 }
 
+// ── Maven's repository holds what cannot be downloaded again ──
+
+/// `~/.m2/repository` mixes what Maven fetched, which the next build fetches
+/// again, with what `mvn install` put there, which nothing can bring back.
+fn maven_repository(sb: &Sandbox) -> (PathBuf, PathBuf, PathBuf) {
+    let repo = sb.home.join(".m2/repository");
+    let fetched = repo.join("org/apache/commons/commons-lang3/3.12.0");
+    let mine = repo.join("com/example/app/1.0");
+    fs::create_dir_all(&fetched).unwrap();
+    fs::write(
+        fetched.join("_remote.repositories"),
+        "commons-lang3-3.12.0.jar>central=\n",
+    )
+    .unwrap();
+    fs::write(
+        fetched.join("commons-lang3-3.12.0.jar"),
+        vec![1u8; 256 * 1024],
+    )
+    .unwrap();
+    fs::create_dir_all(&mine).unwrap();
+    fs::write(mine.join("_remote.repositories"), "app-1.0.jar>=\n").unwrap();
+    fs::write(mine.join("app-1.0.jar"), vec![2u8; 1024 * 1024]).unwrap();
+    (repo, fetched, mine)
+}
+
+#[test]
+fn test_a_deep_clean_of_maven_keeps_what_was_installed_on_this_machine() {
+    let sb = Sandbox::new("maven_installed");
+    let (_, fetched, mine) = maven_repository(&sb);
+
+    let out = sb.oxiclean(&["--dev", "--yes", "--deep"]).output().unwrap();
+
+    assert!(out.status.success(), "{}", report(&out));
+    assert!(
+        !fetched.exists(),
+        "what was fetched is cleaned\n{}",
+        report(&out)
+    );
+    assert!(
+        mine.join("app-1.0.jar").is_file(),
+        "what was installed here cannot be downloaded again\n{}",
+        report(&out)
+    );
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("maven (.m2):"), "{}", report(&out));
+    assert!(
+        stdout.contains("kept 1 artifact(s) installed on this machine"),
+        "{}",
+        report(&out)
+    );
+    sb.cleanup();
+}
+
+#[test]
+fn test_the_maven_figure_is_what_a_clean_would_free() {
+    let sb = Sandbox::new("maven_figure");
+    let (_, fetched, mine) = maven_repository(&sb);
+
+    // 1 MiB was installed here and 256 KiB fetched: the megabyte is not on offer.
+    let out = sb
+        .oxiclean(&["--dev", "--dry-run", "--deep"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{}", report(&out));
+    let stdout = text(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("maven (.m2)"))
+        .unwrap_or_else(|| panic!("{}", report(&out)));
+    assert!(!line.contains("MB"), "{line}");
+    assert!(line.contains("KB"), "{line}");
+    assert!(
+        stdout.contains("installed here is kept"),
+        "{}",
+        report(&out)
+    );
+    // A dry run changes nothing.
+    assert!(fetched.join("commons-lang3-3.12.0.jar").is_file());
+    assert!(mine.join("app-1.0.jar").is_file());
+    sb.cleanup();
+}
+
+#[test]
+fn test_without_deep_the_maven_repository_is_left_alone() {
+    let sb = Sandbox::new("maven_not_deep");
+    let (_, fetched, mine) = maven_repository(&sb);
+    fill_cache(&sb.home.join(".cache/uv"));
+    fake_uv(&sb, &sb.home.join(".cache/uv"), &WELL_BEHAVED);
+
+    let out = sb.oxiclean(&["--dev", "--yes"]).output().unwrap();
+
+    assert!(out.status.success(), "{}", report(&out));
+    assert!(fetched.join("commons-lang3-3.12.0.jar").is_file());
+    assert!(mine.join("app-1.0.jar").is_file());
+    sb.cleanup();
+}
+
 // ── Tools that are not there ──
 
 /// The caches only their own tool may clean: what `--dev` calls each one, the

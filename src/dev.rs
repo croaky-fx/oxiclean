@@ -23,8 +23,10 @@
 //   re-download.
 
 use colored::Colorize;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::mounts::Mounts;
 use crate::roots;
 use crate::utils;
 
@@ -514,12 +516,9 @@ pub fn scan_all() -> Vec<DevCache> {
     if let Some(c) = scan_simple("gradle", home_join(".gradle/caches"), "safe") {
         out.push(c);
     }
-    // Maven local repo — will re-download. Often huge.
-    if let Some(c) = scan_redownload(
-        "maven (.m2)",
-        home_join(".m2/repository"),
-        "re-download on next build",
-    ) {
+    // Maven local repo. Often huge, and mostly what it can fetch again; what was
+    // installed on this machine is not that, and stays (see `read_maven_repo`).
+    if let Some(c) = scan_maven(home_join(".m2/repository")) {
         out.push(c);
     }
 
@@ -596,6 +595,153 @@ pub fn print_summary(caches: &[DevCache], deep: bool) {
     }
 }
 
+// ─── Maven's local repository ────────────────────────
+//
+// `~/.m2/repository` holds two kinds of things that look alike: what Maven
+// fetched from a remote repository, which the next build fetches again, and what
+// was installed on this machine (`mvn install` of one's own modules,
+// `install:install-file`), which no repository has. Wiping all of it, as this
+// once did, loses the second kind for good.
+//
+// Maven keeps the difference itself. Each version directory has a
+// `_remote.repositories` file that says, for every file in it, which repository
+// it was fetched from, and leaves the repository empty for what was installed
+// here. Only a directory whose record shows that everything in it was fetched is
+// removed. One without a record (a build published to the local repository by
+// Gradle leaves none), with a file the record does not list, or with anything
+// installed here, stays as it is.
+
+/// The file that holds the record.
+const MAVEN_RECORD: &str = "_remote.repositories";
+
+/// No real record is anywhere near this size; a larger one is not read.
+const MAVEN_RECORD_MAX: u64 = 64 * 1024;
+
+/// What Maven keeps beside an artifact that is not an artifact, and does not list
+/// in the record: its checksums and signature, and the note of a download that
+/// failed.
+const MAVEN_SIDECARS: [&str; 6] = ["sha1", "md5", "sha256", "sha512", "asc", "lastUpdated"];
+
+/// The files a record lists, when it says that every one of them was fetched from
+/// a remote repository (`name>repository=`, the repository not empty), which is
+/// what makes them something to download again. `None` for anything else: a file
+/// installed here (empty repository), a record that lists nothing, a line that is
+/// not one. What is not shown to have been fetched is not taken for it.
+fn fetched_files(record: &str) -> Option<HashSet<&str>> {
+    let mut files = HashSet::new();
+    for line in record.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, rest) = line.rsplit_once('>')?;
+        let (repository, _) = rest.split_once('=')?;
+        if name.is_empty() || repository.is_empty() {
+            return None;
+        }
+        files.insert(name);
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+fn is_sidecar(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, extension)| MAVEN_SIDECARS.contains(&extension))
+}
+
+/// Whether the record in version directory `dir` shows everything in it, `files`,
+/// to have been fetched.
+fn all_fetched(dir: &Path, files: &[String]) -> bool {
+    let record = dir.join(MAVEN_RECORD);
+    let readable = std::fs::symlink_metadata(&record)
+        .is_ok_and(|md| md.is_file() && md.len() <= MAVEN_RECORD_MAX);
+    if !readable {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&record) else {
+        return false;
+    };
+    let Some(fetched) = fetched_files(&text) else {
+        return false;
+    };
+    files
+        .iter()
+        .all(|f| f == MAVEN_RECORD || fetched.contains(f.as_str()) || is_sidecar(f))
+}
+
+/// What a walk of the repository found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MavenRepo {
+    /// The version directories whose files were all fetched, by path.
+    fetched: Vec<PathBuf>,
+    /// How many version directories are not: installed here, or with nothing to
+    /// say where they came from.
+    kept: usize,
+}
+
+/// Walk the repository, `root` being its real path. Links are neither entered nor
+/// counted: what a link leads to is not in the repository.
+fn read_maven_repo(root: &Path) -> MavenRepo {
+    let mut repo = MavenRepo::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let (mut files, mut subdirs) = (Vec::new(), Vec::new());
+        for entry in entries.flatten() {
+            // `file_type` does not follow a link.
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => subdirs.push(entry.path()),
+                Ok(kind) if kind.is_file() => {
+                    files.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                _ => {}
+            }
+        }
+        if files.iter().any(|f| f == MAVEN_RECORD) {
+            if subdirs.is_empty() && all_fetched(&dir, &files) {
+                repo.fetched.push(dir);
+            } else {
+                repo.kept += 1;
+            }
+        } else if subdirs.is_empty()
+            && files
+                .iter()
+                .any(|f| f.ends_with(".pom") || f.ends_with(".jar"))
+        {
+            // An artifact without a record of where it came from.
+            repo.kept += 1;
+        } else {
+            stack.extend(subdirs);
+        }
+    }
+    repo.fetched.sort();
+    repo
+}
+
+/// The repository as a cache: its size is what a clean would free, not what is
+/// in it.
+fn scan_maven(path: Option<PathBuf>) -> Option<DevCache> {
+    let path = path?;
+    // A link is not followed, as for every cache that is measured.
+    if std::fs::symlink_metadata(&path).ok()?.is_symlink() {
+        return None;
+    }
+    let real = std::fs::canonicalize(&path).ok()?;
+    let mounts = Mounts::read().unwrap_or_default();
+    let size: u64 = read_maven_repo(&real)
+        .fetched
+        .iter()
+        .map(|dir| utils::dir_size_in(dir, &mounts))
+        .sum();
+    (size > 0).then_some(DevCache {
+        name: "maven (.m2)",
+        size,
+        needs_redownload: true,
+        note: "re-download on next build; what was installed here is kept",
+    })
+}
+
 // ─── Cleaners ────────────────────────────────────────
 
 fn clean_dir_contents(path: &Path) -> u64 {
@@ -603,6 +749,80 @@ fn clean_dir_contents(path: &Path) -> u64 {
         return 0;
     }
     utils::rm_contents(path)
+}
+
+/// Remove what Maven fetched from the repository at `path`, and the directories
+/// that held only that. What is left is said, and is not a failure: it is what
+/// cannot be fetched again.
+fn clean_maven(path: &Path) -> u64 {
+    clean_maven_with(path, Mounts::read())
+}
+
+/// [`clean_maven`] with the list of mounts handed in, so that a test can say what
+/// is mounted where.
+fn clean_maven_with(path: &Path, mounts: std::io::Result<Mounts>) -> u64 {
+    // As the scan: a link is not followed.
+    if std::fs::symlink_metadata(path).is_ok_and(|md| md.is_symlink()) {
+        return 0;
+    }
+    // The mounts are listed by their real paths, so the paths below must be real.
+    let root = match std::fs::canonicalize(path) {
+        Ok(root) => root,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(why) => {
+            utils::error(&format!("Could not read {}: {why}", path.display()));
+            return 0;
+        }
+    };
+    let mounts = match mounts {
+        Ok(mounts) => mounts,
+        Err(why) => {
+            utils::error(&format!(
+                "Could not read the list of mounts ({why}), so {} was left alone",
+                path.display()
+            ));
+            return 0;
+        }
+    };
+
+    // Read again: the scan was a while ago, and what it listed may have changed.
+    let repo = read_maven_repo(&root);
+    let mut emptied = utils::Emptied::default();
+    for dir in &repo.fetched {
+        let size = utils::dir_size_in(dir, &mounts);
+        emptied.add(dir, size, utils::remove_entry(dir, true, &mounts));
+    }
+    prune_empty_parents(&repo.fetched, &root);
+
+    emptied.mention_left();
+    if let Some(complaint) = emptied.complaint(path) {
+        utils::error(&complaint);
+    }
+    if repo.kept > 0 {
+        utils::info(&format!(
+            "maven (.m2): kept {} artifact(s) installed on this machine or of unknown origin — they cannot be downloaded again",
+            repo.kept
+        ));
+    }
+    emptied.freed
+}
+
+/// Remove the directories above `removed`, up to but not including `root`, that
+/// nothing is left in. `remove_dir` takes only an empty directory, so what still
+/// holds something (the metadata beside the versions, a version that stayed) stays.
+fn prune_empty_parents(removed: &[PathBuf], root: &Path) {
+    let mut parents = BTreeSet::new();
+    for dir in removed {
+        let mut above = dir.parent();
+        while let Some(parent) = above.filter(|p| *p != root && p.starts_with(root)) {
+            parents.insert(parent.to_path_buf());
+            above = parent.parent();
+        }
+    }
+    // A directory sorts after the one it is in, so the innermost come first.
+    for parent in parents.iter().rev() {
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 /// Wipe everything inside the directory **except** entries whose name is
@@ -887,7 +1107,7 @@ fn clean_one(c: &DevCache, deep: bool, dry_run: bool) -> u64 {
         }
         "maven (.m2)" => home_join(".m2/repository")
             .as_deref()
-            .map(clean_dir_contents)
+            .map(clean_maven)
             .unwrap_or(0),
 
         _ => 0,
@@ -1211,5 +1431,293 @@ mod tests {
                 assert!(s.ends_with(".nuget/packages"), "unexpected nuget path: {s}");
             }
         }
+    }
+
+    // ── Maven's local repository ────────────────────────
+
+    const FETCHED: &str = "#NOTE: This is a Maven Resolver internal implementation file, its format can be changed without prior notice.\n#Wed Oct 28 10:00:00 UTC 2026\nlib-1.0.jar>central=\nlib-1.0.pom>central=\n";
+    const INSTALLED: &str = "#NOTE: This is a Maven Resolver internal implementation file, its format can be changed without prior notice.\n#Wed Oct 28 10:00:00 UTC 2026\nlib-1.0.jar>=\nlib-1.0.pom>=\n";
+
+    /// A repository in a fresh directory with a real path; `files` are
+    /// (path, contents) below it.
+    fn maven_repo(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let base = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = base.join(format!("oxiclean_m2_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for (path, body) in files {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, body).unwrap();
+        }
+        root
+    }
+
+    const LANG3: &str = "org/apache/commons/commons-lang3/3.12.0";
+
+    /// One of each kind: fetched (with the checksums and the failed download's
+    /// note Maven leaves beside it), installed here, without any record, and
+    /// fetched but with a file of someone's own beside it.
+    fn mixed_repo(name: &str) -> PathBuf {
+        maven_repo(
+            name,
+            &[
+                (
+                    "org/apache/commons/commons-lang3/3.12.0/_remote.repositories",
+                    "commons-lang3-3.12.0.jar>central=\ncommons-lang3-3.12.0.pom>central=\n",
+                ),
+                (
+                    "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+                    "jar",
+                ),
+                (
+                    "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom",
+                    "pom",
+                ),
+                (
+                    "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar.sha1",
+                    "sum",
+                ),
+                (
+                    "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom.lastUpdated",
+                    "note",
+                ),
+                (
+                    "org/apache/commons/commons-lang3/maven-metadata-central.xml",
+                    "meta",
+                ),
+                (
+                    "com/me/app/1.0/_remote.repositories",
+                    "app-1.0.jar>=\napp-1.0.pom>=\n",
+                ),
+                ("com/me/app/1.0/app-1.0.jar", "jar"),
+                ("com/me/app/1.0/app-1.0.pom", "pom"),
+                ("com/me/lib/2.0/lib-2.0.jar", "jar"),
+                ("com/me/lib/2.0/lib-2.0.pom", "pom"),
+                ("io/x/y/1.0/_remote.repositories", "y-1.0.jar>central=\n"),
+                ("io/x/y/1.0/y-1.0.jar", "jar"),
+                ("io/x/y/1.0/y-1.0-extra.jar", "mine"),
+            ],
+        )
+    }
+
+    const KEPT_FILES: [&str; 7] = [
+        "com/me/app/1.0/app-1.0.jar",
+        "com/me/app/1.0/app-1.0.pom",
+        "com/me/app/1.0/_remote.repositories",
+        "com/me/lib/2.0/lib-2.0.jar",
+        "com/me/lib/2.0/lib-2.0.pom",
+        "io/x/y/1.0/y-1.0.jar",
+        "io/x/y/1.0/y-1.0-extra.jar",
+    ];
+
+    #[test]
+    fn test_a_record_of_fetched_files_only_means_they_can_be_downloaded_again() {
+        assert_eq!(
+            fetched_files(FETCHED),
+            Some(HashSet::from(["lib-1.0.jar", "lib-1.0.pom"]))
+        );
+        // Which repository it was does not matter, nor how the lines end.
+        assert!(fetched_files("a.jar>my-repo=\r\n").is_some());
+        assert!(fetched_files("a.pom>central=\n\nb.pom>other=\n").is_some());
+        assert!(fetched_files("  a.pom>central=  \n").is_some());
+    }
+
+    #[test]
+    fn test_anything_else_in_the_record_is_not_taken_for_a_download() {
+        for record in [
+            // installed here
+            INSTALLED,
+            // one of the files is
+            "a.jar>central=\na.pom>=\n",
+            // says nothing
+            "",
+            "# only a comment\n",
+            "\n\n",
+            // not lines of the record
+            "a.jar\n",
+            "a.jar>central\n",
+            ">central=\n",
+            "garbage\na.jar>central=\n",
+        ] {
+            assert_eq!(fetched_files(record), None, "{record:?}");
+        }
+    }
+
+    #[test]
+    fn test_what_maven_keeps_beside_an_artifact_is_not_an_artifact() {
+        for name in [
+            "a-1.0.jar.sha1",
+            "a-1.0.pom.md5",
+            "a-1.0.jar.sha256",
+            "a-1.0.jar.sha512",
+            "a-1.0.jar.asc",
+            "a-1.0.pom.lastUpdated",
+        ] {
+            assert!(is_sidecar(name), "{name}");
+        }
+        for name in [
+            "a-1.0.jar",
+            "a-1.0.pom",
+            "a-1.0.jar.part",
+            "a-1.0-extra.zip",
+            "sha1",
+            "",
+        ] {
+            assert!(!is_sidecar(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_the_repository_is_read_for_what_can_be_downloaded_again() {
+        let root = mixed_repo("read");
+        let repo = read_maven_repo(&root);
+        assert_eq!(repo.fetched, vec![root.join(LANG3)]);
+        // Installed here, no record, and a file the record does not list.
+        assert_eq!(repo.kept, 3);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_a_record_that_cannot_be_trusted_keeps_the_directory() {
+        let big = format!("a.jar>central=\n#{}\n", "x".repeat(70_000));
+        let root = maven_repo(
+            "untrusted",
+            &[
+                ("g/a/1.0/_remote.repositories", &big),
+                ("g/a/1.0/a.jar", "jar"),
+                ("g/b/1.0/_remote.repositories", "b.jar>central=\n"),
+                ("g/b/1.0/b.jar", "jar"),
+                ("g/b/1.0/deeper/c.jar", "inside a directory"),
+            ],
+        );
+        let repo = read_maven_repo(&root);
+        assert!(repo.fetched.is_empty(), "{repo:?}");
+        assert_eq!(repo.kept, 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_cleaning_removes_what_was_fetched_and_keeps_the_rest() {
+        let root = mixed_repo("clean");
+        let freed = clean_maven_with(&root, Ok(Mounts::default()));
+        assert!(freed > 0);
+        assert!(!root.join(LANG3).exists(), "the fetched version is gone");
+        // What is not a version stays, and so does the directory that holds it.
+        assert!(root
+            .join("org/apache/commons/commons-lang3/maven-metadata-central.xml")
+            .is_file());
+        for kept in KEPT_FILES {
+            assert!(root.join(kept).is_file(), "{kept} was removed");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_a_repository_of_downloads_only_is_left_empty() {
+        let root = maven_repo(
+            "all_fetched",
+            &[
+                ("org/a/1.0/_remote.repositories", "a-1.0.jar>central=\n"),
+                ("org/a/1.0/a-1.0.jar", "jar"),
+                ("org/a/2.0/_remote.repositories", "a-2.0.jar>central=\n"),
+                ("org/a/2.0/a-2.0.jar", "jar"),
+                ("org/b/1.0/_remote.repositories", "b-1.0.jar>other=\n"),
+                ("org/b/1.0/b-1.0.jar", "jar"),
+            ],
+        );
+        assert!(clean_maven_with(&root, Ok(Mounts::default())) > 0);
+        // The directories that held only what went are gone; the repository stays.
+        assert!(root.is_dir());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_a_link_in_the_repository_is_neither_entered_nor_removed() {
+        use std::os::unix::fs::symlink;
+        let root = mixed_repo("links");
+        let outside = maven_repo(
+            "links_outside",
+            &[
+                ("1.0/_remote.repositories", "a-1.0.jar>central=\n"),
+                ("1.0/a-1.0.jar", "jar"),
+            ],
+        );
+        symlink(outside.join("1.0"), root.join("com/me/linked")).unwrap();
+        symlink(&outside, root.join("outside")).unwrap();
+        let repo = read_maven_repo(&root);
+        assert_eq!(repo.fetched, vec![root.join(LANG3)]);
+        assert_eq!(repo.kept, 3);
+        clean_maven_with(&root, Ok(Mounts::default()));
+        assert!(outside.join("1.0/a-1.0.jar").is_file());
+        assert!(fs::symlink_metadata(root.join("com/me/linked")).is_ok());
+        assert!(fs::symlink_metadata(root.join("outside")).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn test_a_repository_that_is_a_link_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let real = mixed_repo("linked_repo");
+        let link = real.with_file_name(format!("oxiclean_m2_link_{}", std::process::id()));
+        let _ = fs::remove_file(&link);
+        symlink(&real, &link).unwrap();
+        assert!(scan_maven(Some(link.clone())).is_none());
+        assert_eq!(clean_maven_with(&link, Ok(Mounts::default())), 0);
+        assert!(real.join(LANG3).is_dir(), "it was cleaned through the link");
+        fs::remove_file(&link).unwrap();
+        fs::remove_dir_all(&real).unwrap();
+    }
+
+    #[test]
+    fn test_a_version_that_is_a_mount_point_is_left_as_it_is() {
+        let root = mixed_repo("mounted");
+        let version = root.join(LANG3);
+        let mounts = Mounts::of(&[&version]);
+        assert_eq!(clean_maven_with(&root, Ok(mounts)), 0);
+        assert!(version.join("commons-lang3-3.12.0.jar").is_file());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_without_the_list_of_mounts_nothing_is_removed_from_the_repository() {
+        let root = mixed_repo("no_mounts");
+        let freed = clean_maven_with(&root, Err(std::io::Error::other("no /proc here")));
+        assert_eq!(freed, 0);
+        assert!(root.join(LANG3).is_dir());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_the_scan_counts_what_a_clean_would_free() {
+        let root = mixed_repo("scan");
+        let cache = scan_maven(Some(root.clone())).expect("something to clean");
+        assert_eq!(cache.name, "maven (.m2)");
+        assert!(cache.needs_redownload);
+        assert!(
+            cache.note.contains("installed here is kept"),
+            "{}",
+            cache.note
+        );
+        assert_eq!(
+            cache.size,
+            utils::dir_size_in(&root.join(LANG3), &Mounts::default())
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // Nothing that can be fetched again: nothing to list, however much is there.
+        let mine = maven_repo(
+            "scan_mine",
+            &[
+                ("com/me/app/1.0/_remote.repositories", "app-1.0.jar>=\n"),
+                ("com/me/app/1.0/app-1.0.jar", "x"),
+            ],
+        );
+        assert!(scan_maven(Some(mine.clone())).is_none());
+        assert!(scan_maven(Some(mine.join("missing"))).is_none());
+        assert!(scan_maven(None).is_none());
+        fs::remove_dir_all(&mine).unwrap();
     }
 }
