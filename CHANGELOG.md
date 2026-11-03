@@ -1,5 +1,317 @@
 # Changelog
 
+## [Unreleased]
+
+### Security
+- **`--update` installs only releases the maintainer's key has signed.** TLS shows
+  that a download came from GitHub, not that the maintainer published it, and
+  nothing else was checked before the running binary was replaced — as root, when
+  it lives in `/usr/local/bin`. Every release now carries `SHA256SUMS` and
+  `SHA256SUMS.minisig`, made offline with
+  [minisign](https://jedisct1.github.io/minisign/), and the public key is built
+  into the binary. A client goes ahead only when:
+  - the signature verifies against a built-in key (prehashed signatures only);
+  - the signed comment reads exactly `oxiclean X.Y.Z`: the release's own version,
+    and newer than the running one, so a genuine old release replayed as "latest"
+    is refused;
+  - the checksum list, read only after its signature passed, gives the digest of
+    the binary that arrived;
+  - the binary is an ELF file and, run once with `--version` in a cleaned
+    environment, prints exactly `oxiclean X.Y.Z`.
+
+  The transport is stricter too: https only, at most five redirects, a deadline
+  and a size cap on every reply, the download kept in memory, files created
+  exclusively in a private directory. When the target's directory needs root, the
+  verified bytes reach a root `sh` through sudo/doas on stdin, so root never reads
+  a file an unprivileged process could have changed. Release notes are printed
+  with control characters removed and marked as not signed. `--update --json` is
+  refused (exit status 2), and a build with no key refuses to update at all.
+  [RELEASING.md](RELEASING.md) is the release procedure.
+
+  Not covered: `install.sh` still trusts TLS and GitHub, and 1.8.0 and earlier keep
+  the old updater, which is how they receive the first signed release.
+- **A deletion root named by an environment variable must plainly be a cache.**
+  `XDG_CACHE_HOME`, `UV_CACHE_DIR`, `DENO_DIR`, `CCACHE_DIR`, `GOMODCACHE`,
+  `GOPATH`, `PIP_CACHE_DIR`, `COMPOSER_CACHE_DIR` and `NUGET_PACKAGES` name
+  directories that get emptied, by oxiclean or by a tool it starts, and none was
+  checked. `XDG_CACHE_HOME=$HOME` — a typo in a profile is enough — made `--cache`
+  delete everything in the home directory that was not on the protected list, and
+  `UV_CACHE_DIR=$HOME` did the same through `--dev`. Every such directory now goes
+  through one check. Symlinks are resolved first, so a link cannot launder a
+  target. Refused are: a relative path, anything that is not a directory, `/`,
+  your home directory and its parents, system directories, and the places where
+  settings, data, state, keys and personal folders live. A directory that came
+  from the environment must also belong to you and be writable by nobody else.
+
+  A refused directory is reported and left alone. Nothing is cleaned in its place
+  (your tools follow the variable, so `~/.cache` is not where their caches are),
+  and a tool that would have emptied it is not started. A relative
+  `XDG_CACHE_HOME` is ignored with a note, as the XDG spec says; an empty or
+  relative `$HOME` counts as unset. A cache moved with `XDG_CACHE_HOME` is cleaned
+  after a prompt or with `--yes`; `--json` alone is not an answer. `GOPATH` is a
+  list, and the module cache lives under its first entry.
+- **Cleaning no longer goes into what is mounted inside a cache.** `rm -r` and
+  Rust's `remove_dir_all` do not stop at a mount point. A `~/.cache` with a
+  project bind-mounted in it, a network share or a container volume lost that
+  something's files on a run that was only meant to empty a cache, and then
+  reported a failure. The kernel's list of mounts (`/proc/self/mountinfo`) is now
+  read first. A mount point is neither entered nor removed, and
+  `Kept <path>: another file system is mounted there` says so: a note, not a
+  failure. A dry run leaves out what a real run leaves alone, so the two figures
+  agree. If the list cannot be read, nothing is emptied and that is an error.
+
+  This covers every cleaner that empties a directory (cache, trash, thumbnails,
+  the Flatpak and AUR caches, the dev caches) and the `find` sweeps that run as
+  root: portage's build tree, apk's cache, Gentoo's distfiles, Flatpak's repo
+  tmp, snapd's cache, systemd's coredumps. `find -xdev` does not stop at a bind
+  mount either. A cache directory that is itself a symlink is now really cleaned:
+  `find` does not follow a link given as its starting point, and used to report
+  "cleaned" after removing nothing.
+- **As root, oxiclean no longer works inside a home directory that is not root's.**
+  `sudo -E`, a sudoers file that keeps `HOME`, and some older releases start root
+  with the home of whoever ran sudo. `--cache`, `--trash`, `--dev`, `--aur` and the
+  user part of `--flatpak` then did their work as root in a tree the user
+  controls, and where a removal ends up is theirs to say: a link they left as
+  `~/.cache` made root empty whatever it pointed to (shown in a container, with a
+  link planted by an ordinary user: "Freed 8.00 KB", exit status 0).
+
+  When `$HOME` is not a directory that only root can change, those five steps are
+  not run. Each says so under its own heading as a failure — exit status 1, listed
+  under `errors` in `--json`, the same in a dry run — and the steps that are root's
+  own (packages, orphans, journal, snap, coredumps, trim) go on. Run oxiclean as
+  yourself, without sudo: it asks for sudo itself where a step needs it.
+- **As root, oxiclean starts the tools it finds through `$PATH` only from
+  directories that only root can change.** `sudo` keeps the caller's `PATH` unless
+  sudoers sets `secure_path`, and `sudo -E` always keeps it, so a `pip` that
+  something running as you had left in `~/.local/bin` was started as root (it
+  printed `uid=0`). For root the `PATH` is now cut once, at start-up, for
+  oxiclean and for everything its tools start (`#!/usr/bin/env node` and the
+  like). Relative entries and entries that are not there are dropped without a
+  word; a directory that anybody but root can write to is dropped and named in a
+  single warning, which is not a failure. With nothing left, the trusted system
+  directories are used. A run as an ordinary user is not touched.
+- **`install.sh` refuses a download that is sent on over plain http.** A release
+  download is always redirected, and `curl -L` would have followed a redirect to
+  `http://`; TLS older than 1.2 was accepted too. curl now gets
+  `--proto '=https' --tlsv1.2`. The wget fallback gets no flag on purpose: its
+  `--https-only` does not limit redirects, and a flag that looks like a protection
+  and is not one is worse than none. That is why curl is tried first.
+- **Text that comes from outside is shown, not obeyed.** A file name can hold
+  anything but `/`: an escape sequence that clears the screen or retitles the
+  window, a newline followed by `✔ Freed 4 GB`, a right-to-left override that
+  makes `gnp.exe` read as `exe.png`. Such a name reached the terminal raw, in the
+  message for a failed removal and in what a tool complains about, which is
+  replayed under our failure line. Every message oxiclean prints now spells out
+  what a terminal would act on (`\u{1b}`, `\n`). Ordinary text, in any script, is
+  printed as it is, and the colours oxiclean writes itself still work. `--json`
+  already escaped its strings.
+
+### Changed
+- **The exit status says whether the run worked.** A step that failed printed its
+  red line and the run still exited 0, so `oxiclean --all && next-step`, a cron
+  job or a CI script heard "success" whatever had happened. It is now 0 when every
+  step did what it was asked and 1 when any step reported a failure. Unchanged: 1
+  for "no operation selected" and for missing privileges, 2 for a command line
+  that makes no sense. The text report adds `✘ N error(s) — see the lines marked ✘
+  above`. `--json` gains three fields after the existing ones, so nothing a
+  consumer already reads moves: `schema` (1), `status` (`"ok"` or `"error"`) and
+  `errors` (a list of `{operation, message}`, the first 100). The document of a
+  run that cannot start carries `status` and `schema` too. A warning is not a
+  failure.
+- **`--json` is no longer a yes to removing orphaned packages.** On Arch and
+  openSUSE the question "Remove orphaned packages?" counted as answered under
+  `--json`, so a run that only asked for its report as JSON removed packages
+  nobody had been asked about. Removing them now takes `--yes`. With `--json`
+  alone nothing is removed, and that is an error, not a quiet skip: "Orphaned
+  packages not removed without --yes (--json cannot ask)". `--json --yes` removes,
+  a terminal asks as before, and a dry run asks nothing. Debian, Fedora, Void,
+  Gentoo and Solus run their own autoremove with `--orphans`/`--all` and never
+  asked; they are unchanged.
+- **"Freed" and "Would free" are space on disk**, not the sum of file lengths. A
+  small file occupies a whole block, so a cache of many small files (a browser's,
+  npm's, pip's) was under-reported. A sparse file occupies less than its length,
+  and a file with several names frees nothing until the last one goes, so a pnpm
+  store that projects link into was over-reported. A file now counts the blocks
+  its filesystem gave it, which is what `du` and `df` see, and one with several
+  names counts only when every name is among what is being removed. On a copy of
+  a source tree (1 810 files, 1 105 of them with several names) `--dry-run` says
+  4.70 MB, as `du` does; the length sum said 2.05 MB. On a filesystem that shares
+  extents (snapshots, reflinks) the figure is an upper bound.
+- **A dev cache whose own tool is missing is left alone.** pnpm, go, conda,
+  ccache, dotnet (NuGet) and composer are scanned only when their tool is found.
+  A cache that is there while its tool is not gets one dim line — `⊘ pnpm: found a
+  cache, but pnpm is not in your PATH — left alone` — and no row in the summary,
+  no share of "Will clean now" and no failure. Before, a pnpm store left behind by
+  a pnpm that is gone ended the run with "`pnpm store prune` failed" and status 1
+  on a machine where nothing was wrong (deleting that store by hand would break
+  every project that links into it), and the others were listed and counted
+  although nothing could clean them.
+- **Gentoo without `eclean`: `DISTDIR` is no longer emptied unasked.** The step
+  removed every distfile with `find` and asked nothing, hand-fetched files
+  included — what a `RESTRICT=fetch` package needs its user to put there. It now
+  takes `--deep` or a "y" to a question that names the real path and what is
+  lost; `--yes` and `--json` alone leave the files, with a note that `--deep` does
+  it, and do not fail the run. Installing `eclean` (gentoolkit) is still the
+  better way, as it keeps what the tree still wants. `DISTDIR`, which portage
+  reads from the environment before `make.conf`, goes through the same check as the
+  other environment-supplied roots: `/`, `/var`, `/usr` and the other system
+  directories, your home and anything inside a system tree are refused with the
+  reason, as a failure. The old `/usr/portage/...` home of distfiles stays
+  allowed, and a `DISTDIR` that is not there is now said.
+- **`--deep` keeps the Maven artifacts that were installed on this machine.** It
+  emptied `~/.m2/repository`, and with it what cannot be downloaded again: a
+  library put there with `mvn install`, a jar from `install:install-file`. Maven
+  records where it got each version in `_remote.repositories`; only a version
+  whose record names a repository for every file is removed. Everything else is
+  kept — installed here, no record (Gradle's `publishToMavenLocal` writes none),
+  a record that is not text or over 64 KiB, files the record does not list,
+  sub-directories — and one line says how many, and that they cannot be
+  downloaded again. The summary figure is what a clean frees, not what the whole
+  repository weighs. Links inside are neither entered nor removed, mount points
+  are left, and group directories the removal empties are pruned, never the
+  repository itself.
+- **`--quiet` drops the description of the machine,** as `--help` says it does.
+  The System, Distro, AUR helper, Flatpak, Snap, Nix and HDD lines are banner
+  sub-lines and were printed whatever the flag, so a cron job began with seven
+  lines nobody asked for. DRY RUN and DEEP CLEAN stay: they say what the run is
+  about to do.
+- **Building from source needs Rust 1.85.** The README said 1.70+, which was
+  never true: the locked dependencies (ureq 3.3, zeroize 1.9) need 1.85.
+  `Cargo.toml` now says `rust-version = "1.85"` and CI builds with that version.
+
+### Fixed
+- **`--dev` found no tool installed in your home directory (a regression in 1.8.0).**
+  1.8.0 gave every child process the trusted `PATH`, and a program searches its
+  child's `PATH` for a bare name, so `uv` in `~/.local/bin`, `cargo` in
+  `~/.cargo/bin` and a version manager's shims were invisible: the call failed,
+  nothing said why, and the total read 0 B. There are now two kinds of tool. System
+  tools keep the absolute path from the trusted directories and the trusted `PATH`.
+  Your own (`--dev`, the Nix user profile) are found once through your `PATH`,
+  relative and empty entries ignored, only executable regular files accepted, and
+  they keep your environment.
+- **`--dev` keeps tool chatter and first-run side effects out of the run.** The
+  .NET SDK answers a first command — often `dotnet nuget locals all --clear` — with
+  a welcome banner, a telemetry notice, an HTTPS development certificate, a `PATH`
+  change and a workload check. For dotnet, oxiclean now sets `DOTNET_NOLOGO`,
+  `DOTNET_CLI_TELEMETRY_OPTOUT`, `DOTNET_GENERATE_ASPNET_CERTIFICATE=false`,
+  `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false` and `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1`,
+  never over a value you set. The output of each tool-driven cleaner is captured; a
+  failure replays what the tool said, and `--verbose` shows it all. `--json` is one
+  document again: visible children get no stdout in JSON mode, and the orphan list
+  and the dev table no longer print straight to it.
+- **A "✔" means the step did its work.** Many success lines followed a command whose
+  result nobody had looked at, or one that exits 0 without having done anything:
+  - Arch `--deep`: `pacman -Scc --noconfirm` answers "remove all files from cache?"
+    with its default, which is no (pacman 7.1), so it removed nothing and "deep
+    clean done" was printed. Both questions are now answered.
+  - Nix: `nix store --optimise` is not a command; in a single-user install the
+    working one lives in the user's profile, which root cannot see, so it now runs as
+    the user.
+  - Void: `xbps-remove -O` exits 1 when `/var/cache/xbps` does not exist. That is
+    nothing to clean, not a failure.
+  - Alpine: `apk cache clean` exits 0 whatever it did and keeps the cached current
+    versions, so "cleaned" was said after removing zero bytes. The report says what
+    was kept, and `--deep` deletes the rest and checks.
+  - Gentoo, Flatpak (`--user` and `--system` each on their own), snap, coredumps,
+    Apport, the portage tmp sweep and pacman's partial downloads: a success line
+    only when the removal worked, and an error naming what could not be cleared
+    when it did not.
+  - A listing that failed (`pacman -Qdtq`, `zypper packages --orphaned`,
+    `snap list`) was read as "nothing found" — "No orphans found" for a locked
+    package database. The two are told apart now.
+  - A privileged command that was never started (no sudo or doas, or the tool
+    outside the trusted directories) says why, and no longer looks like one that
+    failed.
+
+  `Freed 0 B` after a failed cleanup is gone too, as is "already clean" after a
+  failed deep clean of an AUR cache: the line is left out only when nothing was
+  freed *and* something failed; a clean zero still says `Freed 0 B`.
+- **Caches and the trash with read-only directories are really emptied.** `~/.cache`
+  and the trash are emptied one entry at a time, and an entry that could not be
+  removed was skipped without a word: the run ended with a tick, `Freed 0 B` and
+  status 0, and the tree was still there. Read-only directories are common in just
+  these places — the Go module cache extracts every directory read-only, an AUR
+  build that downloads Go modules leaves them in the helper's cache, a tree put in
+  the trash keeps its modes — and in the trash the info files went while the files
+  they describe stayed. A directory that refuses is now given its owner's rwx, once,
+  and removed. The repair never follows a link and never touches a directory that
+  is not the one it looked at; the directory being emptied keeps its own mode. What
+  stays is one error per directory ("Could not remove 2 of 5 item(s) in DIR: PATH:
+  Permission denied"), counted in the exit status and in `--json`. `gem cleanup`,
+  which printed nothing when it worked, now says "cleaned (size not measured)".
+- **NixOS: sudo and the system tools were not found.** NixOS has none of the
+  directories privileged commands were looked up in: the setuid wrappers are in
+  `/run/wrappers/bin` and `nix-collect-garbage` is in
+  `/run/current-system/sw/bin`, so "No privilege-escalation tool found" came
+  before anything ran. Both directories are now used, but only where they are
+  root's (owner root, not writable by group or others; a link is followed). The
+  standard directories are not put to that check — Debian's group-writable
+  `/usr/local/bin` would be lost. Detection now agrees with launch: flatpak and
+  snap are announced only when the system lookup finds them, and an AUR helper
+  that is not in a system directory is reported as not run, not as a failed `-Sc`.
+  `PIP_CACHE_DIR`, `COMPOSER_CACHE_DIR` and `NUGET_PACKAGES` are checked like the
+  other relocated caches and scanned where the tool looks (pip and Composer keep
+  their cache under `XDG_CACHE_HOME` when it is set). Tried against a made-up NixOS
+  layout in a container; a real NixOS machine was not available.
+- **The "is an emerge running?" guard could answer "no" when it did not know.** The
+  sweep of failed-build leftovers under `PORTAGE_TMPDIR` runs only when no emerge
+  is running. `pgrep` ran as the user, and every status except "found" read as an
+  idle tree: pgrep's own errors, and a root emerge that a `/proc` mounted
+  `hidepid=2` hides (reproduced: "Cleared portage build leftovers" while one ran).
+  Root is now asked — `pgrep -c -f '[e]merge'` — and only a count above 0 (a build;
+  the tree is left alone) or a printed 0 with status 1 (idle) is an answer.
+  Anything else, a sudo that refused or one that wanted a password, leaves the tree
+  alone with a warning that says why; it is not a failure.
+- **Flatpak's leftovers were swept from everything under `/var/tmp`.** The sweep was
+  `find /var/tmp -name 'flatpak-cache-*'` as root, and removed anything with that
+  name at any depth — a project's `flatpak-cache-notes` directory went with the
+  leftovers. It is limited to the top of `/var/tmp` now (`-maxdepth 1`), where
+  Flatpak puts them.
+- **A snap called `disabled-notes` was taken for a disabled revision.** The word was
+  looked for anywhere on a line of `snap list --all`, and `snap remove --revision`
+  was then run against an active snap's current revision. A note must now be
+  exactly `disabled` in the Notes column (`disabled`, `base,disabled` and
+  `disabled,classic` all qualify).
+- **conda in a home directory with non-ASCII characters.** `conda info --json`
+  writes every such character as an escape, and `--dev` read the package directory
+  by looking for the quotes, so the "path" was the escaped text, which does not
+  exist. The reply is parsed as JSON now.
+- **NixOS ran `nix-store --optimise` on a spinning disk,** which can take hours.
+  Every other distribution already skipped it there and said how to run it
+  yourself; NixOS now does the same.
+
+### Internal
+- **Releases are signed offline before anyone can see them.** `release.yml` now makes
+  a draft, which GitHub's "latest release" never returns, so neither `--update` nor
+  `install.sh` sees a release before `scripts/sign-release.sh` has signed it on the
+  maintainer's machine. A preflight job runs before the four builds: the tag must
+  equal the `Cargo.toml` version, `minisign.pub` must hold a key, and the build
+  must be able to verify the certificates of the hosts `--update` talks to (the
+  ignored tests `release_builds_must_ship_an_update_key` and
+  `release_builds_must_verify_the_hosts_they_update_from`). The second needs the
+  network: without it, a build whose TLS roots do not cover GitHub would pass every
+  test and ship a release that can neither update itself nor be updated.
+  `scripts/test-sign-release.sh` runs the signing script against throwaway keys
+  and a fake `gh`, and CI runs it. [RELEASING.md](RELEASING.md) is the procedure.
+- **CI builds with a read-only token and from the locked dependencies.** The
+  workflow has `contents: read`; only the job that creates the draft release asks to
+  write. Checkouts no longer leave the token in `.git/config`, and builds, tests and
+  clippy run with `--locked`, so a change to `Cargo.toml` that does not bring
+  `Cargo.lock` along fails the pull request and not the release. A new `msrv` job
+  builds with the Rust version `Cargo.toml` names. The actions are still pinned by
+  tag, not by commit.
+- **Tests that run the real binary** (`tests/hardening_test.rs`). Some run it in a
+  user and mount namespace of its own (`unshare -Urm`), where a tmpfs, bind mounts
+  and "root" — the developer's own user — cost the machine nothing. Others run it
+  on a made-up machine: `/usr/bin` and `/etc/os-release` are replaced for the run,
+  so the flows that belong to one distribution (orphans on Arch and openSUSE,
+  distfiles on Gentoo) and the checks on root run end to end against stand-in
+  tools that write down what they were asked. They skip where a user cannot have a
+  namespace or `/usr` cannot be made writable.
+- The results of `run`, `run_user`, `run_quiet`, `elevate`, `sudo` and their
+  variants are `#[must_use]`: a command whose outcome is ignored no longer compiles.
+- Comments that said what the code did not were corrected.
+
 ## [1.8.0] - 2026-08-27
 
 ### Security

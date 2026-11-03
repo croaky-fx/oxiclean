@@ -4,7 +4,7 @@
 
 **Fast Cross-Distribution Linux System Cleaner — Written in Rust**
 
-[![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Linux](https://img.shields.io/badge/Platform-Linux-yellow?logo=linux&logoColor=white)](https://kernel.org)
 [![AUR](https://img.shields.io/aur/version/oxiclean?logo=archlinux&label=AUR&color=1793D1)](https://aur.archlinux.org/packages/oxiclean)
@@ -92,7 +92,8 @@ $ oxiclean -A -y
 - Python: pip, uv, pipenv, poetry (cache only — your virtualenvs stay), conda (`conda clean`, never your envs)
 - Rust: cargo registry + git checkouts (your installed binaries in `~/.cargo/bin` are never touched)
 - Go modules (needs `--deep` since it re-downloads)
-- Ruby gems (old versions), PHP composer, Gradle caches, Maven
+- Ruby gems (old versions), PHP composer, Gradle caches, Maven (what it downloaded;
+  artifacts you installed yourself with `mvn install` are kept)
 - C/C++: ccache, and .NET: NuGet global packages
 
 It handles **50+ distributions** across 10 package manager families. If you're on something obscure it doesn't know, it'll still clean the universal stuff (cache, trash, journal, Flatpak, Snap) without complaining.
@@ -103,9 +104,12 @@ It handles **50+ distributions** across 10 package manager families. If you're o
 ```bash
 curl -fsSL https://raw.githubusercontent.com/croaky-fx/oxiclean/main/install.sh | sh
 ```
-Detects your CPU and libc (glibc/musl), downloads the latest release to a temp
-dir, verifies it, and installs to `/usr/local/bin` (asks for sudo only for that
-final step). Force a libc with `OXICLEAN_LIBC=musl` if auto-detection is wrong.
+Detects your CPU and libc (glibc/musl), downloads the latest release over HTTPS
+to a temp dir, checks that it is a Linux binary that runs, and installs it to
+`/usr/local/bin` (asks for sudo only for that final step). Force a libc with
+`OXICLEAN_LIBC=musl` if auto-detection is wrong. The script does not check a
+signature: what you trust there is HTTPS and GitHub. `oxiclean --update` is
+stricter, as described below.
 
 **Arch (AUR):**
 ```bash
@@ -150,6 +154,18 @@ confirm — downloads the right binary for your CPU and libc, verifies it, and
 swaps it in atomically. Use `oxiclean --update -y` to skip the prompt (handy in
 a cron job). Networking is built in (via `ureq` + `rustls`), so no `curl` or
 `wget` is required.
+
+"Verifies" is more than a download over HTTPS. Every release carries a list of
+checksums signed with the maintainer's [minisign](https://jedisct1.github.io/minisign/)
+key, and the public half of that key is built into the binary. `--update`
+installs a release only if the signature is valid, the signed list names the
+checksum of the file it downloaded, the release is newer than the one you run,
+and the new binary then reports the version it was signed as. Anything else is
+refused and your binary stays as it is. The release notes it prints are not
+signed, so they are shown with control characters removed. Releases up to 1.8.0
+have the older updater, which checks less: they receive the first signed release
+through it, and every update after that is verified.
+[How a release is signed →](RELEASING.md)
 
 If oxiclean was installed by a **package manager** (AUR, apt, …), `--update`
 won't touch it — self-updating a managed binary would corrupt the package
@@ -206,6 +222,23 @@ the human report — no banner, no colors, no prompts:
 oxiclean --all --yes --json | jq .total_freed_bytes
 ```
 
+The document also says how the run went: `status` is `"ok"` or `"error"`, and
+`errors` lists what failed, by operation. Nobody can answer a question in JSON
+mode, so a question `--json` would have asked is not answered "yes": removing
+orphaned packages (Arch, openSUSE) and cleaning a cache moved with
+`XDG_CACHE_HOME` need `--yes` as well.
+
+### Exit status
+
+| Status | Meaning |
+|:--:|---|
+| `0` | every step did what it was asked |
+| `1` | a step reported a failure (marked ✘ in the report, listed under `errors` in `--json`), no operation was selected, or privileges were missing |
+| `2` | the command line makes no sense |
+
+So `oxiclean --all --yes && next-step` can be trusted, and so can a cron or CI
+wrapper. A warning (⚠) is not a failure.
+
 ### Cleaning dev tool caches
 
 If you're a developer your `~/.cargo`, `~/.npm`, `~/.cache/pip` and friends can
@@ -242,6 +275,9 @@ A few things it explicitly *won't* do — the ones that bite people:
   breaks every project — it runs `pnpm store prune` instead
 - poetry's `virtualenvs/`, gradle's `wrapper/`, npm globals and aura's restore
   points are all preserved
+- Maven artifacts that were installed on this machine (`mvn install`) can't be
+  downloaded again, so `--deep` removes only what Maven fetched from a repository
+- a cache whose own tool isn't installed is left alone, with one line saying so
 
 Each of those is enforced by a test. [Full list and rationale →](DETAILS.md#what-it-spares-and-why)
 
@@ -320,11 +356,15 @@ image swaps, not the package manager — while user-level cleanup still runs.
 
 **Results vary a lot.** Whether you free 5 MB or 2 GB depends on how long since you last cleaned, your distro, and your disk. The value isn't the number — it's not having to remember ten commands for ten distros.
 
-**`--deep` is more aggressive.** `pacman -Scc`, `flatpak repair`, cached packages that'll re-download. Run `--dry-run --deep` first if unsure.
+**`--deep` is more aggressive.** `pacman -Scc`, `flatpak repair`, cached packages that'll re-download. Run `--dry-run --deep` first if unsure. On Gentoo without `eclean` it is also what lets oxiclean empty `DISTDIR`, which costs a download for every file and loses any you fetched by hand; with `--yes` alone those files are left.
 
 **It needs sudo or doas for some things** — package cache, orphan removal, journal. Detected at startup; on Alpine and Void where `doas` is the default, no configuration needed. User-level operations (`--cache`, `--trash`, `--dev`) never ask.
 
+**Run it as yourself, without `sudo`.** It asks for sudo only for the steps that need it. Started as root (`sudo oxiclean`, a root cron job) it cleans root's own caches, and when `$HOME` isn't root's alone (`sudo -E`, or a sudoers file that keeps `HOME`) the steps that work in a home directory (`--cache`, `--trash`, `--dev`, `--aur`, the user part of `--flatpak`) are refused with an error instead of being run as root inside a tree you control. As root it also starts tools only from `$PATH` directories that only root can change, and names the ones it left out.
+
 **Privileged commands are resolved to absolute system paths**, never through `$PATH` — a binary you didn't install can't be run as root through this tool. See [DETAILS.md](DETAILS.md#security).
+
+**It checks where it deletes.** Anything mounted inside a directory it empties (a bind mount, a network share, a container volume) is kept, and it says so. A cache directory taken from an environment variable (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `GOPATH`…) must be a plain directory that is yours and nobody else's: your home directory, system directories and the places your settings and data live are refused, and nothing is cleaned in their place.
 
 **HDD warning.** On a spinning root disk you'll get a heads-up that cleanup may take a while. Reading directory sizes across millions of small files (looking at you, `~/.cargo/registry`) is genuinely slow. Not a bug, just physics.
 
@@ -332,7 +372,7 @@ image swaps, not the package manager — while user-level cleanup still runs.
 ```
 0 3 * * 0 /usr/local/bin/oxiclean --all --yes --quiet
 ```
-Avoid `--deep` in automated runs. Add `--dev` if you want dev caches included.
+Avoid `--deep` in automated runs. Add `--dev` if you want dev caches included. Use the crontab of the user whose caches these are: from root's it cleans root's. The exit status is 1 when a step failed, so a wrapper can tell.
 
 ---
 
@@ -341,9 +381,9 @@ Avoid `--deep` in automated runs. Add `--dev` if you want dev caches included.
 **[DETAILS.md](DETAILS.md)** covers the longer story:
 
 - [Everything it deliberately spares, and why](DETAILS.md#what-it-spares-and-why) — model weights, pnpm's store, aura's restore points, immutable systems
-- [Security design](DETAILS.md#security) — trusted binary resolution (CWE-426), child environment hardening, self-update guards, the portage build-tmp guards
+- [Security design](DETAILS.md#security) — trusted binary resolution (CWE-426), child environment hardening, signed updates, what root won't do, what is never followed or emptied, the portage build-tmp guards
 - [How it works under the hood](DETAILS.md#how-it-works-under-the-hood) — detection, how freed space is measured, why captured output
-- [Testing](DETAILS.md#testing) — the 132 unit + 17 integration tests, and which ones matter
+- [Testing](DETAILS.md#testing) — the 407 unit tests, the 85 that run the real binary (some on a made-up machine), and which ones matter
 - [Contributing](DETAILS.md#contributing) — adding a distro, and what I'd love help with
 
 ---

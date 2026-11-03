@@ -33,30 +33,63 @@ on faith.
 Do this once, on a machine you trust, before the first signed release.
 
 ```sh
-mkdir -p ~/.minisign
+# 1. A private place for the key
+mkdir -p ~/.minisign && chmod 700 ~/.minisign
+
+# 2. Generate it. You are asked for a password.
 minisign -G -p minisign.pub.new -s ~/.minisign/oxiclean.key
+chmod 600 ~/.minisign/oxiclean.key
+
+# 3. Try it before relying on it: sign a scratch file, then verify it.
+t=$(mktemp -d); echo test > "$t/f"
+minisign -S -s ~/.minisign/oxiclean.key -m "$t/f" -x "$t/f.minisig" -t "oxiclean 0.0.0"
+minisign -V -H -p minisign.pub.new -m "$t/f" -x "$t/f.minisig"
+rm -r "$t"
+
+# 4. Back the key up (next section), then put the public key in place.
 mv minisign.pub.new minisign.pub
 ```
 
-- Pick a strong password when asked, and never pass `-W` (it stores the key
-  unencrypted).
+- Pick a strong password, and never pass `-W` (it stores the key unencrypted).
 - Don't add `-f`. Without it the command stops if the secret key already exists,
   which is what you want: an existing key is never overwritten.
-- Back the secret key up offline, with its password kept somewhere else. If it
-  is lost, see [Rotating or losing the key](#rotating-or-losing-the-key).
-- Keep it off GitHub: not in the repository and not in Actions secrets. Signing
-  is offline so that a compromised repository or CI cannot also sign.
-- Commit `minisign.pub`. It is the only file that goes in the repository. Then
-  `cargo test --locked release_builds_must_ship_an_update_key -- --ignored`
-  must pass; the Release workflow runs the same test before building.
+- If the key lives somewhere else, set `MINISIGN_KEY` when you sign;
+  `scripts/sign-release.sh` looks for `~/.minisign/oxiclean.key`.
+- Keep it off GitHub: not in the repository and not in Actions secrets. Signing is
+  offline so that a compromised repository or CI cannot also sign.
+
+### Backing the key up
+
+The secret key file is already encrypted with its password. A lost key means every
+install has to be redone by hand (see [Rotating or losing the key](#rotating-or-losing-the-key)),
+so keep copies.
+
+1. Copy `~/.minisign/oxiclean.key` to at least two offline media (two USB sticks,
+   say), kept apart from this machine and from each other.
+2. Check each copy. Compare it with the original using `sha256sum`, then repeat
+   step 3 above with `-s` pointing at the copy. A backup you have never signed with
+   is a guess.
+3. Keep the password somewhere else (a password manager, or on paper), not next to
+   the key.
+4. Write down the key ID, which is on the first line of `minisign.pub`, outside this
+   machine too. It is what you compare against if you ever doubt a file.
+
+### The public key
+
+Commit `minisign.pub`. It is the only file that goes in the repository. Then
+`cargo test --locked release_builds_must_ship_an_update_key -- --ignored` must pass;
+the Release workflow runs the same test before building.
 
 ## Making a release
 
 1. Raise the version everywhere: `version` in `Cargo.toml` (run `cargo build` so
    `Cargo.lock` follows), `pkgver` in `PKGBUILD`, and a section in
-   `CHANGELOG.md`. It must be higher than every earlier release; clients never
-   install an equal or older version.
-2. Commit, then tag `vX.Y.Z` (exactly the `Cargo.toml` version) and push the tag.
+   `CHANGELOG.md` (the `[Unreleased]` section becomes the new version's). It must be
+   higher than every earlier release; clients never install an equal or older
+   version.
+2. Commit, run `cargo test --locked -- --ignored` (the two checks only a release
+   runs; the second needs the network), then tag `vX.Y.Z` (exactly the `Cargo.toml`
+   version) and push the tag.
 3. The *Release* workflow checks that the tag matches `Cargo.toml` and that
    `minisign.pub` holds a key, builds the four binaries and attaches them to a
    **draft** release. GitHub's "latest release" never includes drafts, so
