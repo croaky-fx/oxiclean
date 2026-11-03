@@ -1597,6 +1597,59 @@ fn usable_home(home: Option<String>) -> Option<String> {
     home.filter(|h| Path::new(h).is_absolute())
 }
 
+/// `$HOME`, when root is running and the directory is not root's to clean.
+///
+/// `sudo -E`, a sudoers file that keeps `HOME`, and older releases of some
+/// distributions give a root process the home directory of whoever ran sudo.
+/// What the user-level steps do there is then done as root, inside a tree the
+/// user owns, and where a removal ends up is theirs to say: a link they left
+/// (`~/.cache` onto a directory root was never asked to empty, which is theirs
+/// to do, it is their disk) or put there during the run makes root remove what
+/// it leads to. Nothing below a start path is followed; where the start path
+/// leads is not known by looking at it.
+///
+/// So those steps are not run as root there, and `main` says so. Whose a home
+/// directory is is the question [`only_root_can_change`] asks of the directory
+/// the path leads to now. The directories above it are not looked at: root's
+/// home is not put below something somebody else can rename. A user in their own
+/// home is the ordinary case and gets `None`, without a look.
+pub fn foreign_home() -> Option<String> {
+    foreign_home_of(is_root(), home_dir(), look_at_home)
+}
+
+/// [`foreign_home`] with what it asks of the machine handed in: whether root is
+/// running, `$HOME`, and `look`, which says what a path is.
+fn foreign_home_of(
+    root: bool,
+    home: Option<String>,
+    look: impl FnOnce(&str) -> io::Result<(bool, u32, u32)>,
+) -> Option<String> {
+    if !root {
+        return None;
+    }
+    let home = home?;
+    is_someone_elses(look(&home)).then_some(home)
+}
+
+/// What a home directory is now, as `(a directory, owner, mode)`. A link is
+/// followed, as the steps that work in it will follow it.
+fn look_at_home(home: &str) -> io::Result<(bool, u32, u32)> {
+    fs::metadata(home).map(|m| (m.is_dir(), m.uid(), m.mode()))
+}
+
+/// Whether what was found about a home directory makes it somebody else's, for
+/// root. A directory is root's when root alone can change it. One that is not
+/// there is nothing to clean, and what is not a directory has nothing in it to
+/// clean: neither is a reason to say no. One that cannot be looked at is
+/// refused, because nothing is known about it.
+fn is_someone_elses(found: io::Result<(bool, u32, u32)>) -> bool {
+    match found {
+        Ok((true, uid, mode)) => !only_root_can_change(uid, mode),
+        Ok((false, ..)) => false,
+        Err(why) => why.kind() != io::ErrorKind::NotFound,
+    }
+}
+
 /// Ask user for yes/no confirmation. In JSON mode there is no interactive
 /// terminal, so we decline by default rather than block on stdin — callers
 /// that must proceed non-interactively pass `--yes`, which short-circuits
@@ -2163,6 +2216,96 @@ mod tests {
         assert_eq!(usable_home(some("home/u")), None, "relative would too");
         assert_eq!(usable_home(some(".")), None);
         assert_eq!(usable_home(None), None);
+    }
+
+    // ── Root in a home directory that is not root's ──
+
+    fn found(is_dir: bool, uid: u32, mode: u32) -> io::Result<(bool, u32, u32)> {
+        Ok((is_dir, uid, mode))
+    }
+
+    #[test]
+    fn test_a_home_directory_is_roots_when_only_root_can_change_it() {
+        // Root's own, as systems make it.
+        for mode in [0o700, 0o750, 0o755, 0o550] {
+            assert!(!is_someone_elses(found(true, 0, mode)), "{mode:o}");
+        }
+        // Another account's, however closed it is.
+        for uid in [1, 1000, 65534] {
+            assert!(is_someone_elses(found(true, uid, 0o700)), "uid {uid}");
+        }
+        // Root's, but open to its group or to everyone; a sticky bit changes
+        // nothing about what can be put in it.
+        for mode in [0o720, 0o702, 0o775, 0o757, 0o777, 0o1777, 0o2775] {
+            assert!(is_someone_elses(found(true, 0, mode)), "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn test_what_cannot_be_cleaned_anyway_is_no_reason_to_refuse() {
+        let missing: io::Result<(bool, u32, u32)> = Err(io::ErrorKind::NotFound.into());
+        assert!(!is_someone_elses(missing), "there is nothing to clean");
+        // A file has nothing in it, whoever it belongs to.
+        assert!(!is_someone_elses(found(false, 1000, 0o644)));
+        // What cannot be looked at is not known to be root's.
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Other,
+        ] {
+            assert!(is_someone_elses(Err(kind.into())), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_only_root_in_a_home_that_is_not_roots_is_in_a_foreign_one() {
+        let home = || Some("/home/u".to_string());
+        let theirs = |_: &str| found(true, 1000, 0o755);
+        let roots = |_: &str| found(true, 0, 0o700);
+        let never = |_: &str| -> io::Result<(bool, u32, u32)> {
+            panic!("a home directory was looked at that nothing was asked about")
+        };
+
+        // A user in their own home is what the tool is for, and it is not looked at.
+        assert_eq!(foreign_home_of(false, home(), never), None);
+        // Root in somebody else's home, and in its own.
+        assert_eq!(
+            foreign_home_of(true, home(), theirs),
+            Some("/home/u".to_string())
+        );
+        assert_eq!(foreign_home_of(true, home(), roots), None);
+        // With no usable HOME there is nothing to refuse: the steps say what
+        // they say about it themselves.
+        assert_eq!(foreign_home_of(true, None, never), None);
+    }
+
+    #[test]
+    fn test_a_home_directory_is_looked_at_as_the_steps_will_reach_it() {
+        let dir = real_scratch("look_at_home");
+        let md = fs::metadata(&dir).unwrap();
+        let at = |p: &Path| look_at_home(p.to_str().unwrap());
+        assert_eq!(at(&dir).unwrap(), (true, md.uid(), md.mode()));
+
+        // A link is followed, as the steps follow it.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert_eq!(at(&link).unwrap(), (true, md.uid(), md.mode()));
+        // A file is not a directory.
+        let file = dir.join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(!at(&file).unwrap().0);
+        // And what is not there says so, which is what makes it nothing to clean.
+        let gone = dir.join("gone");
+        assert_eq!(at(&gone).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_a_user_is_never_in_somebody_elses_home() {
+        // Only for root does the answer depend on whose HOME it has.
+        if !is_root() {
+            assert_eq!(foreign_home(), None);
+        }
     }
 
     #[test]

@@ -131,7 +131,8 @@ fn parse_ids(status: &str) -> Option<Ids> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     /// Built by us below `$HOME`. It is the user's by construction, and may be a
-    /// symlink onto another disk they own or share.
+    /// symlink onto another disk they own or share. (Root in somebody else's home
+    /// does not get here: see `utils::foreign_home`.)
     Home,
     /// Supplied by an environment variable. Nothing about it is known.
     Env,
@@ -238,9 +239,8 @@ fn real_or_lexical(path: &Path) -> PathBuf {
 /// 4. not inside a system tree, unless the home directory is there or, for a
 ///    [`Source::System`] root, a place where a system's caches live (below it,
 ///    not the place itself);
-/// 5. for [`Source::Env`] only: owned by the user (or by the owner of the home
-///    directory, for root running on someone's behalf), and writable by nobody
-///    else.
+/// 5. for [`Source::Env`] only: owned by the user running oxiclean, and writable
+///    by nobody else.
 pub fn check(ctx: &Context, candidate: &Path, source: Source) -> Result<PathBuf, Reject> {
     if !candidate.is_absolute() {
         return Err(refuse("it is not an absolute path"));
@@ -260,7 +260,7 @@ pub fn check(ctx: &Context, candidate: &Path, source: Source) -> Result<PathBuf,
         return Err(refuse(why));
     }
     if source == Source::Env {
-        if let Some(why) = not_plainly_the_users(ctx, home.as_deref(), &md) {
+        if let Some(why) = not_plainly_the_users(ctx, &md) {
             return Err(refuse(why));
         }
     }
@@ -315,14 +315,16 @@ fn off_limits(ctx: &Context, home: Option<&Path>, root: &Path, source: Source) -
 /// Rule 5: a root named by the environment has to be plainly the user's own.
 /// Anything another account owns or can write to is somewhere we could be made
 /// to delete things that were never ours.
-fn not_plainly_the_users(ctx: &Context, home: Option<&Path>, md: &fs::Metadata) -> Option<String> {
+fn not_plainly_the_users(ctx: &Context, md: &fs::Metadata) -> Option<String> {
     let Some(me) = ctx.ids else {
         return Some("it could not be determined who is running oxiclean".to_string());
     };
-    // Root cleaning on someone's behalf (`sudo -E`, HOME kept) owns nothing of
-    // theirs; what is theirs is what their home directory is.
-    let home_owner = home.and_then(|h| fs::metadata(h).ok()).map(|m| m.uid());
-    if md.uid() != me.uid && Some(md.uid()) != home_owner {
+    // Nobody stands in for whoever is running: root with somebody else's HOME
+    // (`sudo -E`) does not clean what that account names, which is theirs to
+    // clean as themselves. Root in that home does no user-level cleaning at all
+    // (`utils::foreign_home`), so this is not where that is stopped; it is what
+    // keeps the variables of such a run from being believed.
+    if md.uid() != me.uid {
         return Some(format!("it belongs to uid {}, not to you", md.uid()));
     }
     let mode = md.mode();
@@ -648,7 +650,9 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_of_home_stands_in_for_root_running_on_their_behalf() {
+    fn root_does_not_stand_in_for_the_owner_of_home() {
+        // `sudo -E`: root, with the HOME of whoever ran sudo. What the
+        // environment names in their home is theirs, not root's to empty.
         let d = scratch("sudo");
         let home = mkdir(d.join("home"));
         let dir = mkdir(d.join("cache"));
@@ -658,7 +662,7 @@ mod tests {
             ..me
         };
         let c = context(Some(&home), Some(root_like));
-        assert_eq!(check(&c, &dir, Source::Env), Ok(dir.clone()));
+        assert!(why(check(&c, &dir, Source::Env)).contains("not to you"));
     }
 
     #[test]

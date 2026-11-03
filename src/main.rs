@@ -465,6 +465,12 @@ fn main() {
     let timer = Instant::now();
     let mut run = Run::default();
 
+    // Root run with somebody else's HOME must not work inside it, whoever's
+    // cleaning that is (see `utils::foreign_home`). The steps that do are given
+    // `foreign` and are not run; the others do not look in a home directory.
+    let foreign = utils::foreign_home();
+    let foreign = foreign.as_deref();
+
     if ops.cache {
         // The helper list always goes in; `ops.aur` says whether the AUR section
         // will run. A command-driven helper's dir is deferred to that section
@@ -472,7 +478,7 @@ fn main() {
         // without ever leaving the dir uncleaned. A hand-pruned helper's dir is
         // held back either way — it stores state (aura's snapshots) that a
         // wholesale wipe would destroy.
-        run.step("cache", || {
+        run.home_step("cache", "User Cache", foreign, || {
             clean::user_cache(cli.dry_run, cli.yes, &sys.aur_helpers, ops.aur)
         });
     }
@@ -499,7 +505,11 @@ fn main() {
     }
 
     if ops.aur {
-        run.step("aur", || {
+        // The helpers' caches are in the home directory; where there are no
+        // helpers, or this is not Arch, the step only says it has nothing to do.
+        let at_home = sys.distro == Distro::Arch && !sys.aur_helpers.is_empty();
+        let at_home = foreign.filter(|_| at_home);
+        run.home_step("aur", "AUR Cache", at_home, || {
             let mut f = 0u64;
             if sys.distro == Distro::Arch {
                 // Empty-list handling lives in aur_cache so the skip line is
@@ -514,7 +524,9 @@ fn main() {
     }
 
     if ops.flatpak {
-        run.step("flatpak", || {
+        // Only where flatpak is there does the step work in the home directory.
+        let at_home = foreign.filter(|_| sys.has_flatpak);
+        run.home_step("flatpak", "Flatpak", at_home, || {
             let mut f = 0u64;
             if sys.has_flatpak {
                 f = clean::flatpak(cli.deep, cli.dry_run);
@@ -544,7 +556,7 @@ fn main() {
     }
 
     if ops.trash {
-        run.step("trash", || clean::trash(cli.dry_run));
+        run.home_step("trash", "Trash", foreign, || clean::trash(cli.dry_run));
     }
 
     if ops.coredumps {
@@ -552,7 +564,9 @@ fn main() {
     }
 
     if ops.dev {
-        run.step("dev", || dev::run(cli.deep, cli.dry_run, yes));
+        run.home_step("dev", "Dev Cache", foreign, || {
+            dev::run(cli.deep, cli.dry_run, yes)
+        });
     }
 
     if ops.trim {
@@ -671,12 +685,42 @@ impl Run {
         self.record(name, freed, utils::failures_since(mark));
     }
 
+    /// [`step`](Run::step) for an operation that works in the home directory.
+    /// `foreign` is that directory when root would be doing it in one that is not
+    /// root's (see [`utils::foreign_home`]): the operation is not run then, and
+    /// that is said as the failure it is, under the operation's own heading.
+    fn home_step(
+        &mut self,
+        name: &'static str,
+        heading: &str,
+        foreign: Option<&str>,
+        operation: impl FnOnce() -> u64,
+    ) {
+        match foreign {
+            None => self.step(name, operation),
+            Some(home) => self.step(name, || {
+                utils::section(heading);
+                utils::error(&refused_as_root_in(home));
+                0
+            }),
+        }
+    }
+
     fn record(&mut self, name: &'static str, freed: u64, failures: Vec<String>) {
         self.total_freed += freed;
         self.results.push((name, freed));
         self.failures
             .extend(failures.into_iter().map(|message| (name, message)));
     }
+}
+
+/// What an operation that works in `home` says when root is not to do it there.
+fn refused_as_root_in(home: &str) -> String {
+    format!(
+        "Not run: oxiclean is running as root, but $HOME ({home}) is not root's. \
+         Run it as the user whose home that is, without sudo: it asks for sudo \
+         itself where a step needs it"
+    )
 }
 
 /// The exit status of a run that reported `failures` failures: 0 when every step
@@ -824,6 +868,38 @@ mod tests {
         // ...but coredumps (root-owned dirs) does.
         let ops = Ops::resolve(&parse(&["oxiclean", "--coredumps"])).unwrap();
         assert!(ops.needs_sudo());
+    }
+
+    // ── Steps that work in the home directory ──
+
+    #[test]
+    fn test_root_in_a_home_that_is_not_roots_does_not_run_the_step() {
+        let ran = std::cell::Cell::new(0);
+        let mut run = Run::default();
+
+        run.home_step("cache", "User Cache", None, || {
+            ran.set(ran.get() + 1);
+            7
+        });
+        assert_eq!(ran.get(), 1, "a step with nothing against it runs");
+        assert_eq!(run.results, vec![("cache", 7)]);
+
+        run.home_step("trash", "Trash", Some("/home/u"), || {
+            ran.set(ran.get() + 1);
+            9
+        });
+        assert_eq!(ran.get(), 1, "root in somebody else's home must not run it");
+        assert_eq!(run.results, vec![("cache", 7), ("trash", 0)]);
+        assert_eq!(run.total_freed, 7);
+    }
+
+    #[test]
+    fn test_the_refusal_names_the_home_and_says_what_to_do() {
+        let said = refused_as_root_in("/home/u");
+        assert!(said.starts_with("Not run: "), "{said}");
+        assert!(said.contains("$HOME (/home/u) is not root's"), "{said}");
+        assert!(said.contains("without sudo"), "{said}");
+        assert!(!said.contains('\n'), "one line: {said}");
     }
 
     // ── JSON string encoder ──

@@ -1965,6 +1965,7 @@ fn after(section: &str, label: &str) -> String {
 
 const CACHE_WITH_MOUNTS: &str = r#"
 set -u
+umask 022
 BIN=$1; W=$2
 C=$W/real/home/u/.cache
 mkdir -p "$C/plain/sub" "$C/deep/inner/bound" "$C/mnt" "$W/source" "$W/empty"
@@ -2060,6 +2061,7 @@ fn test_a_cache_with_other_file_systems_mounted_in_it_keeps_them() {
 
 const CACHE_THAT_IS_A_MOUNT: &str = r#"
 set -u
+umask 022
 BIN=$1; W=$2
 C=$W/home/.cache
 mkdir -p "$C" "$W/empty"
@@ -2100,6 +2102,7 @@ fn test_a_cache_that_is_itself_a_mount_is_still_emptied() {
 
 const CACHE_WITHOUT_THE_MOUNT_LIST: &str = r#"
 set -u
+umask 022
 BIN=$1; W=$2
 C=$W/home/.cache
 mkdir -p "$C/plain" "$W/empty"
@@ -2169,7 +2172,7 @@ for d in /bin /sbin /usr/sbin /usr/local/bin /usr/local/sbin; do
 done
 "$M" -t tmpfs tmpfs /run
 . "$W/extra.sh"
-export HOME="$W/home" PATH=/usr/bin LC_ALL=C NO_COLOR=1 TERM=dumb FAKE_LOG="$W/calls.log"
+export HOME="${OXI_TEST_HOME:-$W/home}" PATH=/usr/bin LC_ALL=C NO_COLOR=1 TERM=dumb FAKE_LOG="$W/calls.log"
 exec "$BIN" "$@"
 "#;
 
@@ -2589,4 +2592,253 @@ fn test_a_distdir_that_is_a_link_is_cleared_where_it_leads() {
     assert!(out.status.success(), "{}", report(&out));
     assert_eq!(files_below(&real), Vec::<String>::new(), "{}", report(&out));
     assert!(fs::symlink_metadata(&distdir).unwrap().is_symlink());
+}
+
+// ── Root in a home directory that is not root's ──
+//
+// `sudo -E` runs root with the HOME of whoever ran sudo, and what the steps that
+// work in a home directory removed there would be up to that user: a link left
+// in it leads root's removal anywhere. Root does not run them
+// (`utils::foreign_home`) and says so, and the steps that are root's own go on.
+//
+// In the namespace the tests make for themselves the child is "root", which is
+// the developer's own user, and what the real root owns, /usr for one, belongs
+// to nobody it knows there: a home directory that root does not hold. Where the
+// tests run as the real root, /usr is the child's own as well, and these skip.
+
+/// Whether /usr is somebody else's to the "root" of a namespace of our own: it
+/// is not owned by whoever runs the tests.
+fn usr_is_somebody_elses() -> bool {
+    let owner = |path: &str| fs::metadata(path).map(|m| m.uid()).ok();
+    owner("/usr").is_some() && owner("/usr") != owner("/proc/self")
+}
+
+const ROOT_IN_A_HOME: &str = r#"
+set -u
+umask 022
+BIN=$1; W=$2
+mkdir -p "$W/own/.cache/plain" "$W/shared/.cache/plain" "$W/empty"
+head -c 100000 /dev/zero > "$W/own/.cache/plain/a"
+head -c 100000 /dev/zero > "$W/shared/.cache/plain/a"
+chmod 755 "$W/own"
+chmod 775 "$W/shared"
+run() {
+  home=$1; shift
+  env -i HOME="$home" PATH="$W/empty" TERM=dumb NO_COLOR=1 "$BIN" "$@" 2>&1
+  echo "status=$?"
+}
+echo "@@ own"
+run "$W/own" --cache --dry-run
+echo "@@ foreign"
+run /usr --cache --trash --dev --yes
+echo "@@ open"
+run "$W/shared" --cache --yes
+echo "@@ missing"
+run "$W/not-there" --cache --dry-run
+echo "@@ system"
+run /usr --journal --dry-run
+echo "@@ json"
+env -i HOME=/usr PATH="$W/empty" TERM=dumb NO_COLOR=1 "$BIN" --cache --journal --dry-run --json 2>/dev/null
+echo "@@ left"
+(cd "$W" && find own shared -mindepth 1 | sort)
+"#;
+
+const NOT_RUN_IN_USR: &str = "Not run: oxiclean is running as root, but $HOME (/usr) is not root's";
+
+#[test]
+fn test_root_in_a_home_it_does_not_hold_cleans_nothing_in_it() {
+    if !usr_is_somebody_elses() {
+        eprintln!("skipped: /usr is the tests' own user's here, so no home is somebody else's");
+        return;
+    }
+    let work = fs::canonicalize(scratch("root_in_a_home")).unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_oxiclean"));
+    let Some(out) = in_private_mounts(ROOT_IN_A_HOME, &[exe, &work]) else {
+        remove_unmounted(&work);
+        return;
+    };
+    let shown = report(&out);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "the script itself failed:\n{shown}");
+    let part = |name: &str| section(&stdout, name);
+
+    // Root in a home of its own: as ever.
+    let own = part("own");
+    assert!(
+        own.contains("User Cache") && own.contains("status=0"),
+        "{shown}"
+    );
+    assert!(!own.contains("Not run"), "{shown}");
+
+    // Somebody else's: each step that works in it says it was not run, and that
+    // is a failure.
+    let foreign = part("foreign");
+    assert!(foreign.contains("status=1"), "{shown}");
+    assert_eq!(foreign.matches(NOT_RUN_IN_USR).count(), 3, "{shown}");
+    for heading in ["User Cache", "Trash", "Dev Cache"] {
+        assert!(foreign.contains(heading), "{heading}\n{shown}");
+    }
+    assert!(foreign.contains("3 errors"), "{shown}");
+    assert!(!foreign.contains("Freed"), "{shown}");
+
+    // A home that is root's but open to its group is not root's alone.
+    let open = part("open");
+    assert!(open.contains("status=1"), "{shown}");
+    assert!(
+        open.contains(&format!("$HOME ({}/shared) is not root's", work.display())),
+        "{shown}"
+    );
+    assert!(!open.contains("Freed"), "{shown}");
+
+    // Nothing is there to be said about a home that is not there.
+    let missing = part("missing");
+    assert!(missing.contains("status=0"), "{shown}");
+    assert!(!missing.contains("Not run"), "{shown}");
+
+    // What is root's own to do goes on in somebody else's home.
+    let system = part("system");
+    assert!(
+        system.contains("Journal") && system.contains("status=0"),
+        "{shown}"
+    );
+    assert!(!system.contains("Not run"), "{shown}");
+
+    // The report says which operation was not run, and only that one.
+    let doc: serde_json::Value = serde_json::from_str(part("json").trim())
+        .unwrap_or_else(|e| panic!("not JSON ({e}):\n{shown}"));
+    assert_eq!(doc["status"], "error", "{shown}");
+    let errors = doc["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{shown}");
+    assert_eq!(errors[0]["operation"], "cache", "{shown}");
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("$HOME (/usr)"),
+        "{shown}"
+    );
+    assert_eq!(doc["operations"]["cache"], 0, "{shown}");
+    assert!(doc["operations"].get("journal").is_some(), "{shown}");
+
+    // And nothing was removed.
+    assert_eq!(
+        part("left").lines().collect::<Vec<_>>(),
+        [
+            "own/.cache",
+            "own/.cache/plain",
+            "own/.cache/plain/a",
+            "shared/.cache",
+            "shared/.cache/plain",
+            "shared/.cache/plain/a",
+        ],
+        "{shown}"
+    );
+    remove_unmounted(&work);
+}
+
+/// An Arch machine with an AUR helper and flatpak, which write down what they
+/// are asked, and with `home` for the child's HOME where it is not the default.
+fn arch_machine_with_tools_at_home(name: &str, home: Option<&str>) -> Machine {
+    let machine = arch_machine(name);
+    machine.tool("yay", "echo \"yay $*\" >> \"$FAKE_LOG\"\n");
+    machine.tool("flatpak", "echo \"flatpak $*\" >> \"$FAKE_LOG\"\n");
+    if let Some(home) = home {
+        machine.also(&format!("OXI_TEST_HOME={home}\n"));
+    }
+    machine
+}
+
+#[test]
+fn test_root_in_a_home_that_is_not_roots_starts_no_tool_that_works_in_it() {
+    if !usr_is_somebody_elses() {
+        eprintln!("skipped: /usr is the tests' own user's here, so no home is somebody else's");
+        return;
+    }
+    let machine = arch_machine_with_tools_at_home("foreign_home_tools", Some("/usr"));
+    let flags = [
+        "--cache",
+        "--trash",
+        "--dev",
+        "--aur",
+        "--flatpak",
+        "--orphans",
+        "--yes",
+        "--json",
+    ];
+    let Some(out) = machine.run(&flags, "") else {
+        return;
+    };
+    let shown = report(&out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    let doc = one_document(&out);
+    assert_eq!(doc["status"], "error", "{shown}");
+
+    // The five that work in a home directory, in the order they run.
+    let errors = doc["errors"].as_array().unwrap();
+    let refused: Vec<&str> = errors
+        .iter()
+        .map(|e| e["operation"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        refused,
+        ["cache", "aur", "flatpak", "trash", "dev"],
+        "{shown}"
+    );
+    for error in errors {
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(NOT_RUN_IN_USR), "{message}\n{shown}");
+    }
+
+    // Neither the AUR helper nor flatpak was started, and what is root's own,
+    // the orphaned packages, was removed.
+    assert_eq!(machine.calls(), ["pacman -Qdtq", ARCH_REMOVAL], "{shown}");
+}
+
+#[test]
+fn test_root_in_a_home_that_is_not_roots_leaves_what_has_nothing_to_do_alone() {
+    if !usr_is_somebody_elses() {
+        eprintln!("skipped: /usr is the tests' own user's here, so no home is somebody else's");
+        return;
+    }
+    // No AUR helper and no flatpak: those steps only say they have nothing to
+    // do, and root being in somebody else's home is no reason to call that a
+    // failure.
+    let machine = arch_machine("foreign_home_nothing_to_do");
+    machine.also("OXI_TEST_HOME=/usr\n");
+    let Some(out) = machine.run(&["--aur", "--flatpak", "--json"], "") else {
+        return;
+    };
+    let shown = report(&out);
+    assert!(out.status.success(), "{shown}");
+    let doc = one_document(&out);
+    assert_eq!(doc["status"], "ok", "{shown}");
+    assert_eq!(doc["errors"], serde_json::json!([]), "{shown}");
+}
+
+#[test]
+fn test_root_in_its_own_home_works_in_it_as_before() {
+    let machine = arch_machine_with_tools_at_home("own_home_tools", None);
+    // Made by the test, with the umask of whoever runs it: root's home is not
+    // open to anyone.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let home = machine.dir.join("home");
+        fs::set_permissions(home, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let flags = ["--cache", "--trash", "--aur", "--flatpak", "--dry-run"];
+    let Some(out) = machine.run(&flags, "") else {
+        return;
+    };
+    let shown = report(&out);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{shown}");
+    assert!(!stdout.contains("Not run"), "{shown}");
+    for ran in [
+        "User Cache",
+        "Trash",
+        "Would run: yay",
+        "Would clean Flatpak",
+    ] {
+        assert!(stdout.contains(ran), "{ran}\n{shown}");
+    }
 }
