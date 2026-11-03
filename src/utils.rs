@@ -1,7 +1,7 @@
 use colored::Colorize;
 use std::borrow::Cow;
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -130,6 +130,72 @@ pub fn trusted_path() -> String {
     trusted_dirs().join(":")
 }
 
+/// Cut `$PATH` down to what root can run tools from, when root is running, and
+/// say which entries were left out that are worth naming.
+///
+/// The user tier ([`run_user`], [`capture`], [`which`]) finds a tool through the
+/// caller's `$PATH` and runs it with the caller's rights, which gains nobody
+/// anything while the caller is the user whose caches are being cleaned. A root
+/// run is not that: `sudo` keeps the caller's `PATH` unless the sudoers file sets
+/// `secure_path`, `sudo -E` always keeps it, and a `pip` that a process of the
+/// user's own left in `~/.local/bin` is then started as root (seen with the real
+/// root of a container: it printed `uid=0`). What a tool starts is found through
+/// the same `PATH`, `#!/usr/bin/env node` among it, so the `PATH` the children
+/// inherit is changed as well, here, once, before anything looks for a tool.
+///
+/// What stays is what [`only_root_can_change`] holds for the directory an entry
+/// leads to, as it is for the NixOS ones among the trusted directories. What goes
+/// without a word is what could not have held a tool: an entry that is not
+/// absolute (a shell reads it as the current directory), one that is not there,
+/// one that is not a directory. What goes and is named is a directory that
+/// somebody other than root can change, or one that cannot be looked at. When
+/// nothing is left the trusted directories are, not an empty `PATH`, which
+/// anything that searches it reads as the current directory.
+pub fn harden_path_for_root() -> Vec<PathBuf> {
+    let Some(path) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    match harden_path_with(is_root(), &path, look_at_dir) {
+        Some((kept, left_out)) => {
+            env::set_var("PATH", kept);
+            left_out
+        }
+        None => Vec::new(),
+    }
+}
+
+/// [`harden_path_for_root`] with what it asks of the machine handed in: whether
+/// root is running, the `PATH`, and `look`, which says what a directory is. The
+/// new `PATH` and the entries to name, or `None` when there is nothing to change.
+fn harden_path_with(
+    root: bool,
+    path: &OsStr,
+    look: impl Fn(&Path) -> io::Result<(bool, u32, u32)>,
+) -> Option<(OsString, Vec<PathBuf>)> {
+    if !root {
+        return None;
+    }
+    let mut kept: Vec<PathBuf> = Vec::new();
+    let mut left_out = Vec::new();
+    for entry in env::split_paths(path) {
+        if !entry.is_absolute() {
+            continue;
+        }
+        match look(&entry) {
+            Ok((true, uid, mode)) if only_root_can_change(uid, mode) => kept.push(entry),
+            Ok((true, ..)) => left_out.push(entry),
+            Ok((false, ..)) => {}
+            Err(why) if why.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => left_out.push(entry),
+        }
+    }
+    if kept.is_empty() {
+        kept = trusted_dirs().into_iter().map(PathBuf::from).collect();
+    }
+    let new = env::join_paths(&kept).ok()?;
+    (new != path).then_some((new, left_out))
+}
+
 /// Run a system tool with visible output (inherits stdio).
 ///
 /// **System tier.** A bare `cmd` is looked up in the trusted directories only:
@@ -178,8 +244,10 @@ fn keep_json_stdout_clean(command: &mut Command) {
 /// overriding a choice the caller has already made.
 ///
 /// This is not an escalation: the tool runs with the caller's rights against
-/// the caller's caches, so a binary the caller controls gains nothing. It must
-/// never be paired with [`elevate`], which has its own trusted lookup.
+/// the caller's caches, so a binary the caller controls gains nothing. (Were the
+/// caller root it would be one, and `main` has cut `$PATH` down to what root
+/// alone controls first: [`harden_path_for_root`].) It must never be paired with
+/// [`elevate`], which has its own trusted lookup.
 #[must_use = "a command that failed has to be reported, not assumed to have worked"]
 pub fn run_user(cmd: &str, args: &[&str]) -> bool {
     run_user_in(&env::var_os("PATH").unwrap_or_default(), cmd, args)
@@ -737,7 +805,8 @@ pub fn sudo(cmd: &str, args: &[&str]) -> bool {
 /// `uv`/`deno`/`pnpm`/`bun` installers default to `~/.local/bin`. Those run with
 /// the caller's own privileges against the caller's own cache, so a binary they
 /// control is not an escalation. The name is resolved through the caller's
-/// `$PATH` ([`which_path`]) and the child keeps the caller's environment.
+/// `$PATH` ([`which_path`]) and the child keeps the caller's environment; for
+/// root that `$PATH` is the one [`harden_path_for_root`] left.
 /// Privileged callers use [`capture_trusted`].
 pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
     capture_in(&env::var_os("PATH").unwrap_or_default(), cmd, args)
@@ -1634,7 +1703,12 @@ fn foreign_home_of(
 /// What a home directory is now, as `(a directory, owner, mode)`. A link is
 /// followed, as the steps that work in it will follow it.
 fn look_at_home(home: &str) -> io::Result<(bool, u32, u32)> {
-    fs::metadata(home).map(|m| (m.is_dir(), m.uid(), m.mode()))
+    look_at_dir(Path::new(home))
+}
+
+/// [`look_at_home`] for any path.
+fn look_at_dir(dir: &Path) -> io::Result<(bool, u32, u32)> {
+    fs::metadata(dir).map(|m| (m.is_dir(), m.uid(), m.mode()))
 }
 
 /// Whether what was found about a home directory makes it somebody else's, for
@@ -2306,6 +2380,70 @@ mod tests {
         if !is_root() {
             assert_eq!(foreign_home(), None);
         }
+    }
+
+    // ── Root and $PATH ──
+
+    #[test]
+    fn test_root_keeps_only_the_path_entries_that_root_alone_can_change() {
+        let look = |dir: &Path| match dir.to_str().unwrap() {
+            "/usr/bin" | "/usr/local/bin" => found(true, 0, 0o755),
+            "/home/u/.local/bin" => found(true, 1000, 0o755),
+            "/opt/shared/bin" => found(true, 0, 0o775),
+            "/opt/open/bin" => found(true, 0, 0o777),
+            "/srv/tool" => found(false, 0, 0o755),
+            "/gone/bin" => Err(io::ErrorKind::NotFound.into()),
+            "/locked/bin" => Err(io::ErrorKind::PermissionDenied.into()),
+            other => panic!("{other} is not an absolute entry, and was looked at"),
+        };
+        let path = OsStr::new(
+            "/home/u/.local/bin:/usr/local/bin:/opt/shared/bin:/usr/bin:/opt/open/bin:\
+             /srv/tool:/gone/bin:/locked/bin:.::relative/bin",
+        );
+        let (new, left_out) = harden_path_with(true, path, look).unwrap();
+        // Root's own stay, in the order they were in.
+        assert_eq!(new, OsString::from("/usr/local/bin:/usr/bin"));
+        // What is named is what is there and that somebody else can change, or
+        // cannot be looked at; not what could never have held a tool.
+        let named: Vec<&str> = left_out.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(
+            named,
+            [
+                "/home/u/.local/bin",
+                "/opt/shared/bin",
+                "/opt/open/bin",
+                "/locked/bin"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_users_path_is_not_touched_and_a_safe_one_is_not_rewritten() {
+        let never =
+            |_: &Path| -> io::Result<(bool, u32, u32)> { panic!("a user's PATH was looked at") };
+        let path = OsStr::new("/home/u/.local/bin:/usr/bin");
+        assert_eq!(harden_path_with(false, path, never), None);
+
+        let roots = |_: &Path| found(true, 0, 0o755);
+        let safe = OsStr::new("/usr/local/bin:/usr/bin:/bin");
+        assert_eq!(harden_path_with(true, safe, roots), None);
+    }
+
+    #[test]
+    fn test_root_with_nothing_left_gets_the_trusted_directories() {
+        let theirs = |_: &Path| found(true, 1000, 0o755);
+        let path = OsStr::new("/home/u/bin:/home/u/.local/bin");
+        let (new, left_out) = harden_path_with(true, path, theirs).unwrap();
+        assert_eq!(new, OsString::from(trusted_path()));
+        assert_eq!(left_out.len(), 2);
+
+        // An empty PATH is the current directory to whatever searches it.
+        let never = |_: &Path| -> io::Result<(bool, u32, u32)> {
+            panic!("an entry that is not absolute was looked at")
+        };
+        let (new, left_out) = harden_path_with(true, OsStr::new(""), never).unwrap();
+        assert_eq!(new, OsString::from(trusted_path()));
+        assert!(left_out.is_empty());
     }
 
     #[test]

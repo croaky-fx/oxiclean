@@ -310,6 +310,11 @@ fn main() {
     // consumer parsing one JSON line cannot also receive pacman's chatter.
     utils::set_verbose(cli.verbose && !cli.json);
 
+    // Root finds the tools it runs through $PATH only where root alone can write
+    // (see `utils::harden_path_for_root`), and it is done before anything looks
+    // for a tool, so that what is detected is what runs.
+    let left_out_of_path = utils::harden_path_for_root();
+
     // Self-update is a standalone mode — it ignores the cleanup flags.
     if cli.update {
         // --json promises one JSON document on stdout, and the update flow is a
@@ -365,6 +370,9 @@ fn main() {
 
     // ── Banner ──
     utils::banner(env!("CARGO_PKG_VERSION"));
+    if !left_out_of_path.is_empty() {
+        utils::warning(&left_out_of_path_says(&left_out_of_path));
+    }
 
     // ── Detect everything once ──
     let sys = SystemInfo::detect();
@@ -714,6 +722,15 @@ impl Run {
     }
 }
 
+/// What is said of the `$PATH` entries that root did not take.
+fn left_out_of_path_says(entries: &[std::path::PathBuf]) -> String {
+    let named: Vec<String> = entries.iter().map(|e| e.display().to_string()).collect();
+    format!(
+        "Root does not run tools from PATH entries that others can change, so these are left out: {}",
+        named.join(", ")
+    )
+}
+
 /// What an operation that works in `home` says when root is not to do it there.
 fn refused_as_root_in(home: &str) -> String {
     format!(
@@ -891,6 +908,20 @@ mod tests {
         assert_eq!(ran.get(), 1, "root in somebody else's home must not run it");
         assert_eq!(run.results, vec![("cache", 7), ("trash", 0)]);
         assert_eq!(run.total_freed, 7);
+    }
+
+    #[test]
+    fn test_the_entries_left_out_of_path_are_named_as_they_are_written() {
+        let entries = ["/home/u/.local/bin".into(), "/opt/x".into()];
+        let said = left_out_of_path_says(&entries);
+        assert!(
+            said.starts_with("Root does not run tools from PATH entries that others can change"),
+            "{said}"
+        );
+        assert!(
+            said.ends_with("so these are left out: /home/u/.local/bin, /opt/x"),
+            "{said}"
+        );
     }
 
     #[test]

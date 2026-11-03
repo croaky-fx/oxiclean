@@ -2212,6 +2212,12 @@ impl Machine {
         for sub in ["bin", "tools", "home"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
+        // It is the machine's /usr/bin, which root runs tools from only where
+        // others cannot write: not whatever the umask of the test made of it.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fs::write(dir.join("os-release"), os_release).unwrap();
         fs::write(dir.join("extra.sh"), "").unwrap();
         fs::write(dir.join("calls.log"), "").unwrap();
@@ -2841,4 +2847,72 @@ fn test_root_in_its_own_home_works_in_it_as_before() {
     ] {
         assert!(stdout.contains(ran), "{ran}\n{shown}");
     }
+}
+
+// ── Root and the tools it finds through $PATH ──
+//
+// The user tier starts a tool it finds through the caller's PATH, with the
+// caller's rights. Root is not the user whose caches these are, and `sudo` keeps
+// the caller's PATH unless the sudoers file says otherwise: a `pip` in a
+// directory the user can write to was started as root. Root now goes only by
+// the entries that root alone can change, and says which it left out.
+
+const ROOT_AND_A_PATH_OTHERS_CAN_WRITE: &str = r#"
+set -u
+umask 022
+BIN=$1; W=$2
+mkdir -p "$W/open" "$W/safe" "$W/home/.cache/pip"
+head -c 100000 /dev/zero > "$W/home/.cache/pip/blob"
+for d in open safe; do
+  printf '#!/bin/sh\necho "%s pip: $*" >> "%s/pip.log"\n' "$d" "$W" > "$W/$d/pip"
+  chmod 755 "$W/$d/pip"
+done
+chmod 775 "$W/open"
+chmod 755 "$W/safe" "$W/home"
+: > "$W/pip.log"
+run() {
+  env -i HOME="$W/home" PATH="$1" TERM=dumb NO_COLOR=1 "$BIN" --dev --yes 2>&1
+  echo "status=$?"
+}
+echo "@@ both"
+run "$W/open:$W/safe"
+echo "@@ log"
+cat "$W/pip.log"
+rm "$W/safe/pip"
+: > "$W/pip.log"
+echo "@@ only open"
+run "$W/open"
+echo "@@ log of only open"
+cat "$W/pip.log"
+"#;
+
+#[test]
+fn test_root_runs_no_tool_from_a_path_entry_that_others_can_change() {
+    let work = fs::canonicalize(scratch("root_and_path")).unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_oxiclean"));
+    let Some(out) = in_private_mounts(ROOT_AND_A_PATH_OTHERS_CAN_WRITE, &[exe, &work]) else {
+        remove_unmounted(&work);
+        return;
+    };
+    let shown = report(&out);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "the script itself failed:\n{shown}");
+    let part = |name: &str| section(&stdout, name);
+
+    // The one that others can write to comes first on the PATH, and the one
+    // that root can trust is the one that runs.
+    let both = part("both");
+    assert!(both.contains("status=0"), "{shown}");
+    let ran: Vec<&str> = part("log").lines().collect();
+    assert!(
+        !ran.is_empty() && ran.iter().all(|line| line.starts_with("safe pip: ")),
+        "{ran:?}\n{shown}"
+    );
+    // It is said, and it is not a failure; only the entry that was left out is named.
+    let said = format!("so these are left out: {}/open", work.display());
+    assert!(both.lines().any(|line| line.ends_with(&said)), "{shown}");
+
+    // With only that one left, nothing of it runs, wherever else a pip is found.
+    assert_eq!(part("log of only open"), "", "{shown}");
+    remove_unmounted(&work);
 }
