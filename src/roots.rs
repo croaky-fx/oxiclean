@@ -2,8 +2,10 @@
 //!
 //! Most of what it deletes sits at a path it builds itself (`~/.npm/_cacache`).
 //! A few roots are handed to it by the environment instead: `XDG_CACHE_HOME`,
-//! `UV_CACHE_DIR`, `DENO_DIR`, `CCACHE_DIR`, `GOMODCACHE` and `GOPATH`. Those
-//! used to be emptied without asking what they point at, so
+//! `UV_CACHE_DIR`, `DENO_DIR`, `CCACHE_DIR`, `GOMODCACHE`, `GOPATH`,
+//! `PIP_CACHE_DIR`, `COMPOSER_CACHE_DIR` and `NUGET_PACKAGES`, and, for what root
+//! empties, Gentoo's `DISTDIR`. Those used to be emptied without asking what
+//! they point at, so
 //! `XDG_CACHE_HOME=$HOME` (a typo, a mixed-up line in a profile, a variable
 //! inherited from another account) turned "clean my cache" into "empty my home
 //! directory".

@@ -1666,22 +1666,21 @@ fn usable_home(home: Option<String>) -> Option<String> {
     home.filter(|h| Path::new(h).is_absolute())
 }
 
-/// `$HOME`, when root is running and the directory is not root's to clean.
+/// `$HOME`, when root is running and that directory is not root's to clean.
 ///
 /// `sudo -E`, a sudoers file that keeps `HOME`, and older releases of some
-/// distributions give a root process the home directory of whoever ran sudo.
-/// What the user-level steps do there is then done as root, inside a tree the
-/// user owns, and where a removal ends up is theirs to say: a link they left
-/// (`~/.cache` onto a directory root was never asked to empty, which is theirs
-/// to do, it is their disk) or put there during the run makes root remove what
-/// it leads to. Nothing below a start path is followed; where the start path
-/// leads is not known by looking at it.
+/// distributions start root with the home directory of whoever ran sudo. The
+/// user-level steps (`--cache`, `--trash`, `--dev`, ...) would then run as root
+/// inside a tree that user controls, and where a removal ends up is theirs to
+/// say: a link they left as `~/.cache`, or put there during the run, makes root
+/// remove whatever it leads to. Nothing below the start path is followed, but
+/// where the start path itself leads cannot be told by looking at it.
 ///
-/// So those steps are not run as root there, and `main` says so. Whose a home
-/// directory is is the question [`only_root_can_change`] asks of the directory
-/// the path leads to now. The directories above it are not looked at: root's
-/// home is not put below something somebody else can rename. A user in their own
-/// home is the ordinary case and gets `None`, without a look.
+/// So those steps are not run as root in such a home, and `main` says so. A home
+/// is root's when [`only_root_can_change`] holds for the directory it leads to
+/// now. The directories above it are not looked at (root's home is not put below
+/// something somebody else can rename). A user in their own home, the ordinary
+/// case, gets `None` without a look.
 pub fn foreign_home() -> Option<String> {
     foreign_home_of(is_root(), home_dir(), look_at_home)
 }
