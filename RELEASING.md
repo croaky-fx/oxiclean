@@ -33,21 +33,24 @@ on faith.
 Do this once, on a machine you trust, before the first signed release.
 
 ```sh
-# 1. A private place for the key
+# 1. A private place for the key, and a check that nothing is there yet
 mkdir -p ~/.minisign && chmod 700 ~/.minisign
+ls ~/.minisign/oxiclean.key ~/.minisign/oxiclean.pub 2>/dev/null && echo "STOP: a key already exists"
 
-# 2. Generate it. You are asked for a password.
-minisign -G -p minisign.pub.new -s ~/.minisign/oxiclean.key
+# 2. Generate the pair. You are asked for a password.
+minisign -G -p ~/.minisign/oxiclean.pub -s ~/.minisign/oxiclean.key
 chmod 600 ~/.minisign/oxiclean.key
+chmod 644 ~/.minisign/oxiclean.pub
 
 # 3. Try it before relying on it: sign a scratch file, then verify it.
 t=$(mktemp -d); echo test > "$t/f"
 minisign -S -s ~/.minisign/oxiclean.key -m "$t/f" -x "$t/f.minisig" -t "oxiclean 0.0.0"
-minisign -V -H -p minisign.pub.new -m "$t/f" -x "$t/f.minisig"
+minisign -V -H -p ~/.minisign/oxiclean.pub -m "$t/f" -x "$t/f.minisig"
 rm -r "$t"
 
-# 4. Back the key up (next section), then put the public key in place.
-mv minisign.pub.new minisign.pub
+# 4. Back the key up (next section), then put the public key in the repository.
+install -m 644 ~/.minisign/oxiclean.pub minisign.pub
+cmp ~/.minisign/oxiclean.pub minisign.pub
 ```
 
 - Pick a strong password, and never pass `-W` (it stores the key unencrypted).
@@ -64,15 +67,22 @@ The secret key file is already encrypted with its password. A lost key means eve
 install has to be redone by hand (see [Rotating or losing the key](#rotating-or-losing-the-key)),
 so keep copies.
 
-1. Copy `~/.minisign/oxiclean.key` to at least two offline media (two USB sticks,
-   say), kept apart from this machine and from each other.
+1. Copy `~/.minisign/oxiclean.key` to at least two offline media that are different
+   devices (two USB sticks, say), kept apart from this machine and from each other.
+   Never overwrite a file that is already there (`test -e "$dest/oxiclean.key" ||
+   cp …`), and run `sync`. A FAT or exFAT stick has no file permissions, so the
+   password is all that protects the key on it: treat the sticks like the key.
 2. Check each copy. Compare it with the original using `sha256sum`, then repeat
    step 3 above with `-s` pointing at the copy. A backup you have never signed with
-   is a guess.
+   is a guess. That first check may have been read from the cache, so plug each
+   stick in again later and compare the checksum once more.
 3. Keep the password somewhere else (a password manager, or on paper), not next to
    the key.
 4. Write down the key ID, which is on the first line of `minisign.pub`, outside this
-   machine too. It is what you compare against if you ever doubt a file.
+   machine too. It is what you compare against if you ever doubt a file. Copy
+   `oxiclean.pub` next to the key as well: it is public, and
+   `minisign -R -s oxiclean.key -p oxiclean.pub` can rebuild it from the secret key
+   anyway.
 
 ### The public key
 
