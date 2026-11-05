@@ -52,13 +52,14 @@
   list, and the module cache lives under its first entry.
 - **Cleaning no longer goes into what is mounted inside a cache.** `rm -r` and
   Rust's `remove_dir_all` do not stop at a mount point. A `~/.cache` with a
-  project bind-mounted in it, a network share or a container volume lost that
-  something's files on a run that was only meant to empty a cache, and then
-  reported a failure. The kernel's list of mounts (`/proc/self/mountinfo`) is now
-  read first. A mount point is neither entered nor removed, and
-  `Kept <path>: another file system is mounted there` says so: a note, not a
-  failure. A dry run leaves out what a real run leaves alone, so the two figures
-  agree. If the list cannot be read, nothing is emptied and that is an error.
+  project bind-mounted in it, a network share or a container volume lost the
+  files that were mounted there on a run that was only meant to empty a cache,
+  and then reported a failure. The kernel's list of mounts
+  (`/proc/self/mountinfo`) is now read first. A mount point is neither entered
+  nor removed, and `Kept <path>: another file system is mounted there` says so: a
+  note, not a failure. A dry run leaves out what a real run leaves alone, so the
+  two figures agree. If the list cannot be read, nothing is emptied and that is an
+  error.
 
   This covers every cleaner that empties a directory (cache, trash, thumbnails,
   the Flatpak and AUR caches, the dev caches) and the `find` sweeps that run as
@@ -135,10 +136,10 @@
   store that projects link into was over-reported. A file now counts the blocks
   its filesystem gave it, which is what `du` adds up and what `df` shows as free
   afterwards, and one with several names counts only when every name is among
-  what is being removed. On a copy of
-  a source tree (1 810 files, 1 105 of them with several names) `--dry-run` says
-  4.70 MB, as `du` does; the length sum said 2.05 MB. On a filesystem that shares
-  extents (snapshots, reflinks) the figure is an upper bound.
+  what is being removed. On a copy of a source tree (1 810 files, 1 105 of them
+  with several names) `--dry-run` says 4.70 MB, as `du` does; the length sum said
+  2.05 MB. On a filesystem that shares extents (snapshots, reflinks) the figure
+  is an upper bound.
 - **A dev cache whose own tool is missing is left alone.** pnpm, go, conda,
   ccache, dotnet (NuGet) and composer are scanned only when their tool is found.
   A cache that is there while its tool is not gets one dim line — `⊘ pnpm: found a
@@ -199,10 +200,10 @@
   `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false` and `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1`,
   never over a value you set. The SDK still counts that run as the first one, so
   your own next `dotnet` command shows no welcome or telemetry message and skips
-  the workload check; the certificate and the `PATH` change are done then, and
-  `dotnet workload update` does what the check would have. The output of each
-  tool-driven cleaner is captured; a failure replays what the tool said, and
-  `--verbose` shows it all. `--json` is one
+  the workload check; the certificate and the `PATH` change are left for that
+  command, and `dotnet workload update` does what the check would have. The
+  output of each tool-driven cleaner is captured; a failure replays what the tool
+  said, and `--verbose` shows it all. `--json` is one
   document again: visible children get no stdout in JSON mode, and the orphan list
   and the dev table no longer print straight to it.
 - **A "✔" means the step did its work.** Many success lines followed a command whose
@@ -297,8 +298,10 @@
   `release_builds_must_verify_the_hosts_they_update_from`). The second needs the
   network: without it, a build whose TLS roots do not cover GitHub would pass every
   test and ship a release that can neither update itself nor be updated.
-  `scripts/test-sign-release.sh` runs the signing script against throwaway keys
-  and a fake `gh`, and CI runs it. [RELEASING.md](RELEASING.md) is the procedure.
+  The signing script works on a draft only, refuses a release that is already
+  published, and always asks before it signs. `scripts/test-sign-release.sh` runs
+  it against throwaway keys and a fake `gh`, and CI runs that.
+  [RELEASING.md](RELEASING.md) is the procedure.
 - **CI builds with a read-only token and from the locked dependencies.** The
   workflow has `contents: read`; only the job that creates the draft release asks to
   write. Checkouts no longer leave the token in `.git/config`, and builds, tests and

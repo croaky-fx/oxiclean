@@ -141,8 +141,9 @@ never over a value you set. The SDK still counts that run as the first one: your
 own next `dotnet` command shows no welcome or telemetry message and skips the
 workload check, which the SDK runs only on a first run and which can reinstall
 workloads over the network. The certificate and the `PATH` change keep markers of
-their own and are done then. With workloads installed, `dotnet workload update`
-does what the check would have. (Checked with SDK 10.0.114, in a fresh home.)
+their own and are left for that command. With workloads installed,
+`dotnet workload update` does what the check would have. (Checked with SDK
+10.0.114, in a fresh home.)
 
 ### Root and `$PATH`
 
