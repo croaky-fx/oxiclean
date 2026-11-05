@@ -122,12 +122,39 @@ the Release workflow runs the same test before building.
    `MINISIGN_KEY` if the secret key is not at `~/.minisign/oxiclean.key`.
 5. Optionally download a binary from the draft and run `--version` on a scratch
    machine.
-6. Publish: `gh release edit vX.Y.Z --repo croaky-fx/oxiclean --draft=false`.
+6. Add the release notes, which the workflow leaves empty (what a user will
+   notice, shorter than the changelog section), then publish:
+
+   ```sh
+   gh release edit vX.Y.Z --repo croaky-fx/oxiclean --notes-file notes.md
+   gh release edit vX.Y.Z --repo croaky-fx/oxiclean --draft=false
+   ```
 
 If anything changes after you signed (a binary rebuilt, say), the old signature
 no longer matches: rebuild, then run the script again; it replaces the signature
 on the draft. Once a release is published, treat it as final and never replace
 its files; the script refuses to touch one. Fix forward with a higher version.
+
+## The AUR package
+
+The AUR package is built from source at the release tag (`git+…#tag=v$pkgver`,
+`sha256sums=('SKIP')`). It never downloads the signed binaries, so the signature
+plays no part in it, and `--update` refuses to replace a binary that pacman owns.
+It is updated by hand, once the release is published:
+
+1. Work in the AUR clone (`~/oxiclean-aur`), not in this repository: `makepkg`
+   makes `src/` and `pkg/` in the directory it runs in, and `src/` is the Rust
+   source here. Copy `PKGBUILD` over from this repository, where `pkgver` was
+   raised when you made the release. The AUR holds the same file.
+2. Refresh the metadata: `makepkg --printsrcinfo > .SRCINFO`.
+3. Build it once in a clean chroot (`pkgctl build`, from devtools), or with plain
+   `makepkg`, and read what `namcap` says. `check()` runs the whole test suite.
+4. Commit as `upgpkg: oxiclean X.Y.Z-1: what changed` and `git push`. The push is
+   authenticated by the SSH key registered with the AUR account; nothing is
+   signed.
+
+The tag has to be on GitHub before the push, or the package cannot be built. For
+a fix to the PKGBUILD alone, raise `pkgrel` and leave `pkgver`.
 
 ## Checking a release by hand
 
