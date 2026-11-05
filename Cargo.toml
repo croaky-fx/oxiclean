@@ -1,6 +1,6 @@
 [package]
 name = "oxiclean"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 # The oldest compiler that builds with Cargo.lock: some of the locked
 # dependencies (ureq, zeroize) declare 1.85 themselves. The `msrv` job in CI

@@ -19,7 +19,7 @@ OxiClean figures out what distro you're on and does the right thing. That's basi
 ```
 $ oxiclean -A -y
 
-    ⚡ Oxi Clean  v1.8.0
+    ⚡ Oxi Clean  v1.9.0
     Fast Cross-Distribution Linux System Cleaner
     ──────────────────────────────────────────────
 

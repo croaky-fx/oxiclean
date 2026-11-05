@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.9.0] - 2026-11-05
 
 ### Security
 - **`--update` installs only releases the maintainer's key has signed.** TLS shows
