@@ -197,8 +197,12 @@
   change and a workload check. For dotnet, oxiclean now sets `DOTNET_NOLOGO`,
   `DOTNET_CLI_TELEMETRY_OPTOUT`, `DOTNET_GENERATE_ASPNET_CERTIFICATE=false`,
   `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false` and `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1`,
-  never over a value you set. The output of each tool-driven cleaner is captured; a
-  failure replays what the tool said, and `--verbose` shows it all. `--json` is one
+  never over a value you set. The SDK still counts that run as the first one, so
+  your own next `dotnet` command shows no welcome or telemetry message and skips
+  the workload check; the certificate and the `PATH` change are done then, and
+  `dotnet workload update` does what the check would have. The output of each
+  tool-driven cleaner is captured; a failure replays what the tool said, and
+  `--verbose` shows it all. `--json` is one
   document again: visible children get no stdout in JSON mode, and the orphan list
   and the dev table no longer print straight to it.
 - **A "✔" means the step did its work.** Many success lines followed a command whose

@@ -325,6 +325,14 @@ fn user_command(program: &Path, args: &[&str]) -> Command {
 /// is here for the same reason: a cache cleaner should not report anything on
 /// the user's behalf.
 ///
+/// Checked against SDK 10.0.114: a first command with these switches writes the
+/// SDK's first-run marker and nothing else. For the user's own next `dotnet`
+/// command that is no longer a first run, so it shows no welcome or telemetry
+/// message and does not run the workload check. The certificate and the tool
+/// path keep markers of their own and are done then, as they would have been.
+/// The workload check is the only one given up rather than put off;
+/// `dotnet workload update` does what it would have done.
+///
 /// `DOTNET_SKIP_FIRST_TIME_EXPERIENCE` is the legacy first-run switch. Current
 /// SDKs ignore it and older ones honoured it, so setting it costs nothing.
 const TOOL_ENV_DEFAULTS: &[(&str, &[(&str, &str)])] = &[(

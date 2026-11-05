@@ -137,7 +137,12 @@ Your own tools keep your environment. For dotnet oxiclean adds the defaults that
 keep a first command from doing more than it was asked (`DOTNET_NOLOGO`,
 `DOTNET_CLI_TELEMETRY_OPTOUT`, `DOTNET_GENERATE_ASPNET_CERTIFICATE=false`,
 `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false`, `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1`),
-never over a value you set.
+never over a value you set. The SDK still counts that run as the first one: your
+own next `dotnet` command shows no welcome or telemetry message and skips the
+workload check, which the SDK runs only on a first run and which can reinstall
+workloads over the network. The certificate and the `PATH` change keep markers of
+their own and are done then. With workloads installed, `dotnet workload update`
+does what the check would have. (Checked with SDK 10.0.114, in a fresh home.)
 
 ### Root and `$PATH`
 
