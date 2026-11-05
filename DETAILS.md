@@ -25,7 +25,7 @@ unit test that fails loudly if a refactor breaks it.
 | Maven artifacts installed on this machine | `mvn install` and `install:install-file` put things in `~/.m2/repository` that exist nowhere else. Maven records where it fetched each version (`_remote.repositories`), and only a version whose record names a repository for every file is removed. No record, a record that cannot be trusted, files it does not list: kept, and counted in one line. |
 | Gentoo's `DISTDIR`, without `eclean` | Hand-fetched files (what a `RESTRICT=fetch` package needs) are in there, and every other file costs a download. Emptied only with `--deep` or a "y"; `--yes` and `--json` are not an answer. |
 | What is mounted inside a directory being emptied | A bind mount, a network share, a container volume. See [What a cleanup will not follow or empty](#what-a-cleanup-will-not-follow-or-empty). |
-| Everything under `--dev` | Not part of `--all`. Some of it triggers gigabyte-scale re-downloads, so it must be an explicit choice. |
+| What `--dev` cleans, when you run `--all` | `--all` leaves it alone. Some of it means gigabyte-scale re-downloads, so you have to ask for `--dev` yourself. |
 
 Dev-tool caches that live under `~/.cache` are skipped by `--cache` and left to
 `--dev`, which cleans each with its own correct per-tool command. A one-line hint
@@ -211,9 +211,11 @@ no gain.
   what was left is said, in path order, and is not a failure. If the list cannot be
   read, nothing is emptied and that is an error. A cache directory that is itself a
   mount (a tmpfs, say) is ordinary and is emptied as before. The `find` sweeps that
-  run as root (`utils::sudo_sweep`) do the same, and are given `-xdev` as well, for
-  a mount that appears after the list was read, and the real path, because `find`
-  does not follow a link given as its starting point.
+  run as root (`utils::sudo_sweep`) use the same list. They are also given `-xdev`,
+  which keeps `find` out of a different file system that is mounted after the list
+  was read; a bind mount made in that window has the device number of its source,
+  and `-xdev` cannot tell it apart. They get the real path too, because `find` does
+  not follow a link given as its starting point.
 - **Links.** A link inside a tree is removed; it is never entered, and what it
   leads to is never touched. A root that the environment names is resolved before
   it is judged (below), so a link cannot launder a target.
@@ -374,9 +376,10 @@ and Gentoo ships `ID='gentoo'`. Handling only double quotes dropped Gentoo into
 
 Freed space is **measured** — what the cleaned trees occupy before and after —
 not estimated, and it is space on disk. A file counts the blocks its filesystem
-gave it (`st_blocks`, which is what `du` and `df` see), and a file with several
-names counts only when every one of them is among what is being removed, since
-another name keeps the data: a pnpm store that projects link into is worth nothing
+gave it (`st_blocks`: what `du` adds up, and what `df` shows as free once they are
+released), and a file with several names counts only when every one of them is
+among what is being removed, since another name keeps the data: a pnpm store that
+projects link into is worth nothing
 until those projects go, and says so. Directories are not counted, so a tree of
 empty directories is 0 and "nothing to clean" stays true of it. On a filesystem
 that shares extents (a snapshot, a reflink copy) the figure is an upper bound, and

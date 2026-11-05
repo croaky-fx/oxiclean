@@ -63,8 +63,9 @@
   This covers every cleaner that empties a directory (cache, trash, thumbnails,
   the Flatpak and AUR caches, the dev caches) and the `find` sweeps that run as
   root: portage's build tree, apk's cache, Gentoo's distfiles, Flatpak's repo
-  tmp, snapd's cache, systemd's coredumps. `find -xdev` does not stop at a bind
-  mount either. A cache directory that is itself a symlink is now really cleaned:
+  tmp, snapd's cache, systemd's coredumps. `find -xdev` stops at another file
+  system but not at a bind mount, so those sweeps use the mount list too. A cache
+  directory that is itself a symlink is now really cleaned:
   `find` does not follow a link given as its starting point, and used to report
   "cleaned" after removing nothing.
 - **As root, oxiclean no longer works inside a home directory that is not root's.**
@@ -132,8 +133,9 @@
   npm's, pip's) was under-reported. A sparse file occupies less than its length,
   and a file with several names frees nothing until the last one goes, so a pnpm
   store that projects link into was over-reported. A file now counts the blocks
-  its filesystem gave it, which is what `du` and `df` see, and one with several
-  names counts only when every name is among what is being removed. On a copy of
+  its filesystem gave it, which is what `du` adds up and what `df` shows as free
+  afterwards, and one with several names counts only when every name is among
+  what is being removed. On a copy of
   a source tree (1 810 files, 1 105 of them with several names) `--dry-run` says
   4.70 MB, as `du` does; the length sum said 2.05 MB. On a filesystem that shares
   extents (snapshots, reflinks) the figure is an upper bound.
