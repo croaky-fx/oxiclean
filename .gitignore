@@ -1,7 +1,12 @@
 /target
-Cargo.lock
 *.swp
 *.swo
 *~
 .idea/
 .vscode/
+# Signing material stays out of the repository. The secret key lives in
+# ~/.minisign; these are what a hand check of a release leaves behind, and what
+# a key copied into a working tree by mistake would look like.
+*.key
+*.minisig
+SHA256SUMS
