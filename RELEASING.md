@@ -111,13 +111,15 @@ the Release workflow runs the same test before building.
    scripts/sign-release.sh vX.Y.Z
    ```
 
-   It downloads the four binaries (it never runs them), prints their checksums
-   and waits. Compare them with the ones the build jobs recorded in the "Record
-   the checksum" step of the workflow run, then answer `y`. It signs the list as
-   `oxiclean X.Y.Z`, verifies the result the way a client will (against
-   `minisign.pub`, prehashed), and uploads `SHA256SUMS` and `SHA256SUMS.minisig`
-   to the draft. Set `MINISIGN_KEY` if the secret key is not at
-   `~/.minisign/oxiclean.key`.
+   It works on a draft only and stops at once if the release is already
+   published. It downloads the four binaries (it never runs them), prints their
+   checksums and waits. Compare them with the ones the build jobs recorded in the
+   "Record the checksum" step of the workflow run, then answer `y`. No option
+   answers for you: the signature says that you compared them. It signs the list
+   as `oxiclean X.Y.Z`, verifies the result the way a client will (against
+   `minisign.pub`, prehashed), checks once more that the release is still a
+   draft, and uploads `SHA256SUMS` and `SHA256SUMS.minisig` to it. Set
+   `MINISIGN_KEY` if the secret key is not at `~/.minisign/oxiclean.key`.
 5. Optionally download a binary from the draft and run `--version` on a scratch
    machine.
 6. Publish: `gh release edit vX.Y.Z --repo croaky-fx/oxiclean --draft=false`.
@@ -125,7 +127,7 @@ the Release workflow runs the same test before building.
 If anything changes after you signed (a binary rebuilt, say), the old signature
 no longer matches: rebuild, then run the script again; it replaces the signature
 on the draft. Once a release is published, treat it as final and never replace
-its files. Fix forward with a higher version.
+its files; the script refuses to touch one. Fix forward with a higher version.
 
 ## Checking a release by hand
 
