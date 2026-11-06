@@ -3225,6 +3225,7 @@ mod tests {
 
     #[test]
     fn test_look_for_finds_a_process_by_its_command_line_and_not_itself() {
+        use std::io::BufRead;
         // The real pgrep and a real process.
         let id = std::process::id();
         let tag = format!("oxiclean_probe_{id}");
@@ -3243,12 +3244,21 @@ mod tests {
             Builds::Idle,
             "nothing carries {tag} yet, and pgrep must not match itself"
         );
-        // `sh` waiting for input, with the tag in its command line.
+        // `sh` waiting for input, with the tag in its command line. `spawn` can
+        // return before the new program's command line is complete: /proc shows
+        // it empty, or only its first words, for a moment, and a pgrep that
+        // looks then finds nothing. So wait until the shell says it is up.
         let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "read line", &tag])
+            .args(["-c", "echo up; read line", &tag])
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        let mut said = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut said)
+            .unwrap();
+        assert_eq!(said, "up\n", "the shell did not start");
         let seen = look_for(Privilege::Root, &pattern);
         let _ = child.kill();
         let _ = child.wait();
