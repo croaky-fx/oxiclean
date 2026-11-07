@@ -178,9 +178,10 @@
   sub-lines and were printed whatever the flag, so a cron job began with seven
   lines nobody asked for. DRY RUN and DEEP CLEAN stay: they say what the run is
   about to do.
-- **Building from source needs Rust 1.85.** The README said 1.70+, which was
-  never true: the locked dependencies (ureq 3.3, zeroize 1.9) need 1.85.
-  `Cargo.toml` now says `rust-version = "1.85"` and CI builds with that version.
+- **Building from source needs Rust 1.85 or newer.** The locked dependencies
+  (ureq 3.3, zeroize 1.9) need it. `Cargo.toml` now declares
+  `rust-version = "1.85"`, the README gives the same number, and CI builds with
+  that version.
 
 ### Fixed
 - **`--dev` found no tool installed in your home directory (a regression in 1.8.0).**
