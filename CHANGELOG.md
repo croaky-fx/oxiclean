@@ -320,7 +320,6 @@
   namespace or `/usr` cannot be made writable.
 - The results of `run`, `run_user`, `run_quiet`, `elevate`, `sudo` and their
   variants are `#[must_use]`: a command whose outcome is ignored no longer compiles.
-- Comments that said what the code did not were corrected.
 
 ## [1.8.0] - 2026-08-27
 
